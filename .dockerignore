@@ -1,0 +1,71 @@
+# Rust build artifacts
+target/
+**/*.rs.bk
+*.pdb
+
+# Git
+.git/
+.gitignore
+
+# Documentation
+docs/
+*.md
+!README.md
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# CI/CD
+.github/
+.gitlab-ci.yml
+.travis.yml
+
+# Test and benchmark artifacts
+benches/results/
+criterion/
+*.profdata
+*.profraw
+flamegraph.svg
+perf.data*
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+*.log
+
+# Data files
+data/
+*.rdb
+*.aof
+*.db
+
+# Docker files (avoid recursion)
+Dockerfile*
+.dockerignore
+docker-compose*.yml
+
+# Environment files
+.env
+.env.*
+!.env.example
+
+# Dependencies cache (will be built in Docker)
+Cargo.lock
+
+# Coverage reports
+tarpaulin-report.html
+cobertura.xml
+lcov.info
+
+# Package files
+*.tar.gz
+*.zip
+
+# OS files
+Thumbs.db
