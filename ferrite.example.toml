@@ -1,0 +1,136 @@
+# Ferrite Configuration
+# Copy this file to ferrite.toml and adjust for your environment.
+#
+# Quick start:
+#   cp ferrite.example.toml ferrite.toml
+#   cargo run --release -- --config ferrite.toml
+#
+# Ferrite loads ./ferrite.toml by default. If it is missing but this file
+# exists, Ferrite will use it with a warning.
+#
+# Or generate a fresh config with:
+#   ferrite init
+
+# ============================================================================
+# Server Configuration
+# ============================================================================
+[server]
+# Address to bind to. Use 0.0.0.0 to accept connections from any interface.
+bind = "127.0.0.1"
+
+# Port to listen on. Default Redis port is 6379.
+port = 6379
+
+# Maximum number of simultaneous client connections.
+max_connections = 10000
+
+# TCP keepalive interval in seconds (0 to disable).
+tcp_keepalive = 300
+
+# Client timeout in seconds (0 to disable).
+timeout = 0
+
+# ============================================================================
+# Storage Configuration
+# ============================================================================
+[storage]
+# Directory for persistent data files.
+data_dir = "./data"
+
+# Number of logical databases (1-16).
+databases = 16
+
+# Maximum memory usage in bytes. When exceeded, eviction policies apply.
+# Default: 1GB (1073741824 bytes)
+max_memory = 1073741824
+
+# Storage backend: "memory" for pure in-memory, "hybridlog" for tiered storage.
+backend = "memory"
+
+# Maximum key size in bytes (512MB default).
+max_key_size = 536870912
+
+# Maximum value size in bytes (512MB default).
+max_value_size = 536870912
+
+# ============================================================================
+# Persistence Configuration
+# ============================================================================
+[persistence]
+# Enable append-only file for durability.
+aof_enabled = true
+
+# Path to the append-only file.
+aof_path = "./data/appendonly.aof"
+
+# AOF sync policy: "always", "everysecond" (default), or "no".
+# Also accepts "everysec" as an alias for "everysecond".
+# - "always": Sync after every write (safest, slowest)
+# - "everysecond": Sync every second (good balance)
+# - "no": Let OS handle syncing (fastest, less safe)
+aof_sync = "everysecond"
+
+# Enable periodic checkpoints (RDB-like snapshots).
+checkpoint_enabled = true
+
+# Checkpoint interval (seconds).
+checkpoint_interval = 300
+
+# Checkpoint directory.
+checkpoint_dir = "./data/checkpoints"
+
+# ============================================================================
+# Metrics Configuration
+# ============================================================================
+[metrics]
+# Enable Prometheus metrics endpoint.
+enabled = true
+
+# Metrics server port.
+port = 9090
+
+# Metrics bind address.
+bind = "127.0.0.1"
+
+# ============================================================================
+# Logging Configuration
+# ============================================================================
+[logging]
+# Log level: trace, debug, info, warn, error
+level = "info"
+
+# Log format: "pretty" for human-readable, "json" for structured logging.
+format = "pretty"
+
+# Optional log file path. If not set, logs go to stdout.
+# file = "/var/log/ferrite/ferrite.log"
+
+# ============================================================================
+# TLS Configuration (optional)
+# ============================================================================
+# [tls]
+# enabled = false
+# port = 6380
+# cert_file = "/path/to/cert.pem"
+# key_file = "/path/to/key.pem"
+# ca_file = "/path/to/ca.pem"  # For mTLS
+# require_client_cert = false
+
+# ============================================================================
+# Cluster Configuration (optional)
+# ============================================================================
+# [cluster]
+# enabled = false
+# node_id = "node1"
+# announce_ip = "192.168.1.10"
+# announce_port = 6379
+# cluster_port = 16379
+
+# ============================================================================
+# Replication Configuration (optional)
+# ============================================================================
+# [replication]
+# role = "primary"  # or "replica"
+# primary_host = "primary.example.com"
+# primary_port = 6379
+# replica_read_only = true
