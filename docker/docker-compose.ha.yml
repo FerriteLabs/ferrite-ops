@@ -1,0 +1,184 @@
+# Ferrite High Availability Docker Compose
+#
+# Deploys a primary with 2 replicas and optional monitoring.
+#
+# Usage:
+#   docker compose -f docker/docker-compose.ha.yml up -d
+#   docker compose -f docker/docker-compose.ha.yml --profile monitoring up -d
+#
+# Failover:
+#   docker compose -f docker/docker-compose.ha.yml exec ferrite-replica-1 ferrite-cli REPLICAOF NO ONE
+#   docker compose -f docker/docker-compose.ha.yml exec ferrite-replica-2 ferrite-cli REPLICAOF ferrite-replica-1 6379
+
+services:
+  # ── Primary ────────────────────────────────────────────────
+  ferrite-primary:
+    image: ferrite:latest
+    container_name: ferrite-primary
+    hostname: ferrite-primary
+    ports:
+      - "6379:6379"
+      - "9090:9090"
+    volumes:
+      - primary-data:/var/lib/ferrite/data
+    environment:
+      - RUST_LOG=${RUST_LOG:-ferrite=info}
+      - FERRITE_BIND=0.0.0.0
+      - FERRITE_METRICS_BIND=0.0.0.0
+      - FERRITE_REPLICATION_ROLE=primary
+      - FERRITE_REPLICATION_MIN_REPLICAS_TO_WRITE=1
+      - FERRITE_REPLICATION_MIN_REPLICAS_MAX_LAG=10
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "ferrite-cli", "PING"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+    networks:
+      - ferrite-ha
+    deploy:
+      resources:
+        limits:
+          cpus: "2"
+          memory: 4G
+        reservations:
+          cpus: "1"
+          memory: 2G
+
+  # ── Replica 1 ──────────────────────────────────────────────
+  ferrite-replica-1:
+    image: ferrite:latest
+    container_name: ferrite-replica-1
+    hostname: ferrite-replica-1
+    ports:
+      - "6380:6379"
+      - "9091:9090"
+    volumes:
+      - replica1-data:/var/lib/ferrite/data
+    environment:
+      - RUST_LOG=${RUST_LOG:-ferrite=info}
+      - FERRITE_BIND=0.0.0.0
+      - FERRITE_METRICS_BIND=0.0.0.0
+      - FERRITE_REPLICATION_ROLE=replica
+      - FERRITE_REPLICATION_PRIMARY_HOST=ferrite-primary
+      - FERRITE_REPLICATION_PRIMARY_PORT=6379
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "ferrite-cli", "PING"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 15s
+    depends_on:
+      ferrite-primary:
+        condition: service_healthy
+    networks:
+      - ferrite-ha
+    deploy:
+      resources:
+        limits:
+          cpus: "2"
+          memory: 4G
+        reservations:
+          cpus: "0.5"
+          memory: 1G
+
+  # ── Replica 2 ──────────────────────────────────────────────
+  ferrite-replica-2:
+    image: ferrite:latest
+    container_name: ferrite-replica-2
+    hostname: ferrite-replica-2
+    ports:
+      - "6381:6379"
+      - "9092:9090"
+    volumes:
+      - replica2-data:/var/lib/ferrite/data
+    environment:
+      - RUST_LOG=${RUST_LOG:-ferrite=info}
+      - FERRITE_BIND=0.0.0.0
+      - FERRITE_METRICS_BIND=0.0.0.0
+      - FERRITE_REPLICATION_ROLE=replica
+      - FERRITE_REPLICATION_PRIMARY_HOST=ferrite-primary
+      - FERRITE_REPLICATION_PRIMARY_PORT=6379
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "ferrite-cli", "PING"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 15s
+    depends_on:
+      ferrite-primary:
+        condition: service_healthy
+    networks:
+      - ferrite-ha
+    deploy:
+      resources:
+        limits:
+          cpus: "2"
+          memory: 4G
+        reservations:
+          cpus: "0.5"
+          memory: 1G
+
+  # ── Prometheus (monitoring profile) ────────────────────────
+  prometheus:
+    image: prom/prometheus:v2.48.0
+    container_name: ferrite-ha-prometheus
+    ports:
+      - "9093:9090"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./prometheus-alerts.yml:/etc/prometheus/alerts.yml:ro
+      - prometheus-data:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--web.enable-lifecycle"
+    restart: unless-stopped
+    depends_on:
+      ferrite-primary:
+        condition: service_healthy
+    networks:
+      - ferrite-ha
+    profiles:
+      - monitoring
+
+  # ── Grafana (monitoring profile) ───────────────────────────
+  grafana:
+    image: grafana/grafana:10.2.2
+    container_name: ferrite-ha-grafana
+    ports:
+      - "3000:3000"
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+    environment:
+      - GF_SECURITY_ADMIN_USER=${GRAFANA_ADMIN_USER:-admin}
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD:-ferrite}
+      - GF_USERS_ALLOW_SIGN_UP=false
+    restart: unless-stopped
+    depends_on:
+      prometheus:
+        condition: service_started
+    networks:
+      - ferrite-ha
+    profiles:
+      - monitoring
+
+volumes:
+  primary-data:
+    driver: local
+  replica1-data:
+    driver: local
+  replica2-data:
+    driver: local
+  prometheus-data:
+    driver: local
+  grafana-data:
+    driver: local
+
+networks:
+  ferrite-ha:
+    driver: bridge

@@ -1,0 +1,163 @@
+# Ferrite Docker Compose Configuration
+#
+# Usage:
+#   docker compose up -d                    # Start Ferrite only
+#   docker compose --profile monitoring up  # Start with Prometheus & Grafana
+#   docker compose --profile redis up       # Start with Redis for comparison
+#   docker compose --profile all up         # Start everything
+
+services:
+  # Primary Ferrite service
+  ferrite:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+          RUST_VERSION: "1.88"
+    image: ferrite:latest
+    container_name: ferrite
+    hostname: ferrite
+    ports:
+      - "6379:6379"   # Redis protocol port
+      - "9090:9090"   # Prometheus metrics endpoint
+    volumes:
+      - ferrite-data:/var/lib/ferrite/data
+      - ${FERRITE_CONFIG:-./ferrite.example.toml}:/etc/ferrite/ferrite.toml:ro
+    environment:
+      - RUST_LOG=${RUST_LOG:-ferrite=info}
+      - FERRITE_DATA_DIR=/var/lib/ferrite/data
+      - FERRITE_BIND=0.0.0.0
+      - FERRITE_METRICS_BIND=0.0.0.0
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/ferrite-cli", "PING"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+    networks:
+      - ferrite-network
+    # Resource limits (adjust based on your needs)
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 4G
+        reservations:
+          cpus: '1'
+          memory: 2G
+
+  # Optional: Redis for comparison testing
+  redis:
+    image: redis:7-alpine
+    container_name: ferrite-redis-comparison
+    hostname: redis
+    ports:
+      - "6380:6379"   # Exposed on different port to avoid conflicts
+    volumes:
+      - redis-data:/data
+    command: >
+      redis-server
+      --save 60 1000
+      --loglevel warning
+      --maxmemory 2gb
+      --maxmemory-policy allkeys-lru
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+    networks:
+      - ferrite-network
+    profiles:
+      - redis
+      - all
+
+  # Optional: Prometheus for metrics collection
+  prometheus:
+    image: prom/prometheus:v2.48.0
+    container_name: ferrite-prometheus
+    hostname: prometheus
+    ports:
+      - "9091:9090"   # Avoid conflict with Ferrite metrics port
+    volumes:
+      - ./docker/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/usr/share/prometheus/console_libraries'
+      - '--web.console.templates=/usr/share/prometheus/consoles'
+      - '--web.enable-lifecycle'
+      - '--storage.tsdb.retention.time=30d'
+    restart: unless-stopped
+    depends_on:
+      ferrite:
+        condition: service_healthy
+    networks:
+      - ferrite-network
+    profiles:
+      - monitoring
+      - all
+
+  # Optional: Grafana for visualization
+  grafana:
+    image: grafana/grafana:10.2.2
+    container_name: ferrite-grafana
+    hostname: grafana
+    ports:
+      - "3000:3000"
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./docker/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./docker/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    environment:
+      - GF_SECURITY_ADMIN_USER=${GRAFANA_ADMIN_USER:-admin}
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD:-ferrite}
+      - GF_USERS_ALLOW_SIGN_UP=false
+      - GF_SERVER_ROOT_URL=http://localhost:3000
+      - GF_ANALYTICS_REPORTING_ENABLED=false
+      - GF_ANALYTICS_CHECK_FOR_UPDATES=false
+    restart: unless-stopped
+    depends_on:
+      prometheus:
+        condition: service_started
+    networks:
+      - ferrite-network
+    profiles:
+      - monitoring
+      - all
+
+  # Optional: Redis Benchmark tool
+  redis-benchmark:
+    image: redis:7-alpine
+    container_name: ferrite-benchmark
+    command: >
+      sh -c "sleep 15 &&
+             redis-benchmark -h ferrite -p 6379 -t set,get -n 100000 -c 50 -d 256 --csv"
+    depends_on:
+      ferrite:
+        condition: service_healthy
+    networks:
+      - ferrite-network
+    profiles:
+      - benchmark
+
+volumes:
+  ferrite-data:
+    driver: local
+  redis-data:
+    driver: local
+  prometheus-data:
+    driver: local
+  grafana-data:
+    driver: local
+
+networks:
+  ferrite-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.0.0/16

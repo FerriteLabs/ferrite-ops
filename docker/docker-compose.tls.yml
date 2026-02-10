@@ -1,0 +1,33 @@
+# Ferrite Docker Compose - TLS Configuration
+#
+# Usage:
+#   # 1. Generate test certificates
+#   ./docker/generate-certs.sh
+#
+#   # 2. Start Ferrite with TLS
+#   docker compose -f docker-compose.yml -f docker/docker-compose.tls.yml up -d
+#
+#   # 3. Test TLS connectivity
+#   redis-cli --tls --cacert docker/certs/ca.crt -h 127.0.0.1 -p 6380 PING
+#
+#   # 4. Test mTLS connectivity
+#   redis-cli --tls \
+#     --cacert docker/certs/ca.crt \
+#     --cert docker/certs/client.crt \
+#     --key docker/certs/client.key \
+#     -h 127.0.0.1 -p 6380 PING
+
+services:
+  ferrite:
+    ports:
+      - "6380:6380"   # TLS port
+    volumes:
+      - ./docker/certs/server.crt:/etc/ferrite/tls/tls.crt:ro
+      - ./docker/certs/server.key:/etc/ferrite/tls/tls.key:ro
+      - ./docker/certs/ca.crt:/etc/ferrite/tls/ca.crt:ro
+    environment:
+      - FERRITE_TLS_ENABLED=true
+      - FERRITE_TLS_PORT=6380
+      - FERRITE_TLS_CERT=/etc/ferrite/tls/tls.crt
+      - FERRITE_TLS_KEY=/etc/ferrite/tls/tls.key
+      - FERRITE_TLS_CA=/etc/ferrite/tls/ca.crt
