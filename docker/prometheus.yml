@@ -1,0 +1,12 @@
+# Prometheus configuration for Ferrite monitoring
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: 'ferrite'
+    static_configs:
+      - targets: ['ferrite:9090']
+    metrics_path: '/metrics'
+    scrape_interval: 5s

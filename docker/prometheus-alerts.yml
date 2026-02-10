@@ -1,0 +1,192 @@
+# Ferrite Prometheus Alerting Rules
+# Include in prometheus.yml: rule_files: ["prometheus-alerts.yml"]
+
+groups:
+  - name: ferrite-alerts
+    interval: 30s
+    rules:
+      # Memory alerts
+      - alert: FerriteHighMemoryUsage
+        expr: (ferrite_memory_used_bytes / ferrite_memory_max_bytes) * 100 > 85
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Ferrite high memory usage (instance {{ $labels.instance }})"
+          description: "Memory usage is above 85% (current: {{ $value | printf \"%.1f\" }}%)"
+
+      - alert: FerriteCriticalMemoryUsage
+        expr: (ferrite_memory_used_bytes / ferrite_memory_max_bytes) * 100 > 95
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Ferrite critical memory usage (instance {{ $labels.instance }})"
+          description: "Memory usage is above 95% (current: {{ $value | printf \"%.1f\" }}%). Evictions may occur."
+
+      # Latency alerts
+      - alert: FerriteHighLatencyP99
+        expr: histogram_quantile(0.99, rate(ferrite_command_duration_seconds_bucket[5m])) * 1000 > 5
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Ferrite high P99 latency (instance {{ $labels.instance }})"
+          description: "P99 latency is above 5ms (current: {{ $value | printf \"%.2f\" }}ms)"
+
+      - alert: FerriteHighLatencyP999
+        expr: histogram_quantile(0.999, rate(ferrite_command_duration_seconds_bucket[5m])) * 1000 > 10
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Ferrite high P99.9 latency (instance {{ $labels.instance }})"
+          description: "P99.9 latency is above 10ms (current: {{ $value | printf \"%.2f\" }}ms)"
+
+      # Connection alerts
+      - alert: FerriteNoConnections
+        expr: ferrite_connected_clients == 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Ferrite has no connected clients (instance {{ $labels.instance }})"
+          description: "No clients connected for 5 minutes. Application may be down."
+
+      - alert: FerriteHighConnectionCount
+        expr: ferrite_connected_clients > 1000
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Ferrite high connection count (instance {{ $labels.instance }})"
+          description: "More than 1000 clients connected (current: {{ $value }})"
+
+      - alert: FerriteRejectedConnections
+        expr: rate(ferrite_rejected_connections_total[5m]) > 0
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Ferrite rejecting connections (instance {{ $labels.instance }})"
+          description: "Connections are being rejected. Check maxclients setting."
+
+      # Cache performance alerts
+      - alert: FerriteLowHitRate
+        expr: |
+          (rate(ferrite_keyspace_hits_total[5m]) /
+           (rate(ferrite_keyspace_hits_total[5m]) + rate(ferrite_keyspace_misses_total[5m]))) * 100 < 80
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Ferrite low cache hit rate (instance {{ $labels.instance }})"
+          description: "Cache hit rate below 80% (current: {{ $value | printf \"%.1f\" }}%)"
+
+      # Eviction alerts
+      - alert: FerriteEvictions
+        expr: rate(ferrite_evicted_keys_total[5m]) > 100
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Ferrite evicting keys (instance {{ $labels.instance }})"
+          description: "Keys are being evicted at {{ $value | printf \"%.0f\" }} keys/sec. Consider increasing maxmemory."
+
+      # Replication alerts
+      - alert: FerriteReplicationLag
+        expr: ferrite_replication_lag_seconds > 10
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Ferrite replication lag (instance {{ $labels.instance }})"
+          description: "Replication lag is {{ $value | printf \"%.1f\" }} seconds"
+
+      - alert: FerriteReplicationBroken
+        expr: ferrite_connected_replicas < ferrite_expected_replicas
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Ferrite replication broken (instance {{ $labels.instance }})"
+          description: "Expected {{ $labels.expected }} replicas but only {{ $value }} connected"
+
+      # Persistence alerts
+      - alert: FerriteAOFRewriteInProgress
+        expr: ferrite_aof_rewrite_in_progress == 1
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Ferrite AOF rewrite taking too long (instance {{ $labels.instance }})"
+          description: "AOF rewrite has been running for more than 30 minutes"
+
+      - alert: FerriteRDBSaveInProgress
+        expr: ferrite_rdb_save_in_progress == 1
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Ferrite RDB save taking too long (instance {{ $labels.instance }})"
+          description: "RDB save has been running for more than 30 minutes"
+
+      # HybridLog alerts
+      - alert: FerriteHybridLogDiskHigh
+        expr: ferrite_hybridlog_disk_bytes > 10737418240  # 10GB
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Ferrite HybridLog disk tier growing large (instance {{ $labels.instance }})"
+          description: "HybridLog disk tier is {{ $value | humanize1024 }}. Consider compaction."
+
+      # Instance health
+      - alert: FerriteDown
+        expr: up{job="ferrite"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Ferrite instance down (instance {{ $labels.instance }})"
+          description: "Ferrite instance is not responding to scrapes"
+
+      # Slow commands
+      - alert: FerriteSlowCommands
+        expr: rate(ferrite_slowlog_entries_total[5m]) > 10
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Ferrite slow commands detected (instance {{ $labels.instance }})"
+          description: "{{ $value | printf \"%.1f\" }} slow commands per second detected"
+
+  - name: ferrite-cluster-alerts
+    interval: 30s
+    rules:
+      - alert: FerriteClusterStateNotOk
+        expr: ferrite_cluster_state != 1
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Ferrite cluster state not OK (instance {{ $labels.instance }})"
+          description: "Cluster is not in OK state. Check cluster status."
+
+      - alert: FerriteClusterSlotsNotCovered
+        expr: ferrite_cluster_slots_ok < 16384
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Ferrite cluster slots not fully covered (instance {{ $labels.instance }})"
+          description: "Only {{ $value }} of 16384 slots are OK"
+
+      - alert: FerriteClusterNodeDown
+        expr: ferrite_cluster_known_nodes - ferrite_cluster_nodes_ok > 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Ferrite cluster node down (instance {{ $labels.instance }})"
+          description: "{{ $value }} cluster node(s) are not OK"

@@ -1,0 +1,166 @@
+# Ferrite Prometheus Alert Rules
+# Deploy to your Prometheus rules directory or configure via PrometheusRule CRD
+#
+# Usage:
+#   1. Standalone Prometheus: add to rule_files in prometheus.yml
+#   2. Kubernetes: use the Helm chart's PrometheusRule template instead
+#   3. Docker Compose: see ../docker/prometheus-alerts.yml for the compose-ready variant
+
+groups:
+  - name: ferrite.availability
+    rules:
+      - alert: FerriteDown
+        expr: up{job="ferrite"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Ferrite instance {{ $labels.instance }} is down"
+          description: "Ferrite has been unreachable for more than 1 minute."
+
+      - alert: FerriteHighLatency
+        expr: histogram_quantile(0.99, rate(ferrite_command_duration_seconds_bucket[5m])) > 0.1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High P99 command latency on {{ $labels.instance }}"
+          description: "P99 latency is {{ $value }}s (threshold: 100ms)"
+
+      - alert: FerriteHighLatencyCritical
+        expr: histogram_quantile(0.99, rate(ferrite_command_duration_seconds_bucket[5m])) > 0.5
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Critical P99 latency on {{ $labels.instance }}"
+          description: "P99 latency is {{ $value }}s (threshold: 500ms)"
+
+  - name: ferrite.memory
+    rules:
+      - alert: FerriteHighMemoryUsage
+        expr: ferrite_memory_used_bytes / ferrite_memory_max_bytes > 0.85
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High memory usage on {{ $labels.instance }}"
+          description: "Memory usage is {{ $value | humanizePercentage }} of max."
+
+      - alert: FerriteMemoryCritical
+        expr: ferrite_memory_used_bytes / ferrite_memory_max_bytes > 0.95
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Critical memory usage on {{ $labels.instance }}"
+          description: "Memory at {{ $value | humanizePercentage }}. Eviction or OOM imminent."
+
+      - alert: FerriteHighEvictionRate
+        expr: rate(ferrite_evicted_keys_total[5m]) > 100
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High eviction rate on {{ $labels.instance }}"
+          description: "Evicting {{ $value }} keys/sec. Consider increasing memory."
+
+  - name: ferrite.connections
+    rules:
+      - alert: FerriteHighConnections
+        expr: ferrite_connected_clients > 1000
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High connection count on {{ $labels.instance }}"
+          description: "{{ $value }} connected clients."
+
+      - alert: FerriteRejectedConnections
+        expr: rate(ferrite_rejected_connections_total[5m]) > 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Connections being rejected on {{ $labels.instance }}"
+          description: "{{ $value }} connections/sec rejected. Check maxclients setting."
+
+  - name: ferrite.persistence
+    rules:
+      - alert: FerriteAOFWriteErrors
+        expr: rate(ferrite_aof_write_errors_total[5m]) > 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "AOF write errors on {{ $labels.instance }}"
+          description: "Persistence is failing. Risk of data loss."
+
+      - alert: FerriteCheckpointStale
+        expr: time() - ferrite_last_checkpoint_timestamp > 7200
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Stale checkpoint on {{ $labels.instance }}"
+          description: "Last checkpoint was {{ $value | humanizeDuration }} ago."
+
+  - name: ferrite.replication
+    rules:
+      - alert: FerriteReplicationLagHigh
+        expr: ferrite_replication_lag_bytes > 1048576
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High replication lag on {{ $labels.instance }}"
+          description: "Replica lag is {{ $value | humanize1024 }}B."
+
+      - alert: FerriteReplicationLagCritical
+        expr: ferrite_replication_lag_bytes > 10485760
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Critical replication lag on {{ $labels.instance }}"
+          description: "Replica lag is {{ $value | humanize1024 }}B. Risk of full resync."
+
+      - alert: FerriteReplicaDisconnected
+        expr: ferrite_connected_replicas < ferrite_expected_replicas
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Replica disconnected from {{ $labels.instance }}"
+          description: "Expected {{ $labels.expected }} replicas, got {{ $value }}."
+
+  - name: ferrite.hybridlog
+    rules:
+      - alert: FerriteHybridLogDiskPressure
+        expr: ferrite_hybridlog_disk_bytes / ferrite_hybridlog_disk_capacity_bytes > 0.9
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "HybridLog disk pressure on {{ $labels.instance }}"
+          description: "Disk tier at {{ $value | humanizePercentage }}."
+
+      - alert: FerriteCompactionBehind
+        expr: rate(ferrite_hybridlog_compaction_bytes_reclaimed[1h]) == 0 and ferrite_hybridlog_disk_bytes > 1073741824
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Compaction stalled on {{ $labels.instance }}"
+          description: "No compaction activity with >1GB disk usage."
+
+  - name: ferrite.cache
+    rules:
+      - alert: FerriteLowCacheHitRate
+        expr: ferrite_cache_hit_rate < 0.5
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Low cache hit rate on {{ $labels.instance }}"
+          description: "Hit rate is {{ $value | humanizePercentage }}. Check key patterns."
