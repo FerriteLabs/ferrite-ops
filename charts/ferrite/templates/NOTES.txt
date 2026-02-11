@@ -1,0 +1,46 @@
+Thank you for installing {{ .Chart.Name }}!
+
+Your release is named {{ .Release.Name }}.
+
+To get started:
+
+1. Get the application URL by running these commands:
+{{- if contains "NodePort" .Values.service.type }}
+  export NODE_PORT=$(kubectl get --namespace {{ .Release.Namespace }} -o jsonpath="{.spec.ports[0].nodePort}" services {{ include "ferrite.fullname" . }})
+  export NODE_IP=$(kubectl get nodes --namespace {{ .Release.Namespace }} -o jsonpath="{.items[0].status.addresses[0].address}")
+  echo "Ferrite URL: redis://$NODE_IP:$NODE_PORT"
+{{- else if contains "LoadBalancer" .Values.service.type }}
+  NOTE: It may take a few minutes for the LoadBalancer IP to be available.
+        Watch the status with: kubectl get --namespace {{ .Release.Namespace }} svc -w {{ include "ferrite.fullname" . }}
+  export SERVICE_IP=$(kubectl get svc --namespace {{ .Release.Namespace }} {{ include "ferrite.fullname" . }} --template "{{"{{ range (index .status.loadBalancer.ingress 0) }}{{.}}{{ end }}"}}")
+  echo "Ferrite URL: redis://$SERVICE_IP:{{ .Values.service.port }}"
+{{- else if contains "ClusterIP" .Values.service.type }}
+  export POD_NAME=$(kubectl get pods --namespace {{ .Release.Namespace }} -l "app.kubernetes.io/name={{ include "ferrite.name" . }},app.kubernetes.io/instance={{ .Release.Name }}" -o jsonpath="{.items[0].metadata.name}")
+  export CONTAINER_PORT=$(kubectl get pod --namespace {{ .Release.Namespace }} $POD_NAME -o jsonpath="{.spec.containers[0].ports[0].containerPort}")
+  echo "Visit redis://127.0.0.1:6379 after running:"
+  kubectl --namespace {{ .Release.Namespace }} port-forward $POD_NAME 6379:$CONTAINER_PORT
+{{- end }}
+
+2. Test the connection:
+  kubectl --namespace {{ .Release.Namespace }} exec -it {{ include "ferrite.fullname" . }}-0 -- ferrite-cli PING
+
+3. Connect from your application:
+  - Host: {{ include "ferrite.fullname" . }}.{{ .Release.Namespace }}.svc.cluster.local
+  - Port: {{ .Values.service.port }}
+{{- if .Values.ferrite.auth.enabled }}
+  - Password: (set via secret)
+{{- end }}
+
+{{- if .Values.ferrite.metrics.enabled }}
+
+4. Access metrics:
+  kubectl --namespace {{ .Release.Namespace }} port-forward svc/{{ include "ferrite.fullname" . }} {{ .Values.service.metricsPort }}:{{ .Values.service.metricsPort }}
+  curl http://localhost:{{ .Values.service.metricsPort }}{{ .Values.ferrite.metrics.path }}
+{{- end }}
+
+{{- if .Values.serviceMonitor.enabled }}
+
+5. ServiceMonitor is enabled. Prometheus Operator will automatically scrape metrics.
+{{- end }}
+
+For more information, visit: https://ferrite.dev/docs

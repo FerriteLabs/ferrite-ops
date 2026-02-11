@@ -1,0 +1,209 @@
+# Ferrite High Availability Helm Values
+#
+# Deploys a 3-pod StatefulSet (1 primary + 2 replicas) with:
+#   - Pod anti-affinity across nodes/zones
+#   - PodDisruptionBudget (minAvailable: 2)
+#   - Persistent storage per pod
+#   - Prometheus monitoring
+#   - Health checks tuned for HA
+#
+# Usage:
+#   helm install ferrite ./charts/ferrite -f ./charts/ferrite/values-ha.yaml
+#
+# After install, configure replication:
+#   kubectl exec ferrite-1 -- ferrite-cli REPLICAOF ferrite-0.ferrite-headless 6379
+#   kubectl exec ferrite-2 -- ferrite-cli REPLICAOF ferrite-0.ferrite-headless 6379
+
+# -- 3 replicas: pod-0 is primary, pod-1 and pod-2 are replicas
+replicaCount: 3
+
+image:
+  repository: ghcr.io/ferritelabs/ferrite
+  pullPolicy: IfNotPresent
+  tag: ""
+
+# Ferrite configuration
+ferrite:
+  server:
+    bind: "0.0.0.0"
+    maxConnections: 10000
+    tcpKeepalive: 60
+    timeout: 0
+
+  storage:
+    databases: 16
+    maxMemory: "2147483648"   # 2 GB
+    backend: "memory"
+
+  persistence:
+    aofEnabled: true
+    aofSync: "everysec"
+    checkpointEnabled: true
+    checkpointInterval: "5m"
+
+  logging:
+    level: "info"
+    format: "json"
+
+  metrics:
+    enabled: true
+    path: "/metrics"
+
+  tls:
+    enabled: false
+
+  auth:
+    enabled: false
+
+  # Additional environment variables for replication.
+  # Pod-0 acts as primary; pods 1+ are configured as replicas via a
+  # post-install hook or init script. For a simpler approach, set the
+  # role via extraEnv or use an init container that checks the ordinal.
+  extraEnv:
+    - name: FERRITE_REPLICATION_REPL_BACKLOG_SIZE
+      value: "10485760"   # 10 MB backlog
+    - name: FERRITE_REPLICATION_MIN_REPLICAS_TO_WRITE
+      value: "1"
+    - name: FERRITE_REPLICATION_MIN_REPLICAS_MAX_LAG
+      value: "10"
+
+# Replication configuration
+replication:
+  enabled: true
+  role: "primary"
+  primaryHost: ""
+  primaryPort: 6379
+
+# Persistent storage — each pod gets its own PVC
+persistence:
+  enabled: true
+  storageClassName: ""
+  accessModes:
+    - ReadWriteOnce
+  size: 20Gi
+
+# Resource allocation — size replicas to match primary
+resources:
+  limits:
+    cpu: 2000m
+    memory: 4Gi
+  requests:
+    cpu: 1000m
+    memory: 2Gi
+
+# Pod anti-affinity — spread pods across nodes
+affinity:
+  podAntiAffinity:
+    preferredDuringSchedulingIgnoredDuringExecution:
+      - weight: 100
+        podAffinityTerm:
+          labelSelector:
+            matchExpressions:
+              - key: app.kubernetes.io/name
+                operator: In
+                values:
+                  - ferrite
+          topologyKey: kubernetes.io/hostname
+      - weight: 50
+        podAffinityTerm:
+          labelSelector:
+            matchExpressions:
+              - key: app.kubernetes.io/name
+                operator: In
+                values:
+                  - ferrite
+          topologyKey: topology.kubernetes.io/zone
+
+# Spread across availability zones
+topologySpreadConstraints:
+  - maxSkew: 1
+    topologyKey: topology.kubernetes.io/zone
+    whenUnsatisfiable: ScheduleAnyway
+    labelSelector:
+      matchLabels:
+        app.kubernetes.io/name: ferrite
+
+# Pod Disruption Budget — keep at least 2 pods running
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 2
+
+# Health checks tuned for HA
+livenessProbe:
+  enabled: true
+  initialDelaySeconds: 30
+  periodSeconds: 10
+  timeoutSeconds: 5
+  failureThreshold: 3
+  successThreshold: 1
+
+readinessProbe:
+  enabled: true
+  initialDelaySeconds: 5
+  periodSeconds: 5
+  timeoutSeconds: 3
+  failureThreshold: 3
+  successThreshold: 1
+
+startupProbe:
+  enabled: true
+  initialDelaySeconds: 10
+  periodSeconds: 5
+  timeoutSeconds: 5
+  failureThreshold: 30
+  successThreshold: 1
+
+# Prometheus ServiceMonitor
+serviceMonitor:
+  enabled: true
+  interval: 15s
+  scrapeTimeout: 10s
+  additionalLabels: {}
+
+# Prometheus alerting rules for HA
+prometheusRule:
+  enabled: true
+  additionalLabels: {}
+  rules:
+    - alert: FerriteReplicationLagWarning
+      expr: ferrite_replica_lag_bytes > 1048576
+      for: 5m
+      labels:
+        severity: warning
+      annotations:
+        summary: "Ferrite replica lag exceeds 1 MB"
+        description: "Replica {{ $labels.pod }} lag is {{ $value }} bytes."
+
+    - alert: FerriteReplicationLagCritical
+      expr: ferrite_replica_lag_bytes > 10485760
+      for: 2m
+      labels:
+        severity: critical
+      annotations:
+        summary: "Ferrite replica lag exceeds 10 MB"
+        description: "Replica {{ $labels.pod }} may need full resync."
+
+    - alert: FerriteNoConnectedReplicas
+      expr: ferrite_connected_replicas == 0
+      for: 1m
+      labels:
+        severity: critical
+      annotations:
+        summary: "Ferrite primary has no connected replicas"
+        description: "HA is degraded. All replicas are disconnected."
+
+    - alert: FerritePodDown
+      expr: up{job="ferrite"} == 0
+      for: 30s
+      labels:
+        severity: critical
+      annotations:
+        summary: "Ferrite pod {{ $labels.pod }} is down"
+
+# Cluster mode — disabled for primary-replica HA
+cluster:
+  enabled: false
+
+# Sentinel — disabled (use manual failover or external orchestration)
+sentinel:
+  enabled: false

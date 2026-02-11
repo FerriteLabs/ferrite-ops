@@ -1,0 +1,29 @@
+{{- if and .Values.tls.enabled .Values.tls.certManager.enabled }}
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: {{ include "ferrite.fullname" . }}-tls
+  labels:
+    {{- include "ferrite.labels" . | nindent 4 }}
+spec:
+  secretName: {{ include "ferrite.fullname" . }}-tls
+  duration: 2160h # 90 days
+  renewBefore: 360h # 15 days
+  privateKey:
+    algorithm: RSA
+    size: 2048
+  usages:
+    - server auth
+    {{- if .Values.tls.clientCA }}
+    - client auth
+    {{- end }}
+  dnsNames:
+    - {{ include "ferrite.fullname" . }}
+    - {{ include "ferrite.fullname" . }}.{{ .Release.Namespace }}
+    - {{ include "ferrite.fullname" . }}.{{ .Release.Namespace }}.svc
+    - {{ include "ferrite.fullname" . }}.{{ .Release.Namespace }}.svc.cluster.local
+    - "*.{{ include "ferrite.fullname" . }}-headless.{{ .Release.Namespace }}.svc.cluster.local"
+  issuerRef:
+    name: {{ .Values.tls.certManager.issuerRef.name }}
+    kind: {{ .Values.tls.certManager.issuerRef.kind }}
+{{- end }}

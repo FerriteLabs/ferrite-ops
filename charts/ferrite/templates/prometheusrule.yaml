@@ -1,0 +1,47 @@
+{{- if and .Values.ferrite.metrics.enabled .Values.ferrite.metrics.prometheusRule.enabled }}
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: {{ include "ferrite.fullname" . }}
+  labels:
+    {{- include "ferrite.labels" . | nindent 4 }}
+    {{- with .Values.ferrite.metrics.prometheusRule.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  groups:
+    - name: ferrite.availability
+      rules:
+        - alert: FerriteDown
+          expr: up{job="{{ include "ferrite.fullname" . }}"} == 0
+          for: 1m
+          labels:
+            severity: critical
+          annotations:
+            summary: "Ferrite instance {{`{{ $labels.instance }}`}} is down"
+        - alert: FerriteHighLatency
+          expr: histogram_quantile(0.99, rate(ferrite_command_duration_seconds_bucket{job="{{ include "ferrite.fullname" . }}"}[5m])) > 0.1
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "High P99 latency on {{`{{ $labels.instance }}`}}"
+    - name: ferrite.memory
+      rules:
+        - alert: FerriteHighMemoryUsage
+          expr: ferrite_memory_used_bytes{job="{{ include "ferrite.fullname" . }}"} / ferrite_memory_max_bytes > 0.85
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "High memory on {{`{{ $labels.instance }}`}}"
+    - name: ferrite.replication
+      rules:
+        - alert: FerriteReplicationLagHigh
+          expr: ferrite_replication_lag_bytes{job="{{ include "ferrite.fullname" . }}"} > 1048576
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Replication lag on {{`{{ $labels.instance }}`}}"
+{{- end }}

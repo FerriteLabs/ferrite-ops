@@ -1,0 +1,113 @@
+{{- if .Values.backup.enabled }}
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ include "ferrite.fullname" . }}-backup
+  labels:
+    {{- include "ferrite.labels" . | nindent 4 }}
+spec:
+  schedule: {{ .Values.backup.schedule | quote }}
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      template:
+        metadata:
+          labels:
+            {{- include "ferrite.selectorLabels" . | nindent 12 }}
+            app.kubernetes.io/component: backup
+        spec:
+          {{- with .Values.imagePullSecrets }}
+          imagePullSecrets:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          serviceAccountName: {{ include "ferrite.serviceAccountName" . }}
+          restartPolicy: OnFailure
+          containers:
+          - name: backup
+            image: {{ include "ferrite.image" . }}
+            command:
+              - /bin/sh
+              - -c
+              - |
+                set -e
+                TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+                BACKUP_DIR="{{ .Values.backup.destination }}"
+                RETENTION={{ .Values.backup.retention.count }}
+                DATA_DIR="/var/lib/ferrite/data"
+
+                mkdir -p "${BACKUP_DIR}"
+
+                # Trigger a checkpoint
+                ferrite-cli -h {{ include "ferrite.fullname" . }} -p {{ .Values.service.port }} BGSAVE || true
+                sleep 5
+
+                # Create compressed backup
+                BACKUP_FILE="${BACKUP_DIR}/ferrite-backup-${TIMESTAMP}.tar.gz"
+                tar -czf "${BACKUP_FILE}" -C "${DATA_DIR}" .
+                echo "Backup created: ${BACKUP_FILE}"
+
+                {{- if .Values.backup.s3.enabled }}
+                # Upload to S3
+                aws s3 cp "${BACKUP_FILE}" \
+                  "s3://{{ .Values.backup.s3.bucket }}/{{ .Values.backup.s3.prefix }}ferrite-backup-${TIMESTAMP}.tar.gz" \
+                  --region {{ .Values.backup.s3.region }}
+                echo "Uploaded to S3: s3://{{ .Values.backup.s3.bucket }}/{{ .Values.backup.s3.prefix }}"
+                {{- end }}
+
+                # Rotate old backups (keep last N)
+                cd "${BACKUP_DIR}"
+                ls -t ferrite-backup-*.tar.gz 2>/dev/null | tail -n +$((RETENTION + 1)) | xargs -r rm -f
+                echo "Backup rotation complete (keeping last ${RETENTION})"
+            env:
+              - name: BACKUP_DESTINATION
+                value: {{ .Values.backup.destination }}
+              {{- if .Values.backup.s3.enabled }}
+              - name: AWS_DEFAULT_REGION
+                value: {{ .Values.backup.s3.region }}
+              {{- end }}
+            volumeMounts:
+              - name: data
+                mountPath: /var/lib/ferrite/data
+                readOnly: true
+              - name: backup
+                mountPath: {{ .Values.backup.destination }}
+            resources:
+              requests:
+                cpu: 100m
+                memory: 256Mi
+              limits:
+                cpu: 500m
+                memory: 512Mi
+          volumes:
+            - name: data
+              persistentVolumeClaim:
+                claimName: data-{{ include "ferrite.fullname" . }}-0
+            - name: backup
+              {{- if .Values.backup.persistence.enabled }}
+              persistentVolumeClaim:
+                claimName: {{ include "ferrite.fullname" . }}-backup
+              {{- else }}
+              emptyDir: {}
+              {{- end }}
+---
+{{- if .Values.backup.persistence.enabled }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "ferrite.fullname" . }}-backup
+  labels:
+    {{- include "ferrite.labels" . | nindent 4 }}
+spec:
+  accessModes:
+    - ReadWriteOnce
+  {{- if .Values.backup.persistence.storageClassName }}
+  storageClassName: {{ .Values.backup.persistence.storageClassName | quote }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.backup.persistence.size | default "20Gi" | quote }}
+{{- end }}
+{{- end }}

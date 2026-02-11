@@ -1,0 +1,34 @@
+apiVersion: v2
+name: ferrite
+description: A Helm chart for deploying Ferrite - a high-performance, tiered-storage key-value store
+
+type: application
+
+version: 0.1.0
+
+appVersion: "0.1.0"
+
+home: https://ferrite.dev
+
+sources:
+  - https://github.com/ferritelabs/ferrite
+
+maintainers:
+  - name: Jose David Baena
+    email: josedab@example.com
+
+keywords:
+  - redis
+  - cache
+  - key-value
+  - database
+  - storage
+  - ferrite
+
+annotations:
+  artifacthub.io/license: Apache-2.0
+  artifacthub.io/links: |
+    - name: Documentation
+      url: https://ferrite.dev/docs
+    - name: GitHub
+      url: https://github.com/ferritelabs/ferrite

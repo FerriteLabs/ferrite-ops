@@ -1,0 +1,66 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "ferrite.fullname" . }}
+  labels:
+    {{- include "ferrite.labels" . | nindent 4 }}
+  {{- with .Values.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.service.type }}
+  ports:
+    - port: {{ .Values.service.port }}
+      targetPort: ferrite
+      protocol: TCP
+      name: ferrite
+      {{- if and (eq .Values.service.type "NodePort") .Values.service.nodePort }}
+      nodePort: {{ .Values.service.nodePort }}
+      {{- end }}
+    {{- if .Values.ferrite.metrics.enabled }}
+    - port: {{ .Values.service.metricsPort }}
+      targetPort: metrics
+      protocol: TCP
+      name: metrics
+    {{- end }}
+    {{- if or .Values.tls.enabled .Values.ferrite.tls.enabled }}
+    - port: {{ .Values.ferrite.tls.port }}
+      targetPort: ferrite-tls
+      protocol: TCP
+      name: ferrite-tls
+    {{- end }}
+    {{- if .Values.cluster.enabled }}
+    - port: {{ .Values.cluster.port }}
+      targetPort: cluster
+      protocol: TCP
+      name: cluster
+    {{- end }}
+  selector:
+    {{- include "ferrite.selectorLabels" . | nindent 4 }}
+---
+{{- if gt (int .Values.replicaCount) 1 }}
+# Headless service for StatefulSet
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "ferrite.fullname" . }}-headless
+  labels:
+    {{- include "ferrite.labels" . | nindent 4 }}
+spec:
+  type: ClusterIP
+  clusterIP: None
+  ports:
+    - port: {{ .Values.service.port }}
+      targetPort: ferrite
+      protocol: TCP
+      name: ferrite
+    {{- if .Values.cluster.enabled }}
+    - port: {{ .Values.cluster.port }}
+      targetPort: cluster
+      protocol: TCP
+      name: cluster
+    {{- end }}
+  selector:
+    {{- include "ferrite.selectorLabels" . | nindent 4 }}
+{{- end }}

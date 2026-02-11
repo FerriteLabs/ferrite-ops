@@ -1,0 +1,361 @@
+# Default values for ferrite.
+# This is a YAML-formatted file.
+
+# -- Number of Ferrite replicas (use 1 for standalone, 3+ for cluster)
+replicaCount: 1
+
+image:
+  # -- Container image repository
+  repository: ghcr.io/ferritelabs/ferrite
+  # -- Image pull policy
+  pullPolicy: IfNotPresent
+  # -- Overrides the image tag (default is the chart appVersion)
+  tag: ""
+
+# -- Image pull secrets for private registries
+imagePullSecrets: []
+
+# -- Override the name of the chart
+nameOverride: ""
+# -- Override the full name of the chart
+fullnameOverride: ""
+
+serviceAccount:
+  # -- Specifies whether a service account should be created
+  create: true
+  # -- Annotations to add to the service account
+  annotations: {}
+  # -- The name of the service account to use
+  name: ""
+
+# -- Pod annotations
+podAnnotations: {}
+
+# -- Pod security context
+podSecurityContext:
+  fsGroup: 1000
+
+# -- Container security context
+securityContext:
+  runAsNonRoot: true
+  runAsUser: 1000
+  runAsGroup: 1000
+  capabilities:
+    drop:
+      - ALL
+  readOnlyRootFilesystem: true
+
+service:
+  # -- Service type (ClusterIP, NodePort, LoadBalancer)
+  type: ClusterIP
+  # -- Ferrite port
+  port: 6379
+  # -- Metrics port
+  metricsPort: 9090
+  # -- Node port (only used when type is NodePort)
+  nodePort: ""
+  # -- Service annotations
+  annotations: {}
+
+# -- Ingress configuration (for HTTP/metrics access)
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  hosts:
+    - host: ferrite.local
+      paths:
+        - path: /
+          pathType: ImplementationSpecific
+  tls: []
+
+resources:
+  # -- Resource limits
+  limits:
+    cpu: 2000m
+    memory: 4Gi
+  # -- Resource requests
+  requests:
+    cpu: 500m
+    memory: 1Gi
+
+# -- Node selector
+nodeSelector: {}
+
+# -- Tolerations
+tolerations: []
+
+# -- Affinity rules
+affinity: {}
+
+# -- Topology spread constraints
+topologySpreadConstraints: []
+
+# Ferrite configuration
+ferrite:
+  # -- Server configuration
+  server:
+    # -- Bind address
+    bind: "0.0.0.0"
+    # -- Maximum connections
+    maxConnections: 10000
+    # -- TCP keepalive (seconds)
+    tcpKeepalive: 300
+    # -- Client timeout (seconds, 0 to disable)
+    timeout: 0
+
+  # -- Storage configuration
+  storage:
+    # -- Number of databases
+    databases: 16
+    # -- Maximum memory in bytes
+    maxMemory: "1073741824"
+    # -- Storage backend (memory or hybridlog)
+    backend: "memory"
+
+  # -- Persistence configuration
+  persistence:
+    # -- Enable AOF
+    aofEnabled: true
+    # -- AOF sync policy (always, everysec, no)
+    aofSync: "everysec"
+    # -- Enable checkpoints
+    checkpointEnabled: true
+    # -- Checkpoint interval
+    checkpointInterval: "5m"
+
+  # -- Logging configuration
+  logging:
+    # -- Log level (trace, debug, info, warn, error)
+    level: "info"
+    # -- Log format (pretty, json)
+    format: "json"
+
+  # -- Metrics configuration
+  metrics:
+    # -- Enable Prometheus metrics
+    enabled: true
+    # -- Metrics path
+    path: "/metrics"
+    # -- PrometheusRule for alerting (requires prometheus-operator)
+    prometheusRule:
+      # -- Enable PrometheusRule resource
+      enabled: false
+      # -- Additional labels for the PrometheusRule (e.g. release: kube-prometheus-stack)
+      labels: {}
+
+  # -- TLS configuration
+  tls:
+    # -- Enable TLS
+    enabled: false
+    # -- TLS port
+    port: 6380
+    # -- Name of the secret containing TLS certificates (overridden by top-level tls config)
+    secretName: ""
+    # -- Require client certificates (mTLS)
+    requireClientCert: false
+
+  # -- Authentication
+  auth:
+    # -- Enable password authentication
+    enabled: false
+    # -- Existing secret containing password (key: password)
+    existingSecret: ""
+    # -- Password (only used if existingSecret is not set)
+    password: ""
+
+  # -- Additional environment variables
+  extraEnv: []
+
+  # -- Additional environment variables from secrets/configmaps
+  extraEnvFrom: []
+
+  # -- Extra arguments to pass to ferrite
+  extraArgs: []
+
+# Persistence
+persistence:
+  # -- Enable persistence
+  enabled: true
+  # -- Storage class name
+  storageClassName: ""
+  # -- Access modes
+  accessModes:
+    - ReadWriteOnce
+  # -- Size of the persistent volume
+  size: 10Gi
+  # -- Annotations for the PVC
+  annotations: {}
+  # -- Use existing PVC
+  existingClaim: ""
+
+# ServiceMonitor for Prometheus Operator
+serviceMonitor:
+  # -- Enable ServiceMonitor
+  enabled: false
+  # -- Namespace for ServiceMonitor
+  namespace: ""
+  # -- Additional labels for ServiceMonitor
+  additionalLabels: {}
+  # -- Scrape interval
+  interval: 15s
+  # -- Scrape timeout
+  scrapeTimeout: 10s
+  # -- Relabelings
+  relabelings: []
+  # -- Metric relabelings
+  metricRelabelings: []
+
+# Prometheus rules
+prometheusRule:
+  # -- Enable PrometheusRule
+  enabled: false
+  # -- Namespace for PrometheusRule
+  namespace: ""
+  # -- Additional labels for PrometheusRule
+  additionalLabels: {}
+  # -- Alert rules
+  rules: []
+
+# Pod Disruption Budget
+podDisruptionBudget:
+  # -- Enable PDB
+  enabled: false
+  # -- Minimum available pods
+  minAvailable: 1
+  # -- Maximum unavailable pods
+  maxUnavailable: ""
+
+# Cluster configuration (for multi-replica deployments)
+cluster:
+  # -- Enable cluster mode
+  enabled: false
+  # -- Cluster port
+  port: 16379
+
+# Sentinel configuration (for HA without cluster)
+sentinel:
+  # -- Enable Sentinel mode
+  enabled: false
+  # -- Number of Sentinel replicas
+  replicas: 3
+  # -- Quorum for failover
+  quorum: 2
+
+# Replication (primary-replica setup)
+replication:
+  # -- Enable replication
+  enabled: false
+  # -- Role (primary or replica)
+  role: "primary"
+  # -- Primary host (for replicas)
+  primaryHost: ""
+  # -- Primary port (for replicas)
+  primaryPort: 6379
+
+# Health checks
+livenessProbe:
+  # -- Enable liveness probe
+  enabled: true
+  # -- Initial delay
+  initialDelaySeconds: 30
+  # -- Period
+  periodSeconds: 10
+  # -- Timeout
+  timeoutSeconds: 5
+  # -- Failure threshold
+  failureThreshold: 3
+  # -- Success threshold
+  successThreshold: 1
+
+readinessProbe:
+  # -- Enable readiness probe
+  enabled: true
+  # -- Initial delay
+  initialDelaySeconds: 5
+  # -- Period
+  periodSeconds: 5
+  # -- Timeout
+  timeoutSeconds: 1
+  # -- Failure threshold
+  failureThreshold: 3
+  # -- Success threshold
+  successThreshold: 1
+
+startupProbe:
+  # -- Enable startup probe
+  enabled: true
+  # -- Initial delay
+  initialDelaySeconds: 10
+  # -- Period
+  periodSeconds: 10
+  # -- Timeout
+  timeoutSeconds: 5
+  # -- Failure threshold
+  failureThreshold: 30
+  # -- Success threshold
+  successThreshold: 1
+
+# Init containers
+initContainers: []
+
+# Sidecar containers
+sidecars: []
+
+# Extra volumes
+extraVolumes: []
+
+# Extra volume mounts
+extraVolumeMounts: []
+
+# TLS certificate management (Kubernetes-level)
+tls:
+  # -- Enable TLS for Ferrite connections
+  enabled: false
+  # -- Use an existing Kubernetes TLS secret
+  existingSecret: ""
+  # -- TLS certificate (PEM, used if existingSecret is empty and certManager is disabled)
+  certificate: ""
+  # -- TLS private key (PEM)
+  privateKey: ""
+  # -- CA certificate for mTLS client verification
+  clientCA: ""
+  # -- cert-manager integration
+  certManager:
+    # -- Enable automatic certificate management via cert-manager
+    enabled: false
+    # -- Issuer reference
+    issuerRef:
+      name: letsencrypt-prod
+      kind: ClusterIssuer
+
+# Backup configuration
+backup:
+  # -- Enable scheduled backups
+  enabled: false
+  # -- Cron schedule expression
+  schedule: "0 2 * * *"  # Daily at 2am
+  # -- Local backup destination inside the backup container
+  destination: "/backups"
+  # -- Backup retention
+  retention:
+    # -- Number of backups to keep
+    count: 7
+  # -- S3 upload configuration
+  s3:
+    # -- Enable S3 upload after local backup
+    enabled: false
+    # -- S3 bucket name
+    bucket: ""
+    # -- AWS region
+    region: "us-east-1"
+    # -- S3 key prefix
+    prefix: "ferrite-backups/"
+  # -- Persistent storage for backups
+  persistence:
+    # -- Enable PVC for backup storage
+    enabled: false
+    # -- Storage class
+    storageClassName: ""
+    # -- PVC size
+    size: "20Gi"
