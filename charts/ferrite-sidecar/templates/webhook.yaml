@@ -1,0 +1,42 @@
+{{- if .Values.webhook.enabled }}
+apiVersion: admissionregistration.k8s.io/v1
+kind: MutatingWebhookConfiguration
+metadata:
+  name: {{ include "ferrite-sidecar.webhook.fullname" . }}
+  labels:
+    {{- include "ferrite-sidecar.webhook.labels" . | nindent 4 }}
+  {{- if .Values.webhook.certManager.enabled }}
+  annotations:
+    cert-manager.io/inject-ca-from: {{ .Release.Namespace }}/{{ include "ferrite-sidecar.webhook.fullname" . }}
+  {{- end }}
+webhooks:
+  - name: sidecar-injector.ferrite.dev
+    admissionReviewVersions: ["v1", "v1beta1"]
+    sideEffects: None
+    failurePolicy: {{ .Values.webhook.failurePolicy }}
+    reinvocationPolicy: Never
+    timeoutSeconds: 10
+    clientConfig:
+      service:
+        name: {{ include "ferrite-sidecar.webhook.fullname" . }}
+        namespace: {{ .Release.Namespace }}
+        path: /mutate
+        port: 443
+      {{- if not .Values.webhook.certManager.enabled }}
+      caBundle: ""  # Populated by the self-signed cert generation job
+      {{- end }}
+    rules:
+      - operations: ["CREATE"]
+        apiGroups: [""]
+        apiVersions: ["v1"]
+        resources: ["pods"]
+        scope: "Namespaced"
+    {{- with .Values.webhook.namespaceSelector }}
+    namespaceSelector:
+      {{- toYaml . | nindent 6 }}
+    {{- end }}
+    objectSelector:
+      matchExpressions:
+        - key: ferrite.dev/inject
+          operator: DoesNotExist
+{{- end }}

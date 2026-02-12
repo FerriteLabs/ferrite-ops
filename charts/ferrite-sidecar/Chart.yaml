@@ -1,0 +1,48 @@
+apiVersion: v2
+name: ferrite-sidecar
+description: Ferrite as a Kubernetes sidecar cache with automatic injection webhook
+
+type: application
+
+version: 0.2.0
+
+appVersion: "0.1.0"
+
+home: https://ferrite.dev
+
+sources:
+  - https://github.com/ferritelabs/ferrite
+
+maintainers:
+  - name: Jose David Baena
+    email: josedab@example.com
+
+keywords:
+  - redis
+  - cache
+  - sidecar
+  - key-value
+  - ferrite
+  - kubernetes
+  - webhook
+  - auto-injection
+
+annotations:
+  artifacthub.io/license: Apache-2.0
+  artifacthub.io/changes: |
+    - kind: added
+      description: Mutating webhook for automatic sidecar injection
+    - kind: added
+      description: cert-manager integration for TLS certificates
+    - kind: added
+      description: Self-signed certificate generation fallback
+    - kind: added
+      description: RBAC resources for webhook service account
+    - kind: added
+      description: Configurable injector deployment and sidecar defaults
+  artifacthub.io/containsSecurityUpdates: "false"
+  artifacthub.io/links: |
+    - name: Documentation
+      url: https://ferrite.dev/docs/deployment/kubernetes-sidecar
+    - name: GitHub
+      url: https://github.com/ferritelabs/ferrite

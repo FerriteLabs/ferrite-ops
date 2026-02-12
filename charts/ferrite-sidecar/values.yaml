@@ -1,0 +1,141 @@
+# Default values for ferrite-sidecar.
+# Deploys Ferrite as a sidecar cache container alongside your application pods.
+
+image:
+  # -- Container image repository
+  repository: ghcr.io/ferritelabs/ferrite
+  # -- Image pull policy
+  pullPolicy: IfNotPresent
+  # -- Overrides the image tag (default is the chart appVersion)
+  tag: ""
+
+# -- Image pull secrets for private registries
+imagePullSecrets: []
+
+# -- Override the name of the chart
+nameOverride: ""
+# -- Override the full name of the chart
+fullnameOverride: ""
+
+# Sidecar container resources (kept small for co-located cache)
+resources:
+  limits:
+    cpu: 250m
+    memory: 256Mi
+  requests:
+    cpu: 50m
+    memory: 64Mi
+
+# -- Container security context for the sidecar
+securityContext:
+  runAsNonRoot: true
+  runAsUser: 1000
+  runAsGroup: 1000
+  capabilities:
+    drop:
+      - ALL
+  readOnlyRootFilesystem: true
+
+# Ferrite sidecar configuration
+ferrite:
+  # -- Ferrite listen port inside the pod
+  port: 6379
+  # -- Maximum memory in bytes (default: 128MB)
+  maxMemory: "134217728"
+  # -- Maximum client connections (low for sidecar use)
+  maxConnections: 128
+  # -- Eviction policy when memory limit is reached
+  evictionPolicy: "allkeys-lru"
+  # -- Log level
+  logLevel: "warn"
+  # -- Log format
+  logFormat: "json"
+  # -- Number of databases
+  databases: 4
+
+# Webhook configuration for automatic sidecar injection
+webhook:
+  # -- Enable the mutating webhook for automatic sidecar injection
+  enabled: true
+  # -- Webhook server listen port
+  port: 8443
+  # -- cert-manager integration for TLS certificates
+  certManager:
+    # -- Set to true if cert-manager is installed in the cluster
+    enabled: false
+    # -- Issuer reference for cert-manager Certificate resource
+    issuerRef:
+      name: selfsigned-issuer
+      kind: ClusterIssuer
+  # -- Namespace selector: only namespaces matching these labels will have injection
+  namespaceSelector:
+    matchLabels:
+      ferrite.dev/inject: enabled
+  # -- Webhook failure policy (Ignore or Fail)
+  # Ignore: don't block pod creation if the webhook is unavailable
+  failurePolicy: Ignore
+
+# Injector deployment configuration (the webhook server)
+injector:
+  # -- Injector container image
+  image:
+    repository: ghcr.io/ferritelabs/ferrite-sidecar-injector
+    tag: "latest"
+    pullPolicy: IfNotPresent
+  # -- Resource requests and limits for the injector pod
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      cpu: 100m
+      memory: 128Mi
+  # -- Number of injector replicas (2 recommended for HA)
+  replicas: 1
+  # -- Pod annotations for the injector deployment
+  podAnnotations: {}
+  # -- Node selector for the injector deployment
+  nodeSelector: {}
+  # -- Tolerations for the injector deployment
+  tolerations: []
+  # -- Affinity rules for the injector deployment
+  affinity: {}
+
+# Configuration for the injected sidecar container
+sidecar:
+  # -- Ferrite image for the injected sidecar
+  image:
+    repository: ghcr.io/ferritelabs/ferrite
+    tag: "latest"
+  # -- Resource requests and limits for injected sidecar containers
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+  # -- Ferrite listen port inside the injected sidecar
+  port: 6379
+  # -- Prometheus metrics port for the injected sidecar
+  metricsPort: 9090
+
+# Persistence is disabled by default for sidecar mode (memory-only cache)
+persistence:
+  # -- Enable persistence (not recommended for sidecar mode)
+  enabled: false
+
+# Health check for the sidecar container
+livenessProbe:
+  enabled: true
+  initialDelaySeconds: 5
+  periodSeconds: 10
+  timeoutSeconds: 3
+  failureThreshold: 3
+
+readinessProbe:
+  enabled: true
+  initialDelaySeconds: 3
+  periodSeconds: 5
+  timeoutSeconds: 1
+  failureThreshold: 3

@@ -1,0 +1,100 @@
+{{- if .Values.webhook.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "ferrite-sidecar.webhook.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "ferrite-sidecar.webhook.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.injector.replicas }}
+  selector:
+    matchLabels:
+      {{- include "ferrite-sidecar.webhook.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "ferrite-sidecar.webhook.selectorLabels" . | nindent 8 }}
+      {{- with .Values.injector.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      serviceAccountName: {{ include "ferrite-sidecar.webhook.serviceAccountName" . }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: injector
+          image: {{ include "ferrite-sidecar.injector.image" . }}
+          imagePullPolicy: {{ .Values.injector.image.pullPolicy }}
+          args:
+            - --tls-cert-file=/etc/webhook/certs/tls.crt
+            - --tls-key-file=/etc/webhook/certs/tls.key
+            - --port={{ .Values.webhook.port }}
+            - --sidecar-image={{ include "ferrite-sidecar.sidecar.image" . }}
+            - --sidecar-port={{ .Values.sidecar.port }}
+            - --sidecar-cpu-request={{ .Values.sidecar.resources.requests.cpu }}
+            - --sidecar-cpu-limit={{ .Values.sidecar.resources.limits.cpu }}
+            - --sidecar-memory-request={{ .Values.sidecar.resources.requests.memory }}
+            - --sidecar-memory-limit={{ .Values.sidecar.resources.limits.memory }}
+            - --metrics-port={{ .Values.sidecar.metricsPort }}
+            - --configmap-name={{ include "ferrite-sidecar.fullname" . }}
+          ports:
+            - name: https
+              containerPort: {{ .Values.webhook.port }}
+              protocol: TCP
+            - name: healthz
+              containerPort: 8080
+              protocol: TCP
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: healthz
+              scheme: HTTP
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: healthz
+              scheme: HTTP
+            initialDelaySeconds: 3
+            periodSeconds: 5
+            timeoutSeconds: 1
+            failureThreshold: 3
+          resources:
+            {{- toYaml .Values.injector.resources | nindent 12 }}
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65534
+            runAsGroup: 65534
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - name: webhook-certs
+              mountPath: /etc/webhook/certs
+              readOnly: true
+      volumes:
+        - name: webhook-certs
+          secret:
+            secretName: {{ include "ferrite-sidecar.webhook.tlsSecretName" . }}
+      {{- with .Values.injector.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.injector.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.injector.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}

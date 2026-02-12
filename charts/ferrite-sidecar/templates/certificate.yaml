@@ -1,0 +1,124 @@
+{{- if .Values.webhook.enabled }}
+{{- if .Values.webhook.certManager.enabled }}
+# ---- cert-manager Certificate resource ----
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: {{ include "ferrite-sidecar.webhook.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "ferrite-sidecar.webhook.labels" . | nindent 4 }}
+spec:
+  secretName: {{ include "ferrite-sidecar.webhook.tlsSecretName" . }}
+  dnsNames:
+    - {{ include "ferrite-sidecar.webhook.fullname" . }}
+    - {{ include "ferrite-sidecar.webhook.fullname" . }}.{{ .Release.Namespace }}
+    - {{ include "ferrite-sidecar.webhook.fullname" . }}.{{ .Release.Namespace }}.svc
+    - {{ include "ferrite-sidecar.webhook.fullname" . }}.{{ .Release.Namespace }}.svc.cluster.local
+  issuerRef:
+    name: {{ .Values.webhook.certManager.issuerRef.name }}
+    kind: {{ .Values.webhook.certManager.issuerRef.kind }}
+  duration: 8760h   # 1 year
+  renewBefore: 720h  # 30 days before expiry
+{{- else }}
+# ---- Self-signed certificate generation Job ----
+# This Job generates a self-signed CA and TLS certificate for the webhook,
+# stores them in a Secret, and patches the MutatingWebhookConfiguration
+# with the CA bundle.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "ferrite-sidecar.webhook.fullname" . }}-cert-gen
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "ferrite-sidecar.webhook.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook-weight": "-5"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  backoffLimit: 3
+  template:
+    metadata:
+      labels:
+        {{- include "ferrite-sidecar.webhook.selectorLabels" . | nindent 8 }}
+    spec:
+      serviceAccountName: {{ include "ferrite-sidecar.webhook.serviceAccountName" . }}
+      restartPolicy: OnFailure
+      containers:
+        - name: cert-gen
+          image: registry.k8s.io/ingress-nginx/kube-webhook-certgen:v1.4.4
+          imagePullPolicy: IfNotPresent
+          args:
+            - create
+            - --host={{ include "ferrite-sidecar.webhook.fullname" . }},{{ include "ferrite-sidecar.webhook.fullname" . }}.{{ .Release.Namespace }}.svc,{{ include "ferrite-sidecar.webhook.fullname" . }}.{{ .Release.Namespace }}.svc.cluster.local
+            - --namespace={{ .Release.Namespace }}
+            - --secret-name={{ include "ferrite-sidecar.webhook.tlsSecretName" . }}
+            - --cert-name=tls.crt
+            - --key-name=tls.key
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65534
+            runAsGroup: 65534
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              cpu: 50m
+              memory: 64Mi
+---
+# Job to patch the webhook configuration with the CA bundle
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "ferrite-sidecar.webhook.fullname" . }}-cert-patch
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "ferrite-sidecar.webhook.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": post-install,post-upgrade
+    "helm.sh/hook-weight": "5"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  backoffLimit: 3
+  template:
+    metadata:
+      labels:
+        {{- include "ferrite-sidecar.webhook.selectorLabels" . | nindent 8 }}
+    spec:
+      serviceAccountName: {{ include "ferrite-sidecar.webhook.serviceAccountName" . }}
+      restartPolicy: OnFailure
+      containers:
+        - name: cert-patch
+          image: registry.k8s.io/ingress-nginx/kube-webhook-certgen:v1.4.4
+          imagePullPolicy: IfNotPresent
+          args:
+            - patch
+            - --webhook-name={{ include "ferrite-sidecar.webhook.fullname" . }}
+            - --namespace={{ .Release.Namespace }}
+            - --secret-name={{ include "ferrite-sidecar.webhook.tlsSecretName" . }}
+            - --patch-failure-policy={{ .Values.webhook.failurePolicy }}
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65534
+            runAsGroup: 65534
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              cpu: 50m
+              memory: 64Mi
+{{- end }}
+{{- end }}

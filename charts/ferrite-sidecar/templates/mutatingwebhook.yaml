@@ -1,0 +1,45 @@
+{{/*
+  DEPRECATED: This file is superseded by webhook.yaml.
+  Kept for backward compatibility with existing installations that use
+  .Values.injector.enabled. New deployments should use .Values.webhook.enabled
+  and the templates in webhook.yaml instead.
+*/}}
+{{- if and .Values.injector (hasKey .Values.injector "enabled") .Values.injector.enabled (not .Values.webhook.enabled) }}
+apiVersion: admissionregistration.k8s.io/v1
+kind: MutatingWebhookConfiguration
+metadata:
+  name: {{ include "ferrite-sidecar.fullname" . }}-injector
+  labels:
+    {{- include "ferrite-sidecar.labels" . | nindent 4 }}
+  annotations:
+    ferrite.dev/deprecated: "true"
+    ferrite.dev/migration: "Migrate to webhook.enabled=true. See README.md for details."
+webhooks:
+  - name: sidecar-injector.ferrite.dev
+    admissionReviewVersions: ["v1"]
+    sideEffects: None
+    failurePolicy: {{ .Values.injector.failurePolicy | default "Ignore" }}
+    clientConfig:
+      service:
+        name: {{ include "ferrite-sidecar.fullname" . }}-injector
+        namespace: {{ .Release.Namespace }}
+        path: /mutate
+        port: {{ .Values.injector.servicePort | default 443 }}
+      {{- if .Values.injector.tlsSecretName }}
+      caBundle: ""  # Populated by cert-manager or manually
+      {{- end }}
+    rules:
+      - operations: ["CREATE"]
+        apiGroups: [""]
+        apiVersions: ["v1"]
+        resources: ["pods"]
+    {{- with .Values.injector.namespaceSelector }}
+    namespaceSelector:
+      {{- toYaml . | nindent 6 }}
+    {{- end }}
+    objectSelector:
+      matchExpressions:
+        - key: {{ .Values.injector.annotationKey | default "ferrite.dev/inject-sidecar" }}
+          operator: In
+          values: ["true"]
+{{- end }}

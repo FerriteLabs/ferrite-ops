@@ -1,0 +1,31 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "ferrite-sidecar.fullname" . }}
+  labels:
+    {{- include "ferrite-sidecar.labels" . | nindent 4 }}
+data:
+  ferrite.toml: |
+    [server]
+    bind = "127.0.0.1"
+    port = {{ .Values.ferrite.port }}
+    max_connections = {{ .Values.ferrite.maxConnections }}
+    tcp_keepalive = 60
+    timeout = 0
+
+    [storage]
+    databases = {{ .Values.ferrite.databases }}
+    max_memory = {{ .Values.ferrite.maxMemory | quote }}
+    backend = "memory"
+    eviction_policy = {{ .Values.ferrite.evictionPolicy | quote }}
+
+    [persistence]
+    aof_enabled = false
+    checkpoint_enabled = false
+
+    [logging]
+    level = {{ .Values.ferrite.logLevel | quote }}
+    format = {{ .Values.ferrite.logFormat | quote }}
+
+    [metrics]
+    enabled = false
