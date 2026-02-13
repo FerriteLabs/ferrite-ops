@@ -1,0 +1,15 @@
+ferrite (0.1.0-1) unstable; urgency=medium
+
+  * Initial release.
+  * Redis-compatible key-value store with tiered storage
+  * Support for strings, lists, sets, sorted sets, hashes
+  * Vector search and embeddings support
+  * Time-series data capabilities
+  * Graph database features
+  * CRDT support for distributed systems
+  * AOF and checkpoint persistence
+  * Cluster and replication support
+  * TLS/mTLS encryption
+  * ACL authentication
+
+ -- Ferrite Maintainers <maintainers@ferrite.dev>  Sat, 01 Jan 2025 00:00:00 +0000

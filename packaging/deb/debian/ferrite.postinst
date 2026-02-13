@@ -1,0 +1,44 @@
+#!/bin/sh
+# Post-installation script for ferrite
+
+set -e
+
+case "$1" in
+    configure)
+        # Create ferrite user and group if they don't exist
+        if ! getent group ferrite >/dev/null; then
+            addgroup --system ferrite
+        fi
+
+        if ! getent passwd ferrite >/dev/null; then
+            adduser --system --ingroup ferrite --home /var/lib/ferrite \
+                --no-create-home --gecos "Ferrite Server" ferrite
+        fi
+
+        # Set ownership of directories
+        chown -R ferrite:ferrite /var/lib/ferrite
+        chown -R ferrite:ferrite /var/log/ferrite
+        chown -R root:ferrite /etc/ferrite
+        chmod 750 /var/lib/ferrite
+        chmod 750 /var/log/ferrite
+        chmod 750 /etc/ferrite
+        chmod 640 /etc/ferrite/ferrite.toml
+
+        # Reload systemd
+        if [ -d /run/systemd/system ]; then
+            systemctl daemon-reload >/dev/null 2>&1 || true
+        fi
+        ;;
+
+    abort-upgrade|abort-remove|abort-deconfigure)
+        ;;
+
+    *)
+        echo "postinst called with unknown argument \`$1'" >&2
+        exit 1
+        ;;
+esac
+
+#DEBHELPER#
+
+exit 0

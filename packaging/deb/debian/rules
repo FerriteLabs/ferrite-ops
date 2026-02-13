@@ -1,0 +1,68 @@
+#!/usr/bin/make -f
+
+# Debian rules for building Ferrite packages
+
+export DH_VERBOSE = 1
+export DEB_BUILD_MAINT_OPTIONS = hardening=+all
+
+# Set cargo environment
+export CARGO_HOME = $(CURDIR)/debian/.cargo
+export RUSTFLAGS = -C link-arg=-Wl,-z,relro,-z,now
+
+%:
+	dh $@
+
+override_dh_auto_build:
+	cargo build --release --locked
+	# Build CLI if present
+	if [ -d "ferrite-cli" ]; then \
+		cargo build --release --locked --manifest-path ferrite-cli/Cargo.toml; \
+	fi
+	# Build TUI if present
+	if [ -d "ferrite-tui" ]; then \
+		cargo build --release --locked --manifest-path ferrite-tui/Cargo.toml; \
+	fi
+
+override_dh_auto_install:
+	# Install main binary
+	install -D -m 755 target/release/ferrite \
+		debian/ferrite/usr/bin/ferrite
+
+	# Install CLI binary if built
+	if [ -f "target/release/ferrite-cli" ]; then \
+		install -D -m 755 target/release/ferrite-cli \
+			debian/ferrite-cli/usr/bin/ferrite-cli; \
+	fi
+
+	# Install TUI binary if built
+	if [ -f "target/release/ferrite-tui" ]; then \
+		install -D -m 755 target/release/ferrite-tui \
+			debian/ferrite-tui/usr/bin/ferrite-tui; \
+	fi
+
+	# Install configuration file
+	install -D -m 644 debian/ferrite.conf \
+		debian/ferrite/etc/ferrite/ferrite.toml
+
+	# Install systemd service
+	install -D -m 644 debian/ferrite.service \
+		debian/ferrite/lib/systemd/system/ferrite.service
+
+	# Create data directory
+	install -d -m 750 debian/ferrite/var/lib/ferrite
+
+	# Create log directory
+	install -d -m 750 debian/ferrite/var/log/ferrite
+
+override_dh_auto_test:
+	cargo test --release --locked
+
+override_dh_auto_clean:
+	cargo clean || true
+	rm -rf $(CARGO_HOME)
+
+override_dh_installsystemd:
+	dh_installsystemd --name=ferrite --no-enable --no-start
+
+override_dh_strip:
+	dh_strip --no-automatic-dbgsym

@@ -1,0 +1,50 @@
+Source: ferrite
+Section: database
+Priority: optional
+Maintainer: Ferrite Maintainers <maintainers@ferrite.dev>
+Build-Depends: debhelper-compat (= 13),
+               cargo,
+               rustc (>= 1.70),
+               libssl-dev,
+               pkg-config
+Standards-Version: 4.6.2
+Homepage: https://ferrite.dev
+Vcs-Browser: https://github.com/ferritelabs/ferrite
+Vcs-Git: https://github.com/ferritelabs/ferrite.git
+Rules-Requires-Root: no
+
+Package: ferrite
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}
+Recommends: ferrite-cli
+Suggests: ferrite-tui
+Description: High-performance, tiered-storage key-value store
+ Ferrite is a Redis-compatible key-value store with tiered storage
+ support. It provides the speed of memory, the capacity of disk,
+ and the economics of cloud.
+ .
+ Features:
+  * Drop-in Redis replacement with 99% command compatibility
+  * Tiered storage (memory, SSD, cloud)
+  * Vector search and embeddings
+  * Time-series data support
+  * Graph database capabilities
+  * CRDT support for distributed systems
+  * Built-in RAG and semantic caching
+ .
+ This package contains the Ferrite server.
+
+Package: ferrite-cli
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}
+Description: Command-line interface for Ferrite
+ This package contains the Ferrite command-line interface (ferrite-cli),
+ a Redis-compatible REPL for interacting with Ferrite servers.
+
+Package: ferrite-tui
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}
+Recommends: ferrite
+Description: Terminal UI dashboard for Ferrite
+ This package contains the Ferrite Terminal User Interface (ferrite-tui),
+ a real-time dashboard for monitoring Ferrite servers.

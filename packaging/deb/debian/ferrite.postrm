@@ -1,0 +1,33 @@
+#!/bin/sh
+# Post-removal script for ferrite
+
+set -e
+
+case "$1" in
+    purge)
+        # Remove user and group
+        if getent passwd ferrite >/dev/null; then
+            deluser --system ferrite || true
+        fi
+        if getent group ferrite >/dev/null; then
+            delgroup --system ferrite || true
+        fi
+
+        # Remove data directories on purge
+        rm -rf /var/lib/ferrite
+        rm -rf /var/log/ferrite
+        rm -rf /etc/ferrite
+        ;;
+
+    remove|upgrade|failed-upgrade|abort-install|abort-upgrade|disappear)
+        ;;
+
+    *)
+        echo "postrm called with unknown argument \`$1'" >&2
+        exit 1
+        ;;
+esac
+
+#DEBHELPER#
+
+exit 0
