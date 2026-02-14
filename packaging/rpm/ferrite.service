@@ -1,0 +1,49 @@
+[Unit]
+Description=Ferrite - High-Performance Key-Value Store
+Documentation=https://ferrite.dev/docs
+After=network.target
+Wants=network-online.target
+
+[Service]
+Type=notify
+User=ferrite
+Group=ferrite
+ExecStart=/usr/bin/ferrite --config /etc/ferrite/ferrite.toml
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=5s
+
+# Security hardening
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/ferrite /var/log/ferrite
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+MemoryDenyWriteExecute=yes
+LockPersonality=yes
+
+# Resource limits
+LimitNOFILE=65535
+LimitNPROC=4096
+
+# Capabilities
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+# Working directory
+WorkingDirectory=/var/lib/ferrite
+StateDirectory=ferrite
+LogsDirectory=ferrite
+ConfigurationDirectory=ferrite
+
+# Timeout
+TimeoutStartSec=30
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target
