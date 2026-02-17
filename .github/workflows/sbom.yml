@@ -1,0 +1,103 @@
+name: SBOM Generation & Verification
+
+on:
+  release:
+    types: [published]
+  schedule:
+    # Weekly on Mondays at 06:00 UTC
+    - cron: '0 6 * * 1'
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository_owner }}/ferrite
+
+jobs:
+  sbom:
+    name: Generate SBOM & Verify Image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Determine image tag
+        id: image-tag
+        run: |
+          if [ "${{ github.event_name }}" = "release" ]; then
+            TAG="${{ github.event.release.tag_name }}"
+          else
+            TAG="latest"
+          fi
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "image=${REGISTRY}/${IMAGE_NAME}:${TAG}" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Verify container signature with Cosign
+        run: |
+          cosign verify \
+            --certificate-oidc-issuer=https://token.actions.githubusercontent.com \
+            --certificate-identity-regexp="^https://github\\.com/${{ github.repository_owner }}/" \
+            "${{ steps.image-tag.outputs.image }}" || echo "::warning::Signature verification failed or image is not signed"
+
+      - name: Run Trivy vulnerability scan
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ${{ steps.image-tag.outputs.image }}
+          format: table
+          exit-code: 0
+          severity: CRITICAL,HIGH
+
+      - name: Generate SBOM with Trivy (SPDX)
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ${{ steps.image-tag.outputs.image }}
+          format: spdx-json
+          output: ferrite-sbom-spdx.json
+          scan-type: image
+
+      - name: Generate SBOM with Trivy (CycloneDX)
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ${{ steps.image-tag.outputs.image }}
+          format: cyclonedx
+          output: ferrite-sbom-cyclonedx.json
+          scan-type: image
+
+      - name: Upload SBOM artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-${{ steps.image-tag.outputs.tag }}
+          path: |
+            ferrite-sbom-spdx.json
+            ferrite-sbom-cyclonedx.json
+          retention-days: 90
+
+      - name: Upload SBOM as release asset
+        if: github.event_name == 'release'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload "${{ github.event.release.tag_name }}" \
+            ferrite-sbom-spdx.json \
+            ferrite-sbom-cyclonedx.json \
+            --clobber
+
+      - name: Verify SBOM attestation on image
+        run: |
+          cosign verify-attestation \
+            --type spdxjson \
+            --certificate-oidc-issuer=https://token.actions.githubusercontent.com \
+            --certificate-identity-regexp="^https://github\\.com/${{ github.repository_owner }}/" \
+            "${{ steps.image-tag.outputs.image }}" || echo "::warning::SBOM attestation verification failed or not present"
