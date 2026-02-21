@@ -17,6 +17,9 @@ services:
     image: ferrite:latest
     container_name: ferrite
     hostname: ferrite
+    labels:
+      org.opencontainers.image.title: "Ferrite"
+      org.opencontainers.image.description: "High-performance tiered-storage key-value store"
     ports:
       - "6379:6379"   # Redis protocol port
       - "9090:9090"   # Prometheus metrics endpoint
