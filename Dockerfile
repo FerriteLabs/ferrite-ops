@@ -93,7 +93,7 @@ ENV FERRITE_DATA_DIR=/var/lib/ferrite/data
 VOLUME ["/var/lib/ferrite/data"]
 
 # Health check
-HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
+HEALTHCHECK --interval=15s --timeout=3s --start-period=5s --retries=3 \
     CMD ["/usr/local/bin/ferrite-cli", "PING"] || exit 1
 
 # Set entrypoint
