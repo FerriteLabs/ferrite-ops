@@ -1,7 +1,8 @@
 # syntax=docker/dockerfile:1
 
 # Build stage 1: Compute a recipe file
-FROM rust:1.88-slim-bookworm AS chef
+ARG BUILDPLATFORM=linux/amd64
+FROM --platform=$BUILDPLATFORM rust:1.88-slim-bookworm AS chef
 ARG TARGETARCH=amd64
 
 # Install cargo-chef for caching dependencies
