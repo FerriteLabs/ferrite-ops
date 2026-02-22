@@ -24,6 +24,22 @@ helm install ferrite charts/ferrite
 ./scripts/quickstart.sh
 ```
 
+## Grafana Dashboards
+
+Import dashboards from `grafana/dashboards/`:
+
+```bash
+# Copy dashboards to Grafana provisioning directory
+cp grafana/dashboards/*.json /var/lib/grafana/dashboards/
+
+# Or use Docker Compose with monitoring profile
+docker compose --profile monitoring up -d
+```
+
+Available dashboards:
+- **Ferrite Overview** — Key metrics, memory, and throughput
+- **Ferrite Operations** — Command latency and error rates
+
 ## License
 
 Apache-2.0
