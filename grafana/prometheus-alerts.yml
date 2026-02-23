@@ -164,3 +164,41 @@ groups:
         annotations:
           summary: "Low cache hit rate on {{ $labels.instance }}"
           description: "Hit rate is {{ $value | humanizePercentage }}. Check key patterns."
+
+  - name: ferrite.resources
+    rules:
+      - alert: FerriteCPUSaturation
+        expr: rate(process_cpu_seconds_total{job="ferrite"}[5m]) > 0.9
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High CPU usage on {{ $labels.instance }}"
+          description: "Ferrite CPU utilization at {{ $value | humanizePercentage }} for 10+ minutes."
+
+      - alert: FerriteCPUSaturationCritical
+        expr: rate(process_cpu_seconds_total{job="ferrite"}[5m]) > 0.95
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Critical CPU saturation on {{ $labels.instance }}"
+          description: "CPU at {{ $value | humanizePercentage }}. Performance degradation likely."
+
+      - alert: FerriteCommandErrors
+        expr: rate(ferrite_commands_failed_total[5m]) > 10
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High command error rate on {{ $labels.instance }}"
+          description: "{{ $value }} command errors/sec over 5 minutes."
+
+      - alert: FerriteCommandErrorsCritical
+        expr: rate(ferrite_commands_failed_total[5m]) / rate(ferrite_commands_total[5m]) > 0.05
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Command error ratio critical on {{ $labels.instance }}"
+          description: "{{ $value | humanizePercentage }} of commands failing."
