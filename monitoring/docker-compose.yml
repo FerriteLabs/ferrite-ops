@@ -1,0 +1,57 @@
+# Ferrite Observability Starter Kit
+#
+# Full monitoring stack for Ferrite with Prometheus + Grafana.
+# Pre-configured dashboards, alerting rules, and datasources.
+#
+# Quick start:
+#   docker compose up -d
+#
+# This assumes Ferrite is running on localhost:6379 with metrics on :9090.
+# Override with environment variables:
+#   FERRITE_HOST=10.0.0.5 FERRITE_METRICS_PORT=9090 docker compose up -d
+#
+# Access:
+#   Grafana:    http://localhost:3000  (admin / ferrite)
+#   Prometheus: http://localhost:9091
+
+services:
+  prometheus:
+    image: prom/prometheus:v2.48.0
+    container_name: ferrite-prometheus
+    ports:
+      - "${PROMETHEUS_PORT:-9091}:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./prometheus-alerts.yml:/etc/prometheus/alerts.yml:ro
+      - prometheus-data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--storage.tsdb.retention.time=30d'
+      - '--web.enable-lifecycle'
+    restart: unless-stopped
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  grafana:
+    image: grafana/grafana:10.2.2
+    container_name: ferrite-grafana
+    ports:
+      - "${GRAFANA_PORT:-3000}:3000"
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+    environment:
+      - GF_SECURITY_ADMIN_USER=${GRAFANA_ADMIN_USER:-admin}
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD:-ferrite}
+      - GF_USERS_ALLOW_SIGN_UP=false
+      - GF_ANALYTICS_REPORTING_ENABLED=false
+      - GF_ANALYTICS_CHECK_FOR_UPDATES=false
+    restart: unless-stopped
+    depends_on:
+      - prometheus
+
+volumes:
+  prometheus-data:
+  grafana-data:
