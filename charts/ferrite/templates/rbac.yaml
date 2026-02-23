@@ -1,0 +1,35 @@
+{{- if and .Values.serviceAccount.create .Values.rbac.create }}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "ferrite.fullname" . }}
+  labels:
+    {{- include "ferrite.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "watch", "list"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list"]
+  {{- if .Values.cluster.enabled }}
+  - apiGroups: [""]
+    resources: ["endpoints"]
+    verbs: ["get", "list", "watch"]
+  {{- end }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "ferrite.fullname" . }}
+  labels:
+    {{- include "ferrite.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "ferrite.fullname" . }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "ferrite.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+{{- end }}

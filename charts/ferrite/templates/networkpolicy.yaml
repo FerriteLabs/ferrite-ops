@@ -1,0 +1,65 @@
+{{- if .Values.networkPolicy.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "ferrite.fullname" . }}
+  labels:
+    {{- include "ferrite.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "ferrite.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    # Allow Redis protocol traffic
+    - ports:
+        - port: {{ .Values.service.port }}
+          protocol: TCP
+      {{- if .Values.networkPolicy.allowFromNamespaces }}
+      from:
+        {{- range .Values.networkPolicy.allowFromNamespaces }}
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ . }}
+        {{- end }}
+      {{- end }}
+    # Allow metrics scraping
+    {{- if .Values.ferrite.metrics.enabled }}
+    - ports:
+        - port: {{ .Values.service.metricsPort }}
+          protocol: TCP
+    {{- end }}
+    {{- if .Values.ferrite.tls.enabled }}
+    # Allow TLS traffic
+    - ports:
+        - port: {{ .Values.ferrite.tls.port }}
+          protocol: TCP
+    {{- end }}
+    {{- if .Values.cluster.enabled }}
+    # Allow cluster bus traffic
+    - ports:
+        - port: {{ .Values.cluster.port }}
+          protocol: TCP
+    {{- end }}
+  egress:
+    # Allow DNS
+    - ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+    # Allow communication with other Ferrite pods (replication/cluster)
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "ferrite.selectorLabels" . | nindent 14 }}
+      ports:
+        - port: {{ .Values.service.port }}
+          protocol: TCP
+        {{- if .Values.cluster.enabled }}
+        - port: {{ .Values.cluster.port }}
+          protocol: TCP
+        {{- end }}
+{{- end }}
