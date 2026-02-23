@@ -30,6 +30,16 @@ tcp_keepalive = 300
 # Client timeout in seconds (0 to disable).
 timeout = 0
 
+# Protocol frame limits (DoS protection).
+# Maximum bulk string size in bytes (default: 512MB, matches Redis proto-max-bulk-len).
+# proto_max_bulk_len = 536870912
+
+# Maximum array/set/map element count (default: 1,048,576).
+# proto_max_multi_bulk_len = 1048576
+
+# Maximum nesting depth for recursive RESP structures (default: 64).
+# proto_max_nesting_depth = 64
+
 # ============================================================================
 # Storage Configuration
 # ============================================================================
