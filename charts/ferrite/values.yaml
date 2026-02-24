@@ -28,6 +28,11 @@ serviceAccount:
   # -- The name of the service account to use
   name: ""
 
+# -- RBAC configuration
+rbac:
+  # -- Create Role and RoleBinding for the ServiceAccount
+  create: true
+
 # -- Pod annotations
 podAnnotations: {}
 
@@ -91,6 +96,26 @@ affinity: {}
 # -- Topology spread constraints
 topologySpreadConstraints: []
 
+# -- Network Policy
+networkPolicy:
+  # -- Enable NetworkPolicy
+  enabled: false
+  # -- Namespaces allowed to access Ferrite (empty = all namespaces)
+  allowFromNamespaces: []
+
+# -- Autoscaling (HPA)
+autoscaling:
+  # -- Enable HorizontalPodAutoscaler
+  enabled: false
+  # -- Minimum replicas
+  minReplicas: 1
+  # -- Maximum replicas
+  maxReplicas: 5
+  # -- Target CPU utilization (percentage)
+  targetCPUUtilizationPercentage: 80
+  # -- Target memory utilization (percentage)
+  targetMemoryUtilizationPercentage: 80
+
 # Ferrite configuration
 ferrite:
   # -- Server configuration
@@ -103,6 +128,12 @@ ferrite:
     tcpKeepalive: 300
     # -- Client timeout (seconds, 0 to disable)
     timeout: 0
+    # -- Maximum bulk string length (bytes, DoS protection)
+    protoMaxBulkLen: 536870912
+    # -- Maximum multi-bulk elements
+    protoMaxMultiBulkLen: 1048576
+    # -- Maximum nesting depth
+    protoMaxNestingDepth: 64
 
   # -- Storage configuration
   storage:
@@ -112,6 +143,10 @@ ferrite:
     maxMemory: "1073741824"
     # -- Storage backend (memory or hybridlog)
     backend: "memory"
+    # -- Maximum key size in bytes
+    maxKeySize: 512
+    # -- Maximum value size in bytes
+    maxValueSize: 536870912
 
   # -- Persistence configuration
   persistence:
@@ -119,10 +154,14 @@ ferrite:
     aofEnabled: true
     # -- AOF sync policy (always, everysec, no)
     aofSync: "everysec"
+    # -- AOF file path (relative to data dir)
+    aofPath: "appendonly.aof"
     # -- Enable checkpoints
     checkpointEnabled: true
     # -- Checkpoint interval
     checkpointInterval: "5m"
+    # -- Checkpoint directory (relative to data dir)
+    checkpointDir: "checkpoints"
 
   # -- Logging configuration
   logging:
@@ -130,6 +169,8 @@ ferrite:
     level: "info"
     # -- Log format (pretty, json)
     format: "json"
+    # -- Log file path (empty for stdout only)
+    file: ""
 
   # -- Metrics configuration
   metrics:

@@ -102,24 +102,32 @@ port = 6379
 max_connections = {{ .Values.ferrite.server.maxConnections }}
 tcp_keepalive = {{ .Values.ferrite.server.tcpKeepalive }}
 timeout = {{ .Values.ferrite.server.timeout }}
+proto_max_bulk_len = {{ .Values.ferrite.server.protoMaxBulkLen }}
+proto_max_multi_bulk_len = {{ .Values.ferrite.server.protoMaxMultiBulkLen }}
+proto_max_nesting_depth = {{ .Values.ferrite.server.protoMaxNestingDepth }}
 
 [storage]
 databases = {{ .Values.ferrite.storage.databases }}
 max_memory = {{ .Values.ferrite.storage.maxMemory }}
 backend = {{ .Values.ferrite.storage.backend | quote }}
 data_dir = "/var/lib/ferrite/data"
+max_key_size = {{ .Values.ferrite.storage.maxKeySize }}
+max_value_size = {{ .Values.ferrite.storage.maxValueSize }}
 
 [persistence]
 aof_enabled = {{ .Values.ferrite.persistence.aofEnabled }}
-aof_path = "/var/lib/ferrite/data/appendonly.aof"
+aof_path = "/var/lib/ferrite/data/{{ .Values.ferrite.persistence.aofPath }}"
 aof_sync = {{ .Values.ferrite.persistence.aofSync | quote }}
 checkpoint_enabled = {{ .Values.ferrite.persistence.checkpointEnabled }}
 checkpoint_interval = {{ .Values.ferrite.persistence.checkpointInterval | quote }}
-checkpoint_path = "/var/lib/ferrite/data/checkpoint.rdb"
+checkpoint_path = "/var/lib/ferrite/data/{{ .Values.ferrite.persistence.checkpointDir }}"
 
 [logging]
 level = {{ .Values.ferrite.logging.level | quote }}
 format = {{ .Values.ferrite.logging.format | quote }}
+{{- if .Values.ferrite.logging.file }}
+file = {{ .Values.ferrite.logging.file | quote }}
+{{- end }}
 
 [metrics]
 enabled = {{ .Values.ferrite.metrics.enabled }}

@@ -44,3 +44,14 @@ To get started:
 {{- end }}
 
 For more information, visit: https://ferrite.dev/docs
+
+{{- if not .Values.ferrite.tls.enabled }}
+
+⚠️  SECURITY WARNING: TLS is disabled. Connections are unencrypted.
+    Enable TLS for production: set ferrite.tls.enabled=true with cert/key.
+{{- end }}
+{{- if not .Values.ferrite.auth.enabled }}
+
+⚠️  SECURITY WARNING: Authentication is disabled. The default user has no password.
+    Enable auth for production: set ferrite.auth.enabled=true with a password secret.
+{{- end }}

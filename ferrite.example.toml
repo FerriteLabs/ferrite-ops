@@ -125,6 +125,8 @@ format = "pretty"
 # key_file = "/path/to/key.pem"
 # ca_file = "/path/to/ca.pem"  # For mTLS
 # require_client_cert = false
+# min_protocol_version = "1.2"  # "1.2" or "1.3"
+# require_client_cert = false
 
 # ============================================================================
 # Cluster Configuration (optional)
