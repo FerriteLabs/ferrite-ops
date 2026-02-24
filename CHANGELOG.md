@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Helm chart: NetworkPolicy template for pod traffic restriction
+- Helm chart: HorizontalPodAutoscaler (HPA) template
+- Helm chart: PodDisruptionBudget template
+- Helm chart: RBAC (Role + RoleBinding) template
+- Helm chart: Ingress template
+- Helm chart: Connection test template (`helm test`)
+- Helm chart: Helm repository publishing workflow (chart-releaser)
+- Helm chart: Additional config values (storage limits, protocol limits, persistence paths)
+- Grafana: Connection open rate, eviction/expiration, AOF write, replication event panels
+- Prometheus: CPU saturation and command error rate alerts
+- Dockerfile: Parameterized version label via `ARG FERRITE_VERSION`
+- Security warnings in Helm NOTES.txt for disabled TLS/auth
+- ShellCheck CI workflow for scripts
+- Dependabot auto-merge workflow
+- Chart version auto-bump on upstream release dispatch
+
+### Changed
+- Pinned `trivy-action` from `@master` to `@0.28.0`
+- Added `github-actions` ecosystem to dependabot.yml
+
+### Security
+- Added SECURITY.md with vulnerability reporting guidelines
+
 ## [0.1.0] - 2025-01-23
 
 ### Added
