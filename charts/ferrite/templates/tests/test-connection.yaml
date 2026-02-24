@@ -1,0 +1,39 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: "{{ include "ferrite.fullname" . }}-test-connection"
+  labels:
+    {{- include "ferrite.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": test
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  containers:
+    - name: redis-cli
+      image: redis:7-alpine
+      command: ['sh', '-c']
+      args:
+        - |
+          set -e
+          echo "Testing PING..."
+          response=$(redis-cli -h {{ include "ferrite.fullname" . }} -p {{ .Values.service.port }} PING)
+          if [ "$response" != "PONG" ]; then
+            echo "PING failed: got '$response'"
+            exit 1
+          fi
+          echo "PING: OK"
+
+          echo "Testing SET/GET..."
+          redis-cli -h {{ include "ferrite.fullname" . }} -p {{ .Values.service.port }} SET helm-test "pass"
+          response=$(redis-cli -h {{ include "ferrite.fullname" . }} -p {{ .Values.service.port }} GET helm-test)
+          if [ "$response" != "pass" ]; then
+            echo "SET/GET failed: got '$response'"
+            exit 1
+          fi
+          echo "SET/GET: OK"
+
+          echo "Cleaning up..."
+          redis-cli -h {{ include "ferrite.fullname" . }} -p {{ .Values.service.port }} DEL helm-test
+
+          echo "All tests passed!"
+  restartPolicy: Never
