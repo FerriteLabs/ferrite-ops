@@ -27,10 +27,9 @@ RUN cargo chef prepare --recipe-path recipe.json
 FROM chef AS builder
 
 # Install system dependencies needed for building
-RUN apt-get update && apt-get install -y \
+RUN apk add --no-cache \
     pkg-config \
     libssl-dev \
-    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
@@ -55,16 +54,15 @@ RUN cargo build --release --bin ferrite --bin ferrite-cli
 RUN ls -lh /app/target/release/ferrite /app/target/release/ferrite-cli
 
 # Runtime stage: Minimal image
-FROM debian:bookworm-slim AS runtime
+FROM alpine:3.19 AS runtime
 
 # Install runtime dependencies
-RUN apt-get update && apt-get install -y \
+RUN apk add --no-cache \
     ca-certificates \
-    libssl3 \
-    && rm -rf /var/lib/apt/lists/*
+    libssl3
 
 # Create a non-root user for running the application
-RUN useradd -m -u 1000 -s /bin/bash ferrite
+RUN adduser -D -u 1000 -s /bin/sh ferrite
 
 # Create data directory with proper permissions
 RUN mkdir -p /var/lib/ferrite/data && \
