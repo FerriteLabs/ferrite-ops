@@ -1,0 +1,73 @@
+# Ferrite Docker Quickstart
+#
+# One-command experience:
+#   docker compose -f docker-compose.quickstart.yml up
+#
+# This starts Ferrite and runs example commands automatically.
+
+services:
+  ferrite:
+    image: ferritelabs/ferrite:latest
+    build:
+      context: ../ferrite
+      dockerfile: ../ferrite-ops/Dockerfile
+    ports:
+      - "6379:6379"      # RESP protocol (Redis-compatible)
+      - "8080:8080"      # Studio web UI
+      - "9090:9090"      # Prometheus metrics
+    environment:
+      - RUST_LOG=ferrite=info
+      - FERRITE_STUDIO_ENABLED=true
+    healthcheck:
+      test: ["CMD", "redis-cli", "-p", "6379", "PING"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  # Runs example commands after Ferrite starts
+  quickstart:
+    image: redis:7-alpine
+    depends_on:
+      ferrite:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        echo "══════════════════════════════════════════════════════"
+        echo "  🧲 Welcome to Ferrite!"
+        echo "══════════════════════════════════════════════════════"
+        echo ""
+        echo "Ferrite is running on port 6379 (Redis-compatible)"
+        echo ""
+        echo "── Basic Operations ─────────────────────────────────"
+        redis-cli -h ferrite PING
+        redis-cli -h ferrite SET greeting "Hello from Ferrite!"
+        redis-cli -h ferrite GET greeting
+        echo ""
+        echo "── Data Types ───────────────────────────────────────"
+        redis-cli -h ferrite LPUSH fruits apple banana cherry
+        redis-cli -h ferrite LRANGE fruits 0 -1
+        redis-cli -h ferrite HSET user:1 name "Alice" email "alice@example.com" age 30
+        redis-cli -h ferrite HGETALL user:1
+        redis-cli -h ferrite SADD languages rust python go java
+        redis-cli -h ferrite SMEMBERS languages
+        redis-cli -h ferrite ZADD leaderboard 100 alice 200 bob 150 charlie
+        redis-cli -h ferrite ZRANGE leaderboard 0 -1 WITHSCORES
+        echo ""
+        echo "── Server Info ────────────────────────────────────────"
+        redis-cli -h ferrite DBSIZE
+        redis-cli -h ferrite INFO server | head -5
+        echo ""
+        echo "══════════════════════════════════════════════════════"
+        echo "  ✅ Ferrite is ready!"
+        echo ""
+        echo "  Connect:  redis-cli -p 6379"
+        echo "  Studio:   http://localhost:8080"
+        echo "  Metrics:  http://localhost:9090/metrics"
+        echo ""
+        echo "  Try FerriteQL:"
+        echo "    redis-cli QUERY \"SELECT * FROM user:* LIMIT 10\""
+        echo ""
+        echo "  Documentation: https://docs.ferrite.dev"
+        echo "══════════════════════════════════════════════════════"

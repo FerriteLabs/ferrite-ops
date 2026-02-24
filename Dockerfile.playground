@@ -1,0 +1,42 @@
+# Ferrite Web Playground
+# Serves the interactive playground at play.ferrite.dev
+#
+# Build:   docker build -t ferritelabs/playground -f Dockerfile.playground .
+# Run:     docker run -p 8080:8080 ferritelabs/playground
+# Access:  http://localhost:8080
+
+FROM rust:1.88-slim-bookworm AS builder
+
+WORKDIR /app
+COPY . .
+
+# Build the playground server binary (uses ferrite-studio)
+RUN apt-get update && apt-get install -y pkg-config libssl-dev && \
+    cargo build --release --features experimental \
+    --bin ferrite 2>/dev/null || \
+    cargo build --release --bin ferrite
+
+FROM debian:bookworm-slim
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /app/target/release/ferrite /usr/local/bin/ferrite
+
+# Playground configuration
+ENV FERRITE_STUDIO_ENABLED=true
+ENV FERRITE_STUDIO_PORT=8080
+ENV FERRITE_STUDIO_HOST=0.0.0.0
+ENV FERRITE_STUDIO_AUTH=false
+ENV FERRITE_STUDIO_CORS=true
+ENV FERRITE_PORT=6379
+ENV RUST_LOG=ferrite=info
+
+EXPOSE 8080 6379
+
+HEALTHCHECK --interval=30s --timeout=3s --retries=3 \
+    CMD curl -f http://localhost:8080/api/v1/health || exit 1
+
+ENTRYPOINT ["ferrite"]
+CMD ["--port", "6379"]
