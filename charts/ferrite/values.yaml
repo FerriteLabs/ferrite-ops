@@ -107,6 +107,8 @@ networkPolicy:
 autoscaling:
   # -- Enable HorizontalPodAutoscaler
   enabled: false
+  # -- Annotations for the HPA resource
+  annotations: {}
   # -- Minimum replicas
   minReplicas: 1
   # -- Maximum replicas
@@ -115,6 +117,12 @@ autoscaling:
   targetCPUUtilizationPercentage: 80
   # -- Target memory utilization (percentage)
   targetMemoryUtilizationPercentage: 80
+  # -- Custom metrics for scaling (e.g. Ferrite connections or ops/sec)
+  customMetrics: []
+  # -- Stabilization window for scale-down decisions (seconds)
+  scaleDownStabilizationSeconds: 300
+  # -- Stabilization window for scale-up decisions (seconds)
+  scaleUpStabilizationSeconds: 60
 
 # Ferrite configuration
 ferrite:
