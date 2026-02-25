@@ -213,11 +213,22 @@ ferrite:
     # -- Password (only used if existingSecret is not set)
     password: ""
 
-  # -- Additional environment variables
-  extraEnv: []
-
-  # -- Additional environment variables from secrets/configmaps
-  extraEnvFrom: []
+  # -- Consolidated environment variables
+  # Use this section for all custom environment variables passed to the Ferrite container.
+  # Values defined here take precedence over chart-generated env vars.
+  env:
+    # -- Additional environment variables as key-value pairs
+    # Example:
+    #   FERRITE_WORKER_THREADS: "4"
+    #   FERRITE_MAX_CLIENTS: "10000"
+    extra: {}
+    # -- Environment variables sourced from existing Secrets or ConfigMaps
+    # Example:
+    #   - secretRef:
+    #       name: ferrite-credentials
+    #   - configMapRef:
+    #       name: ferrite-env-config
+    fromResources: []
 
   # -- Extra arguments to pass to ferrite
   extraArgs: []
