@@ -3,7 +3,7 @@
 # Build stage 1: Compute a recipe file
 ARG BUILDPLATFORM=linux/amd64
 ARG FERRITE_VERSION=0.1.0
-FROM --platform=$BUILDPLATFORM rust:1.88-slim-bookworm AS chef
+FROM --platform=$BUILDPLATFORM rust:1.93-slim-bookworm AS chef
 ARG TARGETARCH=amd64
 
 # Install cargo-chef for caching dependencies
