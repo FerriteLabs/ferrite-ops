@@ -119,6 +119,8 @@ autoscaling:
   targetMemoryUtilizationPercentage: 80
   # -- Custom metrics for scaling (e.g. Ferrite connections or ops/sec)
   customMetrics: []
+  # -- Target connections per pod for scaling (requires custom metrics adapter)
+  targetConnectionsPerPod: ""
   # -- Stabilization window for scale-down decisions (seconds)
   scaleDownStabilizationSeconds: 300
   # -- Stabilization window for scale-up decisions (seconds)

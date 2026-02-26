@@ -36,6 +36,15 @@ spec:
     {{- with .Values.autoscaling.customMetrics }}
     {{- toYaml . | nindent 4 }}
     {{- end }}
+  {{- if .Values.autoscaling.targetConnectionsPerPod }}
+    - type: Pods
+      pods:
+        metric:
+          name: ferrite_connected_clients_per_pod
+        target:
+          type: AverageValue
+          averageValue: {{ .Values.autoscaling.targetConnectionsPerPod | quote }}
+  {{- end }}
   behavior:
     scaleDown:
       stabilizationWindowSeconds: {{ .Values.autoscaling.scaleDownStabilizationSeconds | default 300 }}
@@ -49,4 +58,8 @@ spec:
         - type: Pods
           value: 2
           periodSeconds: 60
+        - type: Percent
+          value: 50
+          periodSeconds: 60
+      selectPolicy: Max
 {{- end }}
