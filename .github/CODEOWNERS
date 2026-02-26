@@ -1,1 +1,18 @@
+# Default owners for everything
 * @josedab
+
+# Docker and container configuration
+/Dockerfile* @josedab
+/docker-compose*.yml @josedab
+/docker/ @josedab
+
+# Kubernetes and Helm
+/charts/ @josedab
+
+# Monitoring
+/grafana/ @josedab
+/monitoring/ @josedab
+
+# CI/CD and infrastructure
+/.github/ @josedab
+/scripts/ @josedab

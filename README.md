@@ -1,5 +1,8 @@
 # Ferrite Ops
 
+[![CI](https://github.com/ferritelabs/ferrite-ops/actions/workflows/ci.yml/badge.svg)](https://github.com/ferritelabs/ferrite-ops/actions/workflows/ci.yml)
+[![License](https://img.shields.io/badge/license-Apache%202.0-blue)](LICENSE)
+
 Deployment, monitoring, and packaging for [Ferrite](https://github.com/ferritelabs/ferrite).
 
 ## Contents
@@ -39,6 +42,10 @@ docker compose --profile monitoring up -d
 Available dashboards:
 - **Ferrite Overview** — Key metrics, memory, and throughput
 - **Ferrite Operations** — Command latency and error rates
+
+## Contributing
+
+Contributions are welcome! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
 
 ## License
 
