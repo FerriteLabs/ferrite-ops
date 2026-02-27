@@ -50,3 +50,13 @@ Contributions are welcome! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for gui
 ## License
 
 Apache-2.0
+
+## Troubleshooting
+
+### Container Fails to Start
+
+Check logs with `docker compose logs ferrite` and ensure the data directory has correct permissions.
+
+### Helm Release Stuck in Pending
+
+Run `helm status ferrite` to check release state. If stuck, delete with `helm uninstall ferrite` and re-install.
