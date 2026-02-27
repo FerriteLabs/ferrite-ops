@@ -77,8 +77,8 @@ ingress:
 resources:
   # -- Resource limits
   limits:
-    cpu: 2000m
-    memory: 4Gi
+    cpu: 4000m
+    memory: 8Gi
   # -- Resource requests
   requests:
     cpu: 500m
