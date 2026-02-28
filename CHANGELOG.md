@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-02-28
+
 ### Added
 - Helm chart: NetworkPolicy template for pod traffic restriction
 - Helm chart: HorizontalPodAutoscaler (HPA) template
@@ -54,5 +56,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **CI/CD**: Multi-platform release builds (amd64 + arm64) with Cosign keyless signing
 - **CI/CD**: SBOM generation (SPDX + CycloneDX) with SLSA provenance attestation
 
-[Unreleased]: https://github.com/ferritelabs/ferrite-ops/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/ferritelabs/ferrite-ops/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/ferritelabs/ferrite-ops/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/ferritelabs/ferrite-ops/releases/tag/v0.1.0
