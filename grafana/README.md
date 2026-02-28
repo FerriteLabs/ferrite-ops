@@ -54,7 +54,7 @@ scrape_configs:
   - job_name: 'ferrite'
     static_configs:
       - targets: ['ferrite:9090']
-    scrape_interval: 5s
+    scrape_interval: 10s
 ```
 
 ### Ferrite Configuration
