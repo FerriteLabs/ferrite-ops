@@ -34,9 +34,9 @@ services:
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "/usr/local/bin/ferrite-cli", "PING"]
-      interval: 15s
-      timeout: 3s
-      retries: 3
+      interval: 10s
+      timeout: 5s
+      retries: 5
       start_period: 10s
     networks:
       - ferrite-network
@@ -69,8 +69,8 @@ services:
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 30s
-      timeout: 3s
-      retries: 3
+      timeout: 5s
+      retries: 5
       start_period: 5s
     networks:
       - ferrite-network
