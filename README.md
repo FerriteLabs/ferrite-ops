@@ -27,6 +27,23 @@ helm install ferrite charts/ferrite
 ./scripts/quickstart.sh
 ```
 
+## High Availability Deployment
+
+Deploy Ferrite in HA mode with 3 pods (1 primary + 2 replicas), pod anti-affinity, and a PodDisruptionBudget:
+
+```bash
+helm install ferrite charts/ferrite -f charts/ferrite/values-ha.yaml
+```
+
+After install, configure replication:
+
+```bash
+kubectl exec ferrite-1 -- ferrite-cli REPLICAOF ferrite-0.ferrite-headless 6379
+kubectl exec ferrite-2 -- ferrite-cli REPLICAOF ferrite-0.ferrite-headless 6379
+```
+
+See [`charts/ferrite/values-ha.yaml`](charts/ferrite/values-ha.yaml) for the full HA configuration including memory limits, persistence, and monitoring settings.
+
 ## Grafana Dashboards
 
 Import dashboards from `grafana/dashboards/`:
@@ -42,6 +59,28 @@ docker compose --profile monitoring up -d
 Available dashboards:
 - **Ferrite Overview** — Key metrics, memory, and throughput
 - **Ferrite Operations** — Command latency and error rates
+- **Memory Tier Distribution** — HybridLog hot/warm/cold tier visualization
+- **Query Performance** — Command latency breakdown, slow queries, QPS
+- **Cluster & Replication** — Cluster state, replication lag, failover events
+- **CDC & Streaming** — Event throughput, consumer lag, pipeline latency
+- **Vector Search & AI** — Search QPS, embedding rate, semantic cache hit rate
+
+## Docker Hub Publishing
+
+The release workflow pushes images to both GHCR and Docker Hub. To enable Docker Hub:
+
+1. Create a Docker Hub access token at https://hub.docker.com/settings/security
+2. Add these secrets to the `ferrite-ops` repository (Settings → Secrets → Actions):
+   - `DOCKERHUB_USERNAME` — your Docker Hub username
+   - `DOCKERHUB_TOKEN` — the access token (not your password)
+3. The release workflow will automatically push to `ferritelabs/ferrite` on Docker Hub when a `v*` tag is pushed
+
+```bash
+# Verify after release:
+docker pull ferritelabs/ferrite:latest
+docker run -d -p 6379:6379 ferritelabs/ferrite:latest
+redis-cli PING  # → PONG
+```
 
 ## Contributing
 
