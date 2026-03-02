@@ -212,3 +212,69 @@ groups:
         annotations:
           summary: "Ferrite cluster node down (instance {{ $labels.instance }})"
           description: "{{ $value }} cluster node(s) are not OK"
+
+  - name: ferrite-extended-alerts
+    interval: 30s
+    rules:
+      - alert: VectorIndexBuildStalled
+        expr: ferrite_vector_index_building == 1
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Vector index build stalled (instance {{ $labels.instance }})"
+          description: "Vector index has been building for more than 30 minutes."
+
+      - alert: CDCConsumerLagHigh
+        expr: ferrite_stream_consumer_lag > 1000
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "CDC consumer lag high (instance {{ $labels.instance }})"
+          description: "Stream consumer lag is {{ $value }} (threshold: 1000)."
+
+      - alert: TierPromotionSpike
+        expr: rate(ferrite_hybridlog_promotions_total[5m]) > 10 * avg_over_time(rate(ferrite_hybridlog_promotions_total[5m])[1h:5m])
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Tier promotion spike detected (instance {{ $labels.instance }})"
+          description: "Promotion rate is 10x above the 1h average."
+
+      - alert: DiskIOLatencyHigh
+        expr: ferrite_disk_io_latency_seconds > 0.01
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Disk I/O latency high (instance {{ $labels.instance }})"
+          description: "Disk I/O latency is {{ $value | printf \"%.3f\" }}s (threshold: 10ms)."
+
+      - alert: MemoryFragmentationHigh
+        expr: ferrite_memory_fragmentation_ratio > 1.5
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Memory fragmentation high (instance {{ $labels.instance }})"
+          description: "Fragmentation ratio is {{ $value | printf \"%.2f\" }} (threshold: 1.5)."
+
+      - alert: ClusterSplitBrainDetected
+        expr: ferrite_cluster_split_brain == 1
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Cluster split-brain detected (instance {{ $labels.instance }})"
+          description: "Split-brain condition detected. Immediate intervention required."
+
+      - alert: BackupOverdue
+        expr: time() - ferrite_last_backup_timestamp > 86400 * 2
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Backup overdue (instance {{ $labels.instance }})"
+          description: "Last backup was more than 2 days ago."
