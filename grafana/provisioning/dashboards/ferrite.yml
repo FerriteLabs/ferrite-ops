@@ -1,0 +1,14 @@
+apiVersion: 1
+
+providers:
+  - name: "Ferrite"
+    orgId: 1
+    folder: "Ferrite"
+    type: file
+    disableDeletion: false
+    editable: true
+    updateIntervalSeconds: 30
+    allowUiUpdates: true
+    options:
+      path: /etc/grafana/dashboards
+      foldersFromFilesStructure: false
