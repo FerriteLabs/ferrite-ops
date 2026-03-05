@@ -22,8 +22,20 @@ docker compose up -d
 |-----------|------|---------|
 | **Prometheus** | [localhost:9091](http://localhost:9091) | Metrics collection and alerting |
 | **Grafana** | [localhost:3000](http://localhost:3000) | Visualization dashboards |
+| **Loki** | [localhost:3100](http://localhost:3100) | Log aggregation (optional) |
+| **Promtail** | [localhost:9080](http://localhost:9080) | Log collector (optional) |
 
 Default Grafana credentials: `admin` / `ferrite`
+
+### Log Aggregation (Loki)
+
+For centralized log collection and querying, see [`loki/README.md`](loki/README.md):
+
+```bash
+# Add Loki to the monitoring stack
+cd loki/
+docker compose -f docker-compose-loki.yaml up -d
+```
 
 ### Pre-Configured Dashboards
 

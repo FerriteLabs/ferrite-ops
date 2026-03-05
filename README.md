@@ -2,14 +2,18 @@
 
 [![CI](https://github.com/ferritelabs/ferrite-ops/actions/workflows/ci.yml/badge.svg)](https://github.com/ferritelabs/ferrite-ops/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue)](LICENSE)
+[![Docker](https://img.shields.io/badge/Docker-Hub-2496ED)](https://hub.docker.com/r/ferritelabs/ferrite)
+[![Helm](https://img.shields.io/badge/Helm-Chart-0F1689)](charts/ferrite)
 
-Deployment, monitoring, and packaging for [Ferrite](https://github.com/ferritelabs/ferrite).
+Deployment, monitoring, and packaging for [Ferrite](https://github.com/ferritelabs/ferrite) — a high-performance, tiered-storage key-value store.
 
 ## Contents
 
 - `Dockerfile` + `docker-compose.yml` — Container setup
 - `charts/ferrite/` — Helm chart for Kubernetes
+- `gitops/` — ArgoCD, Flux, and Kustomize examples
 - `grafana/` — Grafana monitoring dashboards
+- `monitoring/` — Prometheus alerting rules
 - `packaging/` — deb/rpm package definitions
 - `scripts/` — Install and quickstart scripts
 - `ferrite.example.toml` — Example configuration
@@ -26,6 +30,23 @@ helm install ferrite charts/ferrite
 # Script
 ./scripts/quickstart.sh
 ```
+
+## GitOps Deployment
+
+Deploy Ferrite using GitOps patterns:
+
+```bash
+# ArgoCD
+kubectl apply -f gitops/argocd/application.yaml
+
+# Flux
+kubectl apply -f gitops/flux/helmrelease.yaml
+
+# Kustomize (choose your environment)
+kubectl apply -k gitops/kustomize/overlays/production
+```
+
+See [`gitops/README.md`](gitops/README.md) for full examples including development, staging, and production overlays.
 
 ## High Availability Deployment
 
@@ -81,6 +102,18 @@ docker pull ferritelabs/ferrite:latest
 docker run -d -p 6379:6379 ferritelabs/ferrite:latest
 redis-cli PING  # → PONG
 ```
+
+## 🌐 FerriteLabs Ecosystem
+
+| Repository | Description |
+|-----------|-------------|
+| [ferrite](https://github.com/ferritelabs/ferrite) | Core database engine (Rust, 12 crates) |
+| [ferrite-docs](https://github.com/ferritelabs/ferrite-docs) | Documentation website |
+| **ferrite-ops** | 📍 You are here |
+| [ferrite-bench](https://github.com/ferritelabs/ferrite-bench) | Performance benchmarks |
+| [vscode-ferrite](https://github.com/ferritelabs/vscode-ferrite) | VS Code extension |
+| [jetbrains-ferrite](https://github.com/ferritelabs/jetbrains-ferrite) | JetBrains IDE plugin |
+| [homebrew-tap](https://github.com/ferritelabs/homebrew-tap) | Homebrew formula |
 
 ## Contributing
 

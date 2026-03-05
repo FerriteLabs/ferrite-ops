@@ -1,0 +1,6 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ferrite
+  labels:
+    app.kubernetes.io/name: ferrite
