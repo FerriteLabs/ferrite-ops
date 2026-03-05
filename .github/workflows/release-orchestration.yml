@@ -1,0 +1,196 @@
+name: Release Orchestration
+
+# Coordinates releases across all FerriteLabs repositories.
+# Triggered by the core ferrite repo's release workflow via repository_dispatch,
+# or manually via workflow_dispatch.
+
+on:
+  repository_dispatch:
+    types: [ferrite-release]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version (e.g. 0.3.0)'
+        required: true
+      sha256:
+        description: 'Source tarball SHA256 (optional — computed automatically if empty)'
+        required: false
+      dry_run:
+        description: 'Dry run (log actions without executing)'
+        type: boolean
+        default: false
+
+env:
+  VERSION: ${{ github.event.client_payload.version || inputs.version }}
+  DRY_RUN: ${{ inputs.dry_run || false }}
+
+jobs:
+  # ── Step 1: Validate inputs and compute metadata ─────────────────────────────
+  prepare:
+    name: Prepare Release
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      tag: ${{ steps.meta.outputs.tag }}
+      sha256: ${{ steps.meta.outputs.sha256 }}
+    steps:
+      - name: Compute release metadata
+        id: meta
+        env:
+          INPUT_SHA256: ${{ github.event.client_payload.sha256 || inputs.sha256 }}
+        run: |
+          VERSION="${{ env.VERSION }}"
+          TAG="v${VERSION}"
+
+          if [ -z "$VERSION" ]; then
+            echo "::error::No version specified"
+            exit 1
+          fi
+
+          # Validate semver format
+          if ! echo "$VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.]+)?$'; then
+            echo "::error::Invalid semver: $VERSION"
+            exit 1
+          fi
+
+          # Compute SHA256 if not provided
+          if [ -n "$INPUT_SHA256" ]; then
+            SHA256="$INPUT_SHA256"
+          else
+            TARBALL_URL="https://github.com/${{ github.repository_owner }}/ferrite/archive/refs/tags/${TAG}.tar.gz"
+            SHA256=$(curl -sL "$TARBALL_URL" | shasum -a 256 | awk '{print $1}')
+          fi
+
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "sha256=${SHA256}" >> "$GITHUB_OUTPUT"
+
+          echo "::notice::Release v${VERSION} (SHA256: ${SHA256})"
+
+  # ── Step 2: Update Docker image and Helm chart ───────────────────────────────
+  update-ops:
+    name: Update ferrite-ops
+    needs: prepare
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Update Helm Chart version
+        if: env.DRY_RUN != 'true'
+        run: |
+          VERSION="${{ needs.prepare.outputs.version }}"
+          sed -i "s/^version:.*/version: ${VERSION}/" charts/ferrite/Chart.yaml
+          sed -i "s/^appVersion:.*/appVersion: \"${VERSION}\"/" charts/ferrite/Chart.yaml
+          echo "Updated Chart.yaml to ${VERSION}"
+
+      - name: Create version bump PR
+        if: env.DRY_RUN != 'true'
+        uses: peter-evans/create-pull-request@v6
+        with:
+          title: "chore: release v${{ needs.prepare.outputs.version }}"
+          body: |
+            Automated release coordination for Ferrite v${{ needs.prepare.outputs.version }}.
+
+            ## Changes
+            - Updated Helm chart version and appVersion to ${{ needs.prepare.outputs.version }}
+
+            _Triggered by [release orchestration](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})._
+          branch: "release/${{ needs.prepare.outputs.version }}"
+          labels: release
+          commit-message: "chore: bump to v${{ needs.prepare.outputs.version }}"
+
+      - name: Dry run log
+        if: env.DRY_RUN == 'true'
+        run: |
+          echo "::notice::[DRY RUN] Would update Chart.yaml to v${{ needs.prepare.outputs.version }}"
+
+  # ── Step 3: Trigger Homebrew formula update ──────────────────────────────────
+  update-homebrew:
+    name: Update homebrew-tap
+    needs: prepare
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger Homebrew tap update
+        if: env.DRY_RUN != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.CROSS_REPO_TOKEN }}
+        run: |
+          VERSION="${{ needs.prepare.outputs.version }}"
+          SHA256="${{ needs.prepare.outputs.sha256 }}"
+
+          if [ -z "$GH_TOKEN" ]; then
+            echo "::warning::CROSS_REPO_TOKEN not set. Skipping homebrew-tap update."
+            echo "Manual update required: version=${VERSION}, sha256=${SHA256}"
+            exit 0
+          fi
+
+          curl -X POST \
+            -H "Authorization: token ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github.v3+json" \
+            "https://api.github.com/repos/${{ github.repository_owner }}/homebrew-tap/dispatches" \
+            -d "{\"event_type\":\"ferrite-release\",\"client_payload\":{\"version\":\"${VERSION}\",\"sha256\":\"${SHA256}\"}}"
+
+          echo "::notice::Triggered homebrew-tap update for v${VERSION}"
+
+      - name: Dry run log
+        if: env.DRY_RUN == 'true'
+        run: |
+          echo "::notice::[DRY RUN] Would trigger homebrew-tap for v${{ needs.prepare.outputs.version }}"
+
+  # ── Step 4: Trigger documentation site update ────────────────────────────────
+  update-docs:
+    name: Update ferrite-docs
+    needs: prepare
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger docs version update
+        if: env.DRY_RUN != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.CROSS_REPO_TOKEN }}
+        run: |
+          VERSION="${{ needs.prepare.outputs.version }}"
+
+          if [ -z "$GH_TOKEN" ]; then
+            echo "::warning::CROSS_REPO_TOKEN not set. Skipping docs update."
+            exit 0
+          fi
+
+          curl -X POST \
+            -H "Authorization: token ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github.v3+json" \
+            "https://api.github.com/repos/${{ github.repository_owner }}/ferrite-docs/dispatches" \
+            -d "{\"event_type\":\"ferrite-release\",\"client_payload\":{\"version\":\"${VERSION}\"}}"
+
+          echo "::notice::Triggered ferrite-docs update for v${VERSION}"
+
+      - name: Dry run log
+        if: env.DRY_RUN == 'true'
+        run: |
+          echo "::notice::[DRY RUN] Would trigger ferrite-docs for v${{ needs.prepare.outputs.version }}"
+
+  # ── Step 5: Run version sync check ──────────────────────────────────────────
+  verify:
+    name: Version Sync Check
+    needs: [prepare, update-ops, update-homebrew, update-docs]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Report orchestration results
+        run: |
+          VERSION="${{ needs.prepare.outputs.version }}"
+          echo "## Release Orchestration Summary — v${VERSION}" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Repository | Status |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|-----------|--------|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| ferrite-ops (Helm) | ${{ needs.update-ops.result }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| homebrew-tap | ${{ needs.update-homebrew.result }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| ferrite-docs | ${{ needs.update-docs.result }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "**Version:** ${VERSION}" >> "$GITHUB_STEP_SUMMARY"
+          echo "**SHA256:** ${{ needs.prepare.outputs.sha256 }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "**Dry Run:** ${{ env.DRY_RUN }}" >> "$GITHUB_STEP_SUMMARY"

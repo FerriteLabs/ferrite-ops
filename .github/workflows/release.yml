@@ -15,6 +15,7 @@ on:
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository_owner }}/ferrite
+  DOCKERHUB_IMAGE: ferritelabs/ferrite
 
 jobs:
   build-and-push:
@@ -41,11 +42,20 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        if: vars.DOCKERHUB_ENABLED == 'true'
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
       - name: Extract metadata (tags, labels)
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          images: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+            ${{ env.DOCKERHUB_IMAGE }}
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
@@ -152,6 +162,25 @@ jobs:
             "${IMAGE}@${DIGEST}"
 
   # Bump Chart.yaml version when triggered by a core release
+  smoke-test:
+    name: Smoke Test Published Image
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    steps:
+      - name: Pull and test image
+        env:
+          IMAGE: ${{ needs.build-and-push.outputs.image }}
+          DIGEST: ${{ needs.build-and-push.outputs.digest }}
+        run: |
+          docker pull "${IMAGE}@${DIGEST}"
+          docker run -d --name ferrite-smoke -p 6399:6379 "${IMAGE}@${DIGEST}"
+          sleep 5
+          # Verify server responds to PING
+          echo "PING" | nc -q 1 localhost 6399 | grep -q "PONG" || \
+            (echo "Smoke test failed: PING did not return PONG" && exit 1)
+          echo "Smoke test passed"
+          docker stop ferrite-smoke
+
   bump-chart:
     name: Bump Chart Version
     runs-on: ubuntu-latest
