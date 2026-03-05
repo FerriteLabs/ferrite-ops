@@ -2,6 +2,10 @@
 #
 # Deploys a primary with 2 replicas and optional monitoring.
 #
+# Prerequisites:
+#   Build the Ferrite image first:
+#     docker build -t ferrite:latest -f ../Dockerfile ../../ferrite/
+#
 # Usage:
 #   docker compose -f docker/docker-compose.ha.yml up -d
 #   docker compose -f docker/docker-compose.ha.yml --profile monitoring up -d

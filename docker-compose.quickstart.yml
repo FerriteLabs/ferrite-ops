@@ -17,7 +17,7 @@ services:
       - "9090:9090"      # Prometheus metrics
     environment:
       - RUST_LOG=ferrite=info
-      - FERRITE_STUDIO_ENABLED=true
+      - FERRITE_STUDIO_ENABLED=true    # Experimental web UI (may be unstable)
     healthcheck:
       test: ["CMD", "redis-cli", "-p", "6379", "PING"]
       interval: 5s
