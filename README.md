@@ -21,15 +21,42 @@ Deployment, monitoring, and packaging for [Ferrite](https://github.com/ferritela
 ## Quick Start
 
 ```bash
-# Docker
-docker-compose up
+# Docker (single instance)
+docker compose up -d
 
-# Helm
+# Docker with monitoring (Prometheus + Grafana)
+docker compose --profile monitoring up -d
+
+# Helm (Kubernetes)
 helm install ferrite charts/ferrite
 
-# Script
+# Quickstart script (builds from source)
 ./scripts/quickstart.sh
 ```
+
+## Operational Quick Reference
+
+| Task | Command |
+|------|---------|
+| Start Ferrite | `docker compose up -d` |
+| Stop Ferrite | `docker compose down` |
+| View logs | `docker compose logs -f ferrite` |
+| Health check | `docker exec ferrite ferrite-cli PING` |
+| Backup data | `./scripts/backup.sh /path/to/backup` |
+| Restore data | `./scripts/restore.sh /path/to/backup` |
+| Smoke test | `./scripts/smoke_test.sh` |
+| Metrics | `curl http://localhost:9090/metrics` |
+| Grafana | `http://localhost:3000` (admin/admin) |
+| Prometheus | `http://localhost:9091` |
+
+### Ports
+
+| Port | Service |
+|------|---------|
+| 6379 | Ferrite (Redis-compatible) |
+| 9090 | Prometheus metrics endpoint |
+| 3000 | Grafana (when monitoring profile active) |
+| 9091 | Prometheus server (when monitoring profile active) |
 
 ## GitOps Deployment
 
@@ -85,6 +112,31 @@ Available dashboards:
 - **Cluster & Replication** — Cluster state, replication lag, failover events
 - **CDC & Streaming** — Event throughput, consumer lag, pipeline latency
 - **Vector Search & AI** — Search QPS, embedding rate, semantic cache hit rate
+
+## Prometheus Alerts
+
+Alert rules are defined in `monitoring/prometheus-alerts.yml` and `grafana/prometheus-alerts.yml`. Key alerts include:
+
+| Alert | Severity | Trigger |
+|-------|----------|---------|
+| `FerriteDown` | critical | Instance unreachable for >1 min |
+| `HighMemoryUsage` | warning | Memory usage >80% of limit |
+| `ReplicationLag` | warning | Replica lag >10s |
+| `HighCommandLatency` | warning | P99 latency >10ms |
+| `BackupOverdue` | warning | No successful backup in 24h |
+| `DiskIOLatency` | warning | Disk I/O latency >50ms |
+| `SplitBrainDetected` | critical | Multiple primaries detected |
+
+### Alert Runbooks
+
+Operational runbooks are available in `monitoring/runbooks/`:
+
+- **high-memory.md** — Memory pressure troubleshooting
+- **high-latency.md** — Command latency investigation
+- **replication-lag.md** — Replication delay diagnosis
+- **cluster-failure.md** — Cluster recovery procedures
+- **backup-failure.md** — Backup failure resolution
+- **disk-full.md** — Disk space recovery
 
 ## Docker Hub Publishing
 
