@@ -421,12 +421,3 @@ backup:
     storageClassName: ""
     # -- PVC size
     size: "20Gi"
-
-# -- Readiness probe configuration
-readinessProbe:
-  enabled: true
-  initialDelaySeconds: 5
-  periodSeconds: 10
-  timeoutSeconds: 3
-  failureThreshold: 3
-  successThreshold: 1

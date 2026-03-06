@@ -41,7 +41,25 @@ cleanup() { rm -rf "$TMP_DIR"; }
 trap cleanup EXIT
 
 TARBALL="${ASSET}.tar.gz"
+echo "Downloading ${BASE_URL}/${TARBALL}..."
 curl -fsSL "${BASE_URL}/${TARBALL}" -o "${TMP_DIR}/${TARBALL}"
+
+# Verify checksum if available
+CHECKSUM_URL="${BASE_URL}/${TARBALL}.sha256"
+if curl -fsSL "$CHECKSUM_URL" -o "${TMP_DIR}/${TARBALL}.sha256" 2>/dev/null; then
+  echo "Verifying SHA256 checksum..."
+  cd "${TMP_DIR}"
+  if command -v sha256sum &>/dev/null; then
+    sha256sum -c "${TARBALL}.sha256" || { echo "ERROR: Checksum verification failed!"; exit 1; }
+  elif command -v shasum &>/dev/null; then
+    shasum -a 256 -c "${TARBALL}.sha256" || { echo "ERROR: Checksum verification failed!"; exit 1; }
+  else
+    echo "Warning: No sha256sum or shasum found, skipping verification"
+  fi
+  cd - >/dev/null
+else
+  echo "Warning: No checksum file available, skipping verification"
+fi
 
 mkdir -p "${INSTALL_DIR}"
 tar -xzf "${TMP_DIR}/${TARBALL}" -C "${TMP_DIR}"
