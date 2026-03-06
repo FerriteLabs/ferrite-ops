@@ -278,3 +278,13 @@ groups:
         annotations:
           summary: "Backup overdue (instance {{ $labels.instance }})"
           description: "Last backup was more than 2 days ago."
+
+      # Disk I/O alerts
+      - alert: FerriteHighDiskLatency
+        expr: rate(ferrite_disk_io_seconds_sum[5m]) / rate(ferrite_disk_io_seconds_count[5m]) > 0.01
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Ferrite high disk I/O latency (instance {{ $labels.instance }})"
+          description: "Average disk I/O latency above 10ms (current: {{ $value | printf \"%.3f\" }}s). Check storage backend."
