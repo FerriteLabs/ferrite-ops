@@ -1,0 +1,95 @@
+---
+apiVersion: source.toolkit.fluxcd.io/v1
+kind: GitRepository
+metadata:
+  name: ferrite-ops
+  namespace: flux-system
+spec:
+  interval: 10m
+  url: https://github.com/ferritelabs/ferrite-ops.git
+  ref:
+    # Pin to a release tag in production.
+    tag: v0.3.0
+---
+apiVersion: helm.toolkit.fluxcd.io/v2
+kind: HelmRelease
+metadata:
+  name: ferrite
+  namespace: ferrite
+spec:
+  interval: 30m
+  timeout: 10m
+  chart:
+    spec:
+      chart: charts/ferrite
+      sourceRef:
+        kind: GitRepository
+        name: ferrite-ops
+        namespace: flux-system
+      interval: 10m
+
+  releaseName: ferrite
+
+  values:
+    image:
+      repository: ferritelabs/ferrite
+      tag: "0.3.0"
+      pullPolicy: IfNotPresent
+
+    replicaCount: 3
+
+    resources:
+      requests:
+        cpu: "2"
+        memory: "8Gi"
+      limits:
+        cpu: "4"
+        memory: "16Gi"
+
+    persistence:
+      enabled: true
+      size: 100Gi
+      storageClass: ""
+
+    metrics:
+      enabled: true
+      serviceMonitor:
+        enabled: true
+
+    podDisruptionBudget:
+      enabled: true
+      minAvailable: 2
+
+    config:
+      server:
+        bind: "0.0.0.0"
+        port: 6379
+        max_connections: 10000
+      storage:
+        max_memory: 8589934592 # 8GB
+      persistence:
+        aof_enabled: true
+        aof_sync: "everysec"
+      logging:
+        level: "info"
+        format: "json"
+
+  upgrade:
+    remediation:
+      retries: 5
+      remediateLastFailure: true
+      strategy: rollback
+    cleanupOnFail: true
+    # Production: do not force resource deletion on upgrade.
+    force: false
+
+  rollback:
+    timeout: 10m
+    cleanupOnFail: true
+
+  test:
+    enable: true
+    timeout: 10m
+
+  # Suspend automatic reconciliation if needed:
+  # suspend: true

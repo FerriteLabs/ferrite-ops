@@ -1,0 +1,80 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: ferrite-production
+  namespace: argocd
+  labels:
+    app.kubernetes.io/name: ferrite
+    app.kubernetes.io/part-of: data-infrastructure
+    environment: production
+  annotations:
+    # Uncomment to enable Slack notifications (requires argocd-notifications):
+    # notifications.argoproj.io/subscribe.on-sync-succeeded.slack: ferrite-deployments
+    # notifications.argoproj.io/subscribe.on-sync-failed.slack: ferrite-alerts
+    # notifications.argoproj.io/subscribe.on-health-degraded.slack: ferrite-alerts
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+
+  source:
+    repoURL: https://github.com/ferritelabs/ferrite-ops.git
+    # Pin to a release tag in production — never use HEAD.
+    targetRevision: v0.3.0
+    path: charts/ferrite
+    helm:
+      releaseName: ferrite
+      valueFiles:
+        - values.yaml
+        - values-ha.yaml
+      parameters:
+        - name: image.tag
+          value: "0.3.0"
+        - name: replicaCount
+          value: "3"
+        - name: resources.requests.cpu
+          value: "2"
+        - name: resources.requests.memory
+          value: "8Gi"
+        - name: resources.limits.cpu
+          value: "4"
+        - name: resources.limits.memory
+          value: "16Gi"
+        - name: persistence.enabled
+          value: "true"
+        - name: persistence.size
+          value: "100Gi"
+        - name: metrics.enabled
+          value: "true"
+        - name: podDisruptionBudget.enabled
+          value: "true"
+        - name: podDisruptionBudget.minAvailable
+          value: "2"
+
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: ferrite
+
+  syncPolicy:
+    # Production requires manual sync for safety.
+    automated:
+      prune: false
+      selfHeal: true
+      allowEmpty: false
+    syncOptions:
+      - CreateNamespace=true
+      - PruneLast=true
+      - ServerSideApply=true
+      - RespectIgnoreDifferences=true
+    retry:
+      limit: 3
+      backoff:
+        duration: 10s
+        factor: 2
+        maxDuration: 5m0s
+
+  ignoreDifferences:
+    - group: apps
+      kind: StatefulSet
+      jsonPointers:
+        - /spec/volumeClaimTemplates

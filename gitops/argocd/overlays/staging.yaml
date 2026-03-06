@@ -1,0 +1,64 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: ferrite-staging
+  namespace: argocd
+  labels:
+    app.kubernetes.io/name: ferrite
+    app.kubernetes.io/part-of: data-infrastructure
+    environment: staging
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+
+  source:
+    repoURL: https://github.com/ferritelabs/ferrite-ops.git
+    targetRevision: HEAD
+    path: charts/ferrite
+    helm:
+      releaseName: ferrite-staging
+      valueFiles:
+        - values.yaml
+      parameters:
+        - name: image.tag
+          value: "latest"
+        - name: replicaCount
+          value: "1"
+        - name: resources.requests.memory
+          value: "2Gi"
+        - name: resources.limits.memory
+          value: "4Gi"
+        - name: persistence.enabled
+          value: "true"
+        - name: persistence.size
+          value: "10Gi"
+        - name: metrics.enabled
+          value: "true"
+
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: ferrite-staging
+
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+      allowEmpty: false
+    syncOptions:
+      - CreateNamespace=true
+      - PruneLast=true
+      - ApplyOutOfSyncOnly=true
+      - ServerSideApply=true
+    retry:
+      limit: 5
+      backoff:
+        duration: 5s
+        factor: 2
+        maxDuration: 3m0s
+
+  ignoreDifferences:
+    - group: apps
+      kind: StatefulSet
+      jsonPointers:
+        - /spec/volumeClaimTemplates
