@@ -1,6 +1,7 @@
 # syntax=docker/dockerfile:1
 
-# Build stage 1: Compute a recipe file
+# Security: container image is scanned by Trivy in CI before push
+# See .github/workflows/container-scan.yml for details# Build stage 1: Compute a recipe file
 ARG BUILDPLATFORM=linux/amd64
 ARG FERRITE_VERSION=0.2.0
 FROM --platform=$BUILDPLATFORM rust:1.94-slim-bookworm AS chef
