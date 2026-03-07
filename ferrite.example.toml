@@ -146,3 +146,42 @@ format = "pretty"
 # primary_host = "primary.example.com"
 # primary_port = 6379
 # replica_read_only = true
+
+# ============================================================================
+# Audit Logging (optional, requires --features experimental)
+# ============================================================================
+# [audit]
+# enabled = false
+# # log_file = "/var/log/ferrite/audit.log"  # Omit for stdout
+# format = "json"                             # "json" or "text"
+# log_commands = []                           # Empty = all; or ["SET", "DEL", ...]
+# exclude_commands = ["PING", "ECHO"]
+# log_success = true
+# log_failures = true
+# log_auth = true
+# log_admin = true
+# max_file_size = 104857600                   # 100 MB per file
+# max_files = 10                              # Rotate after N files
+
+# ============================================================================
+# Encryption at Rest (optional, requires --features crypto)
+# ============================================================================
+# [encryption]
+# enabled = false
+# # key_file = "/etc/ferrite/encryption.key"
+# algorithm = "aes-256-gcm"
+# encrypt_aof = true
+# encrypt_rdb = true
+# encrypt_checkpoints = true
+
+# ============================================================================
+# OpenTelemetry (optional, requires --features otel)
+# ============================================================================
+# [otel]
+# enabled = false
+# endpoint = "http://localhost:4317"           # OTLP gRPC endpoint
+# service_name = "ferrite"
+# traces_enabled = true
+# metrics_enabled = true
+# batch_max_queue_size = 2048
+# batch_max_export_batch_size = 512
