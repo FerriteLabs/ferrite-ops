@@ -1,0 +1,93 @@
+name: Container Image Security Scan
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "Dockerfile"
+      - "Dockerfile.*"
+      - "docker/**"
+  pull_request:
+    branches: [main]
+    paths:
+      - "Dockerfile"
+      - "Dockerfile.*"
+      - "docker/**"
+  schedule:
+    # Scan weekly for new CVEs in base images
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  security-events: write
+
+jobs:
+  trivy-scan:
+    name: Trivy Container Scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    strategy:
+      matrix:
+        dockerfile:
+          - Dockerfile
+          - Dockerfile.playground
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Build image for scanning
+        run: |
+          docker build \
+            -f ${{ matrix.dockerfile }} \
+            -t ferrite-scan:${{ github.sha }} \
+            .
+
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: "ferrite-scan:${{ github.sha }}"
+          format: "sarif"
+          output: "trivy-results.sarif"
+          severity: "CRITICAL,HIGH"
+          exit-code: "1"
+
+      - name: Upload Trivy scan results to GitHub Security
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: "trivy-results.sarif"
+
+      - name: Run Trivy in table format (for PR comments)
+        if: always()
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: "ferrite-scan:${{ github.sha }}"
+          format: "table"
+          severity: "CRITICAL,HIGH,MEDIUM"
+
+  scout-scan:
+    name: Docker Scout Scan
+    runs-on: ubuntu-latest
+    if: github.event_name != 'schedule'
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Build image for scanning
+        run: docker build -f Dockerfile -t ferrite-scout:${{ github.sha }} .
+
+      - name: Docker Scout CVE scan
+        uses: docker/scout-action@v1
+        if: ${{ env.DOCKER_USER != '' }}
+        env:
+          DOCKER_USER: ${{ secrets.DOCKER_USERNAME }}
+        with:
+          command: cves
+          image: "ferrite-scout:${{ github.sha }}"
+          sarif-file: "scout-results.sarif"
+          summary: true
