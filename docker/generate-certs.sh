@@ -10,7 +10,7 @@
 #   server.key / server.crt  - Server certificate (for Ferrite)
 #   client.key / client.crt  - Client certificate (for mTLS testing)
 
-set -eu
+set -euo pipefail
 
 CERT_DIR="${1:-$(dirname "$0")/certs}"
 DAYS=365

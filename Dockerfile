@@ -27,10 +27,11 @@ RUN cargo chef prepare --recipe-path recipe.json
 # Build stage 3: Build dependencies (cached layer)
 FROM chef AS builder
 
-# Install system dependencies needed for building
-RUN apk add --no-cache \
+# Install system dependencies needed for building (Debian bookworm)
+RUN apt-get update && apt-get install -y --no-install-recommends \
     pkg-config \
     libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
