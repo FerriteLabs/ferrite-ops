@@ -19,7 +19,7 @@
 #   RESTORE_S3_PREFIX    - S3 key prefix (default: ferrite-backups/)
 #   RESTORE_SKIP_STOP    - Skip server stop/start (default: false, for containers)
 
-set -eu
+set -euo pipefail
 
 # Configuration
 FERRITE_HOST="${FERRITE_HOST:-localhost}"
