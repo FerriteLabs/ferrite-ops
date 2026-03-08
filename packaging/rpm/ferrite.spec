@@ -1,15 +1,15 @@
 # Ferrite RPM Spec File
 
 Name:           ferrite
-Version:        0.1.0
+Version:        0.3.0
 Release:        1%{?dist}
 Summary:        High-performance, tiered-storage key-value store
 
 License:        Apache-2.0
-URL:            https://ferrite.dev
+URL:            https://ferrite.rs
 Source0:        %{name}-%{version}.tar.gz
 
-BuildRequires:  rust >= 1.70
+BuildRequires:  rust >= 1.80
 BuildRequires:  cargo
 BuildRequires:  openssl-devel
 BuildRequires:  systemd-rpm-macros
@@ -125,6 +125,12 @@ fi
 %{_bindir}/ferrite-tui
 
 %changelog
+* Fri Mar 07 2026 Ferrite Maintainers <maintainers@ferrite.dev> - 0.3.0-1
+- Update to v0.3.0
+- Cluster mode improvements
+- Vector search and full-text search enhancements
+- CDC/event streaming
+
 * Sat Jan 01 2025 Ferrite Maintainers <maintainers@ferrite.dev> - 0.1.0-1
 - Initial release
 - Redis-compatible key-value store with tiered storage

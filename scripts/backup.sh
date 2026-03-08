@@ -20,7 +20,7 @@
 #   BACKUP_S3_PREFIX     - S3 key prefix (default: ferrite-backups/)
 #   BACKUP_COMPRESS      - Compression: gzip or none (default: gzip)
 
-set -eu
+set -euo pipefail
 
 # Configuration
 FERRITE_HOST="${FERRITE_HOST:-localhost}"
