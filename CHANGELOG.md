@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-03-09
+
+### Added
+- 5 new Grafana dashboards: Memory Tiers, Query Performance, Cluster & Replication, CDC & Streaming, Vector Search & AI
+- 7 new Prometheus alert rules for production monitoring
+- 6 operational runbooks for common failure scenarios
+- Grafana provisioning configs for auto-loading dashboards and datasources
+- Docker Hub publishing support in release workflow with smoke testing
+
+### Changed
+- Benchmark docker-compose: pinned Redis image to 7.4.2-alpine
+
 ## [0.2.0] - 2026-02-28
 
 ### Added
@@ -56,6 +68,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **CI/CD**: Multi-platform release builds (amd64 + arm64) with Cosign keyless signing
 - **CI/CD**: SBOM generation (SPDX + CycloneDX) with SLSA provenance attestation
 
-[Unreleased]: https://github.com/ferritelabs/ferrite-ops/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/ferritelabs/ferrite-ops/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/ferritelabs/ferrite-ops/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/ferritelabs/ferrite-ops/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/ferritelabs/ferrite-ops/releases/tag/v0.1.0
