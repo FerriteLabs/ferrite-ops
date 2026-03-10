@@ -76,7 +76,7 @@ jobs:
       contents: write
       pull-requests: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Update Helm Chart version
         if: env.DRY_RUN != 'true'
@@ -88,7 +88,7 @@ jobs:
 
       - name: Create version bump PR
         if: env.DRY_RUN != 'true'
-        uses: peter-evans/create-pull-request@v6
+        uses: peter-evans/create-pull-request@v8
         with:
           title: "chore: release v${{ needs.prepare.outputs.version }}"
           body: |
@@ -178,7 +178,7 @@ jobs:
     if: always()
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Report orchestration results
         run: |
