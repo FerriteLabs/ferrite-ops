@@ -11,6 +11,7 @@ Deployment, monitoring, and packaging for [Ferrite](https://github.com/ferritela
 
 - `Dockerfile` + `docker-compose.yml` — Container setup
 - `charts/ferrite/` — Helm chart for Kubernetes
+- `terraform/` — Infrastructure-as-code modules for AWS ECS and EKS
 - `gitops/` — ArgoCD, Flux, and Kustomize examples
 - `grafana/` — Grafana monitoring dashboards
 - `monitoring/` — Prometheus alerting rules
@@ -91,6 +92,29 @@ kubectl exec ferrite-2 -- ferrite-cli REPLICAOF ferrite-0.ferrite-headless 6379
 ```
 
 See [`charts/ferrite/values-ha.yaml`](charts/ferrite/values-ha.yaml) for the full HA configuration including memory limits, persistence, and monitoring settings.
+
+## Terraform Deployment
+
+Deploy Ferrite on AWS using Terraform modules:
+
+```bash
+# AWS ECS Fargate (serverless containers)
+module "ferrite" {
+  source     = "github.com/ferritelabs/ferrite-ops//terraform/aws-ecs"
+  name       = "ferrite-prod"
+  vpc_id     = "vpc-abc123"
+  subnet_ids = ["subnet-1", "subnet-2"]
+}
+
+# AWS EKS (Kubernetes via Helm)
+module "ferrite" {
+  source       = "github.com/ferritelabs/ferrite-ops//terraform/aws-eks"
+  cluster_name = "my-cluster"
+  enable_ha    = true
+}
+```
+
+See [`terraform/README.md`](terraform/README.md) for full documentation.
 
 ## Grafana Dashboards
 
