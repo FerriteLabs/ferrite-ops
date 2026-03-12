@@ -270,14 +270,54 @@ serviceMonitor:
 
 # Prometheus rules
 prometheusRule:
-  # -- Enable PrometheusRule
+  # -- Enable PrometheusRule (requires Prometheus Operator CRDs)
   enabled: false
   # -- Namespace for PrometheusRule
   namespace: ""
   # -- Additional labels for PrometheusRule
   additionalLabels: {}
-  # -- Alert rules
-  rules: []
+  # -- Alert rules (defaults provided — override or extend as needed)
+  rules:
+    - alert: FerriteDown
+      expr: up{job="{{ include \"ferrite.fullname\" . }}"} == 0
+      for: 1m
+      labels:
+        severity: critical
+      annotations:
+        summary: "Ferrite instance {{ $labels.instance }} is down"
+        description: "Ferrite has been unreachable for more than 1 minute."
+    - alert: FerriteHighMemoryUsage
+      expr: ferrite_memory_used_bytes / ferrite_memory_max_bytes > 0.85
+      for: 5m
+      labels:
+        severity: warning
+      annotations:
+        summary: "Ferrite memory usage above 85%"
+        description: "Instance {{ $labels.instance }} memory at {{ $value | humanizePercentage }}."
+    - alert: FerriteHighLatency
+      expr: histogram_quantile(0.99, rate(ferrite_command_duration_seconds_bucket[5m])) > 0.1
+      for: 5m
+      labels:
+        severity: warning
+      annotations:
+        summary: "Ferrite P99 latency above 100ms"
+        description: "Instance {{ $labels.instance }} P99 latency is {{ $value }}s."
+    - alert: FerriteReplicationLagHigh
+      expr: ferrite_replication_lag_bytes > 1048576
+      for: 2m
+      labels:
+        severity: warning
+      annotations:
+        summary: "Ferrite replication lag above 1MB"
+        description: "Replica {{ $labels.instance }} is {{ $value | humanize1024 }}B behind primary."
+    - alert: FerriteRejectedConnections
+      expr: rate(ferrite_rejected_connections_total[5m]) > 0
+      for: 1m
+      labels:
+        severity: warning
+      annotations:
+        summary: "Ferrite rejecting connections"
+        description: "Instance {{ $labels.instance }} is rejecting {{ $value }} connections/sec."
 
 # Pod Disruption Budget
 podDisruptionBudget:
