@@ -1,0 +1,78 @@
+# Triggered by ferrite core repo after a version bump to sync versions
+# across Dockerfile, Helm chart, RPM spec, and other config files.
+
+name: Version Sync
+
+on:
+  repository_dispatch:
+    types: [version-sync]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'New version to sync (e.g. 0.3.1)'
+        required: true
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  sync:
+    name: Sync Versions
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Extract version
+        id: version
+        run: |
+          if [ "${{ github.event_name }}" = "repository_dispatch" ]; then
+            VERSION="${{ github.event.client_payload.version }}"
+          else
+            VERSION="${{ inputs.version }}"
+          fi
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "📦 Syncing to version ${VERSION}"
+
+      - name: Update Dockerfile
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          if grep -q 'ARG FERRITE_VERSION' Dockerfile; then
+            sed -i "s/ARG FERRITE_VERSION=.*/ARG FERRITE_VERSION=${VERSION}/" Dockerfile
+          fi
+
+      - name: Update Helm chart
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          CHART="charts/ferrite/Chart.yaml"
+          if [ -f "$CHART" ]; then
+            sed -i "s/^version:.*/version: ${VERSION}/" "$CHART"
+            sed -i "s/^appVersion:.*/appVersion: ${VERSION}/" "$CHART"
+          fi
+
+      - name: Update RPM spec
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          SPEC="packaging/rpm/ferrite.spec"
+          if [ -f "$SPEC" ]; then
+            sed -i "s/^Version:.*/Version:        ${VERSION}/" "$SPEC"
+          fi
+
+      - name: Create version sync PR
+        uses: peter-evans/create-pull-request@v6
+        with:
+          title: "chore: sync version to v${{ steps.version.outputs.version }}"
+          body: |
+            Automated version sync triggered by ferrite core version bump.
+
+            **Version**: `${{ steps.version.outputs.version }}`
+
+            Updates:
+            - Dockerfile `FERRITE_VERSION` arg
+            - Helm chart `version` and `appVersion`
+            - RPM spec `Version`
+          branch: version-sync/${{ steps.version.outputs.version }}
+          commit-message: "chore: sync version to v${{ steps.version.outputs.version }}"
+          labels: automated,version-sync
