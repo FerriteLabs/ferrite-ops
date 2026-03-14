@@ -93,6 +93,16 @@ kubectl exec ferrite-2 -- ferrite-cli REPLICAOF ferrite-0.ferrite-headless 6379
 
 See [`charts/ferrite/values-ha.yaml`](charts/ferrite/values-ha.yaml) for the full HA configuration including memory limits, persistence, and monitoring settings.
 
+### HA with Docker Compose
+
+For local development or non-Kubernetes environments:
+
+```bash
+docker compose -f docker/docker-compose.ha.yml up -d
+```
+
+This starts a 3-node cluster (1 primary + 2 replicas) with Prometheus and Grafana monitoring.
+
 ## Terraform Deployment
 
 Deploy Ferrite on AWS using Terraform modules:
