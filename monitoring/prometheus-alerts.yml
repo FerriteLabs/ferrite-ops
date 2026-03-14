@@ -14,6 +14,7 @@ groups:
         annotations:
           summary: "Ferrite high memory usage (instance {{ $labels.instance }})"
           description: "Memory usage is above 85% (current: {{ $value | printf \"%.1f\" }}%)"
+          runbook_url: "https://github.com/ferritelabs/ferrite-ops/blob/main/monitoring/runbooks/high-memory.md"
 
       - alert: FerriteCriticalMemoryUsage
         expr: (ferrite_memory_used_bytes / ferrite_memory_max_bytes) * 100 > 95
@@ -23,6 +24,7 @@ groups:
         annotations:
           summary: "Ferrite critical memory usage (instance {{ $labels.instance }})"
           description: "Memory usage is above 95% (current: {{ $value | printf \"%.1f\" }}%). Evictions may occur."
+          runbook_url: "https://github.com/ferritelabs/ferrite-ops/blob/main/monitoring/runbooks/high-memory.md"
 
       # Latency alerts
       - alert: FerriteHighLatencyP99
@@ -33,6 +35,7 @@ groups:
         annotations:
           summary: "Ferrite high P99 latency (instance {{ $labels.instance }})"
           description: "P99 latency is above 5ms (current: {{ $value | printf \"%.2f\" }}ms)"
+          runbook_url: "https://github.com/ferritelabs/ferrite-ops/blob/main/monitoring/runbooks/high-latency.md"
 
       - alert: FerriteHighLatencyP999
         expr: histogram_quantile(0.999, rate(ferrite_command_duration_seconds_bucket[5m])) * 1000 > 10
@@ -42,6 +45,7 @@ groups:
         annotations:
           summary: "Ferrite high P99.9 latency (instance {{ $labels.instance }})"
           description: "P99.9 latency is above 10ms (current: {{ $value | printf \"%.2f\" }}ms)"
+          runbook_url: "https://github.com/ferritelabs/ferrite-ops/blob/main/monitoring/runbooks/high-latency.md"
 
       # Connection alerts
       - alert: FerriteNoConnections
@@ -52,6 +56,7 @@ groups:
         annotations:
           summary: "Ferrite has no connected clients (instance {{ $labels.instance }})"
           description: "No clients connected for 5 minutes. Application may be down."
+          runbook_url: "https://github.com/ferritelabs/ferrite-ops/blob/main/monitoring/runbooks/connection-saturation.md"
 
       - alert: FerriteHighConnectionCount
         expr: ferrite_connected_clients > 1000
@@ -61,6 +66,7 @@ groups:
         annotations:
           summary: "Ferrite high connection count (instance {{ $labels.instance }})"
           description: "More than 1000 clients connected (current: {{ $value }})"
+          runbook_url: "https://github.com/ferritelabs/ferrite-ops/blob/main/monitoring/runbooks/connection-saturation.md"
 
       - alert: FerriteRejectedConnections
         expr: rate(ferrite_rejected_connections_total[5m]) > 0
@@ -70,6 +76,7 @@ groups:
         annotations:
           summary: "Ferrite rejecting connections (instance {{ $labels.instance }})"
           description: "Connections are being rejected. Check maxclients setting."
+          runbook_url: "https://github.com/ferritelabs/ferrite-ops/blob/main/monitoring/runbooks/connection-saturation.md"
 
       # Cache performance alerts
       - alert: FerriteLowHitRate
@@ -82,6 +89,7 @@ groups:
         annotations:
           summary: "Ferrite low cache hit rate (instance {{ $labels.instance }})"
           description: "Cache hit rate below 80% (current: {{ $value | printf \"%.1f\" }}%)"
+          runbook_url: "https://github.com/ferritelabs/ferrite-ops/blob/main/monitoring/runbooks/low-hit-rate.md"
 
       # Eviction alerts
       - alert: FerriteEvictions
@@ -92,6 +100,7 @@ groups:
         annotations:
           summary: "Ferrite evicting keys (instance {{ $labels.instance }})"
           description: "Keys are being evicted at {{ $value | printf \"%.0f\" }} keys/sec. Consider increasing maxmemory."
+          runbook_url: "https://github.com/ferritelabs/ferrite-ops/blob/main/monitoring/runbooks/high-memory.md"
 
       # Replication alerts
       - alert: FerriteReplicationLag
@@ -102,6 +111,7 @@ groups:
         annotations:
           summary: "Ferrite replication lag (instance {{ $labels.instance }})"
           description: "Replication lag is {{ $value | printf \"%.1f\" }} seconds"
+          runbook_url: "https://github.com/ferritelabs/ferrite-ops/blob/main/monitoring/runbooks/replication-lag.md"
 
       - alert: FerriteReplicationBroken
         expr: ferrite_connected_replicas < ferrite_expected_replicas
@@ -111,6 +121,7 @@ groups:
         annotations:
           summary: "Ferrite replication broken (instance {{ $labels.instance }})"
           description: "Expected {{ $labels.expected }} replicas but only {{ $value }} connected"
+          runbook_url: "https://github.com/ferritelabs/ferrite-ops/blob/main/monitoring/runbooks/replication-lag.md"
 
       # Persistence alerts
       - alert: FerriteAOFRewriteInProgress
@@ -121,6 +132,7 @@ groups:
         annotations:
           summary: "Ferrite AOF rewrite taking too long (instance {{ $labels.instance }})"
           description: "AOF rewrite has been running for more than 30 minutes"
+          runbook_url: "https://github.com/ferritelabs/ferrite-ops/blob/main/monitoring/runbooks/disk-full.md"
 
       - alert: FerriteRDBSaveInProgress
         expr: ferrite_rdb_save_in_progress == 1
@@ -130,6 +142,7 @@ groups:
         annotations:
           summary: "Ferrite RDB save taking too long (instance {{ $labels.instance }})"
           description: "RDB save has been running for more than 30 minutes"
+          runbook_url: "https://github.com/ferritelabs/ferrite-ops/blob/main/monitoring/runbooks/disk-full.md"
 
       # HybridLog alerts
       - alert: FerriteHybridLogDiskHigh
@@ -140,6 +153,7 @@ groups:
         annotations:
           summary: "Ferrite HybridLog disk tier growing large (instance {{ $labels.instance }})"
           description: "HybridLog disk tier is {{ $value | humanize1024 }}. Consider compaction."
+          runbook_url: "https://github.com/ferritelabs/ferrite-ops/blob/main/monitoring/runbooks/disk-full.md"
 
       # Instance health
       - alert: FerriteDown
@@ -150,6 +164,7 @@ groups:
         annotations:
           summary: "Ferrite instance down (instance {{ $labels.instance }})"
           description: "Ferrite instance is not responding to scrapes"
+          runbook_url: "https://github.com/ferritelabs/ferrite-ops/blob/main/monitoring/runbooks/ferrite-down.md"
 
       # Slow commands
       - alert: FerriteSlowCommands
@@ -160,6 +175,7 @@ groups:
         annotations:
           summary: "Ferrite slow commands detected (instance {{ $labels.instance }})"
           description: "{{ $value | printf \"%.1f\" }} slow commands per second detected"
+          runbook_url: "https://github.com/ferritelabs/ferrite-ops/blob/main/monitoring/runbooks/slow-commands.md"
 
       # SLO compliance: 99.9% availability over 30-day window
       - alert: FerriteSLOAvailabilityBreach
@@ -171,6 +187,7 @@ groups:
         annotations:
           summary: "Ferrite SLO availability breach (instance {{ $labels.instance }})"
           description: "Availability has dropped below 99.9% SLO target (current: {{ $value | printf \"%.4f\" }})"
+          runbook_url: "https://github.com/ferritelabs/ferrite-ops/blob/main/monitoring/runbooks/ferrite-down.md"
 
       # SLO compliance: P99 latency must stay under 10ms
       - alert: FerriteSLOLatencyBreach
@@ -182,6 +199,7 @@ groups:
         annotations:
           summary: "Ferrite SLO latency breach (instance {{ $labels.instance }})"
           description: "P99 latency exceeds 10ms SLO target (current: {{ $value | printf \"%.2f\" }}ms)"
+          runbook_url: "https://github.com/ferritelabs/ferrite-ops/blob/main/monitoring/runbooks/high-latency.md"
 
   - name: ferrite-cluster-alerts
     interval: 30s
@@ -194,6 +212,7 @@ groups:
         annotations:
           summary: "Ferrite cluster state not OK (instance {{ $labels.instance }})"
           description: "Cluster is not in OK state. Check cluster status."
+          runbook_url: "https://github.com/ferritelabs/ferrite-ops/blob/main/monitoring/runbooks/cluster-failure.md"
 
       - alert: FerriteClusterSlotsNotCovered
         expr: ferrite_cluster_slots_ok < 16384
@@ -203,6 +222,7 @@ groups:
         annotations:
           summary: "Ferrite cluster slots not fully covered (instance {{ $labels.instance }})"
           description: "Only {{ $value }} of 16384 slots are OK"
+          runbook_url: "https://github.com/ferritelabs/ferrite-ops/blob/main/monitoring/runbooks/cluster-failure.md"
 
       - alert: FerriteClusterNodeDown
         expr: ferrite_cluster_known_nodes - ferrite_cluster_nodes_ok > 0
@@ -212,6 +232,7 @@ groups:
         annotations:
           summary: "Ferrite cluster node down (instance {{ $labels.instance }})"
           description: "{{ $value }} cluster node(s) are not OK"
+          runbook_url: "https://github.com/ferritelabs/ferrite-ops/blob/main/monitoring/runbooks/cluster-failure.md"
 
   - name: ferrite-extended-alerts
     interval: 30s
@@ -224,6 +245,7 @@ groups:
         annotations:
           summary: "Vector index build stalled (instance {{ $labels.instance }})"
           description: "Vector index has been building for more than 30 minutes."
+          runbook_url: "https://github.com/ferritelabs/ferrite-ops/blob/main/monitoring/runbooks/slow-commands.md"
 
       - alert: CDCConsumerLagHigh
         expr: ferrite_stream_consumer_lag > 1000
@@ -233,6 +255,7 @@ groups:
         annotations:
           summary: "CDC consumer lag high (instance {{ $labels.instance }})"
           description: "Stream consumer lag is {{ $value }} (threshold: 1000)."
+          runbook_url: "https://github.com/ferritelabs/ferrite-ops/blob/main/monitoring/runbooks/replication-lag.md"
 
       - alert: TierPromotionSpike
         expr: rate(ferrite_hybridlog_promotions_total[5m]) > 10 * avg_over_time(rate(ferrite_hybridlog_promotions_total[5m])[1h:5m])
@@ -242,6 +265,7 @@ groups:
         annotations:
           summary: "Tier promotion spike detected (instance {{ $labels.instance }})"
           description: "Promotion rate is 10x above the 1h average."
+          runbook_url: "https://github.com/ferritelabs/ferrite-ops/blob/main/monitoring/runbooks/high-memory.md"
 
       - alert: DiskIOLatencyHigh
         expr: ferrite_disk_io_latency_seconds > 0.01
@@ -251,6 +275,7 @@ groups:
         annotations:
           summary: "Disk I/O latency high (instance {{ $labels.instance }})"
           description: "Disk I/O latency is {{ $value | printf \"%.3f\" }}s (threshold: 10ms)."
+          runbook_url: "https://github.com/ferritelabs/ferrite-ops/blob/main/monitoring/runbooks/disk-full.md"
 
       - alert: MemoryFragmentationHigh
         expr: ferrite_memory_fragmentation_ratio > 1.5
@@ -260,6 +285,7 @@ groups:
         annotations:
           summary: "Memory fragmentation high (instance {{ $labels.instance }})"
           description: "Fragmentation ratio is {{ $value | printf \"%.2f\" }} (threshold: 1.5)."
+          runbook_url: "https://github.com/ferritelabs/ferrite-ops/blob/main/monitoring/runbooks/high-memory.md"
 
       - alert: ClusterSplitBrainDetected
         expr: ferrite_cluster_split_brain == 1
@@ -269,6 +295,7 @@ groups:
         annotations:
           summary: "Cluster split-brain detected (instance {{ $labels.instance }})"
           description: "Split-brain condition detected. Immediate intervention required."
+          runbook_url: "https://github.com/ferritelabs/ferrite-ops/blob/main/monitoring/runbooks/cluster-failure.md"
 
       - alert: BackupOverdue
         expr: time() - ferrite_last_backup_timestamp > 86400 * 2
@@ -278,6 +305,7 @@ groups:
         annotations:
           summary: "Backup overdue (instance {{ $labels.instance }})"
           description: "Last backup was more than 2 days ago."
+          runbook_url: "https://github.com/ferritelabs/ferrite-ops/blob/main/monitoring/runbooks/backup-failure.md"
 
       # Disk I/O alerts
       - alert: FerriteHighDiskLatency
@@ -288,3 +316,4 @@ groups:
         annotations:
           summary: "Ferrite high disk I/O latency (instance {{ $labels.instance }})"
           description: "Average disk I/O latency above 10ms (current: {{ $value | printf \"%.3f\" }}s). Check storage backend."
+          runbook_url: "https://github.com/ferritelabs/ferrite-ops/blob/main/monitoring/runbooks/disk-full.md"
