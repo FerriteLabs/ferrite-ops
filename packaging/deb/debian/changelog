@@ -1,3 +1,31 @@
+ferrite (0.3.0-1) unstable; urgency=medium
+
+  * Structured error codes (25 numeric codes across 5 categories)
+  * 8 new command families: AUTOINDEX, CONV, COST, MULTICLOUD, POLICY, S3,
+    SLOT, VECTOR.INGEST
+  * Handler state persistence (all 47 handlers persist/restore via Store)
+  * Full SDK generator for 8 languages with FFI layer
+  * OpenTelemetry integration (traces, metrics, OTLP export)
+  * Predictive auto-scaling and cost optimization
+  * Enhanced cluster redirect with slot routing tests
+  * Migration tooling: RDB import, zero-downtime orchestrator
+
+ -- Ferrite Maintainers <maintainers@ferrite.dev>  Sat, 15 Mar 2026 00:00:00 +0000
+
+ferrite (0.2.0-1) unstable; urgency=medium
+
+  * Full-text search with BM25 scoring
+  * Semantic caching for LLM responses
+  * Embedded mode for edge/IoT deployments
+  * FerritQL query language
+  * WASM user-defined functions
+  * CDC and event streaming pipelines
+  * Multi-tenancy and tenant isolation
+  * Prometheus metrics and Grafana dashboards
+  * Kubernetes sidecar injection webhook
+
+ -- Ferrite Maintainers <maintainers@ferrite.dev>  Sat, 01 Jun 2025 00:00:00 +0000
+
 ferrite (0.1.0-1) unstable; urgency=medium
 
   * Initial release.
