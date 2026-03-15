@@ -7,10 +7,7 @@
 
 services:
   ferrite:
-    image: ferritelabs/ferrite:latest
-    build:
-      context: ../ferrite
-      dockerfile: ../ferrite-ops/Dockerfile
+    image: ghcr.io/ferritelabs/ferrite:latest
     ports:
       - "6379:6379"      # RESP protocol (Redis-compatible)
       - "8080:8080"      # Studio web UI
