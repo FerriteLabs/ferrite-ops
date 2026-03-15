@@ -195,6 +195,12 @@ jobs:
           REPOS=(
             "vscode-ferrite"
             "jetbrains-ferrite"
+            "ferrite-python-sdk"
+            "ferrite-go-sdk"
+            "ferrite-node-sdk"
+            "ferrite-java-sdk"
+            "ferrite-dotnet-sdk"
+            "ferrite-rust-sdk"
           )
 
           SUCCEEDED=0
@@ -222,7 +228,7 @@ jobs:
       - name: Dry run log
         if: env.DRY_RUN == 'true'
         run: |
-          echo "::notice::[DRY RUN] Would trigger SDK updates for: vscode-ferrite, jetbrains-ferrite"
+          echo "::notice::[DRY RUN] Would trigger SDK updates for: vscode-ferrite, jetbrains-ferrite, ferrite-python-sdk, ferrite-go-sdk, ferrite-node-sdk, ferrite-java-sdk, ferrite-dotnet-sdk, ferrite-rust-sdk"
 
   # ── Step 6: Run version sync check ──────────────────────────────────────────
   verify:
