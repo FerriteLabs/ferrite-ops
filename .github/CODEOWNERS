@@ -1,5 +1,5 @@
 # Default owners for everything
-* @josedab
+* @ferritelabs/devops
 
 # Docker and container configuration
 /Dockerfile* @josedab
@@ -7,12 +7,12 @@
 /docker/ @josedab
 
 # Kubernetes and Helm
-/charts/ @josedab
+/charts/ @ferritelabs/devops
 
 # Monitoring
-/grafana/ @josedab
+/grafana/ @ferritelabs/devops
 /monitoring/ @josedab
 
 # CI/CD and infrastructure
 /.github/ @josedab
-/scripts/ @josedab
+/scripts/ @ferritelabs/devops
