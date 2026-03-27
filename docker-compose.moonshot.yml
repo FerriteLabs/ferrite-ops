@@ -1,0 +1,144 @@
+# Ferrite Moonshot Docker Compose — Primary + Replica Topology
+#
+# Usage:
+#   docker compose -f docker-compose.moonshot.yml up -d
+#   docker compose -f docker-compose.moonshot.yml --profile monitoring up -d
+#
+# Ports:
+#   6379 — Primary (read/write)
+#   6380 — Replica (read-only)
+#   9090 — Primary metrics
+#   9091 — Replica metrics
+
+services:
+  # ---------- Primary ----------
+  ferrite-primary:
+    build:
+      context: ../ferrite
+      dockerfile: ../ferrite-ops/Dockerfile.moonshot
+      args:
+        FERRITE_FEATURES: "${FERRITE_FEATURES:-forge-runtime}"
+    image: ferrite:moonshot
+    container_name: ferrite-primary
+    hostname: ferrite-primary
+    ports:
+      - "6379:6379"
+      - "9090:9090"
+    volumes:
+      - ferrite-primary-data:/var/lib/ferrite/data
+      - ${FERRITE_CONFIG:-./ferrite.example.toml}:/etc/ferrite/ferrite.toml:ro
+    environment:
+      - RUST_LOG=${RUST_LOG:-ferrite=info}
+      - FERRITE_DATA_DIR=/var/lib/ferrite/data
+      - FERRITE_BIND=0.0.0.0
+      - FERRITE_METRICS_BIND=0.0.0.0
+      - FERRITE_LUCIDITY_SEED_HEX=${FERRITE_LUCIDITY_SEED_HEX:-}
+      - FERRITE_FORGE_ENABLED=${FERRITE_FORGE_ENABLED:-true}
+      - FERRITE_MNEMO_ENABLED=${FERRITE_MNEMO_ENABLED:-true}
+      - FERRITE_CHRONICLE_ENABLED=${FERRITE_CHRONICLE_ENABLED:-true}
+      - FERRITE_LUCIDITY_ENABLED=${FERRITE_LUCIDITY_ENABLED:-true}
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/ferrite-cli", "PING"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - ferrite-moonshot
+    deploy:
+      resources:
+        limits:
+          cpus: '4'
+          memory: 8G
+        reservations:
+          cpus: '2'
+          memory: 4G
+
+  # ---------- Replica ----------
+  ferrite-replica:
+    build:
+      context: ../ferrite
+      dockerfile: ../ferrite-ops/Dockerfile.moonshot
+      args:
+        FERRITE_FEATURES: "${FERRITE_FEATURES:-forge-runtime}"
+    image: ferrite:moonshot
+    container_name: ferrite-replica
+    hostname: ferrite-replica
+    ports:
+      - "6380:6379"
+      - "9091:9090"
+    volumes:
+      - ferrite-replica-data:/var/lib/ferrite/data
+      - ${FERRITE_CONFIG:-./ferrite.example.toml}:/etc/ferrite/ferrite.toml:ro
+    environment:
+      - RUST_LOG=${RUST_LOG:-ferrite=info}
+      - FERRITE_DATA_DIR=/var/lib/ferrite/data
+      - FERRITE_BIND=0.0.0.0
+      - FERRITE_METRICS_BIND=0.0.0.0
+      - FERRITE_REPLICATION_ROLE=replica
+      - FERRITE_REPLICATION_PRIMARY_HOST=ferrite-primary
+      - FERRITE_REPLICATION_PRIMARY_PORT=6379
+      - FERRITE_LUCIDITY_SEED_HEX=${FERRITE_LUCIDITY_SEED_HEX:-}
+      - FERRITE_FORGE_ENABLED=${FERRITE_FORGE_ENABLED:-true}
+      - FERRITE_MNEMO_ENABLED=${FERRITE_MNEMO_ENABLED:-true}
+      - FERRITE_CHRONICLE_ENABLED=${FERRITE_CHRONICLE_ENABLED:-true}
+      - FERRITE_LUCIDITY_ENABLED=${FERRITE_LUCIDITY_ENABLED:-true}
+    restart: unless-stopped
+    depends_on:
+      ferrite-primary:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/ferrite-cli", "PING"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    networks:
+      - ferrite-moonshot
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 4G
+        reservations:
+          cpus: '1'
+          memory: 2G
+
+  # ---------- Prometheus (opt-in) ----------
+  prometheus:
+    image: prom/prometheus:v2.48.0
+    container_name: ferrite-moonshot-prometheus
+    hostname: prometheus
+    ports:
+      - "9092:9090"
+    volumes:
+      - ./docker/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-moonshot-data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--storage.tsdb.retention.time=30d'
+    restart: unless-stopped
+    depends_on:
+      ferrite-primary:
+        condition: service_healthy
+    networks:
+      - ferrite-moonshot
+    profiles:
+      - monitoring
+
+volumes:
+  ferrite-primary-data:
+    driver: local
+  ferrite-replica-data:
+    driver: local
+  prometheus-moonshot-data:
+    driver: local
+
+networks:
+  ferrite-moonshot:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.29.0.0/16

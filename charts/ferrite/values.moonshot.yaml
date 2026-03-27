@@ -1,0 +1,130 @@
+# values.moonshot.yaml — Overlay for moonshot-enabled deployments
+#
+# Usage:
+#   helm install ferrite ./charts/ferrite \
+#     -f charts/ferrite/values.yaml \
+#     -f charts/ferrite/values.moonshot.yaml
+#
+#   helm upgrade ferrite ./charts/ferrite \
+#     -f charts/ferrite/values.yaml \
+#     -f charts/ferrite/values.moonshot.yaml
+
+# Override image to use moonshot-tagged build
+image:
+  tag: "moonshot"
+
+# ── Moonshot feature configuration ────────────────────────────────────
+moonshots:
+  forge:
+    enabled: true
+    requireSigning: false
+    callsPerSecondPerTenant: 1000
+    maxModuleSize: "16Mi"
+  mnemo:
+    enabled: true
+    bytesPerTenant: "1Gi"
+    sweepIntervalSeconds: 300
+  lucidity:
+    enabled: true
+    checkpointIntervalEpochs: 100
+    signerSeedSecret: "ferrite-lucidity-seed"
+  chronicle:
+    enabled: true
+    maxTotalBranches: 1000
+    retentionEpochs: 10000
+    maxBranchAge: "720h"
+  concord:
+    enabled: false  # Wave 3 — requires cluster consensus integration
+    gossipIntervalMs: 1000
+  pangea:
+    enabled: false  # Wave 3 — requires CXL hardware
+
+# Feature flags passed to the Ferrite binary
+featureFlags: "forge-runtime"
+
+# ── Resource bumps for moonshot workloads ─────────────────────────────
+resources:
+  limits:
+    cpu: 8000m
+    memory: 16Gi
+  requests:
+    cpu: 2000m
+    memory: 4Gi
+
+# ── Persistence — larger volume for Mnemo + Chronicle data ────────────
+persistence:
+  size: 50Gi
+
+# ── Environment variables for moonshot features ──────────────────────
+ferrite:
+  env:
+    extra:
+      FERRITE_FORGE_ENABLED: "true"
+      FERRITE_MNEMO_ENABLED: "true"
+      FERRITE_CHRONICLE_ENABLED: "true"
+      FERRITE_LUCIDITY_ENABLED: "true"
+      FERRITE_CONCORD_ENABLED: "false"
+      FERRITE_PANGEA_ENABLED: "false"
+    fromResources:
+      - secretRef:
+          name: ferrite-lucidity-seed
+
+  logging:
+    level: "info"
+    format: "json"
+
+  metrics:
+    enabled: true
+
+# ── Monitoring — enable ServiceMonitor for moonshot metrics ──────────
+serviceMonitor:
+  enabled: true
+  interval: 15s
+  scrapeTimeout: 10s
+
+# ── Prometheus alerting rules for moonshot subsystems ────────────────
+prometheusRule:
+  enabled: true
+  rules:
+    # Standard alerts (inherited from base values)
+    - alert: FerriteDown
+      expr: up{job="{{ include \"ferrite.fullname\" . }}"} == 0
+      for: 1m
+      labels:
+        severity: critical
+      annotations:
+        summary: "Ferrite instance {{ $labels.instance }} is down"
+        description: "Ferrite has been unreachable for more than 1 minute."
+    - alert: FerriteHighMemoryUsage
+      expr: ferrite_memory_used_bytes / ferrite_memory_max_bytes > 0.85
+      for: 5m
+      labels:
+        severity: warning
+      annotations:
+        summary: "Ferrite memory usage above 85%"
+        description: "Instance {{ $labels.instance }} memory at {{ $value | humanizePercentage }}."
+    # Moonshot-specific alerts
+    - alert: ForgeFunctionErrors
+      expr: rate(ferrite_forge_function_errors_total[5m]) > 5
+      for: 2m
+      labels:
+        severity: warning
+      annotations:
+        summary: "Forge function error rate elevated"
+        description: "Instance {{ $labels.instance }} seeing {{ $value }}/s Forge errors."
+    - alert: MnemoTenantNearQuota
+      expr: ferrite_mnemo_bytes_used / ferrite_mnemo_bytes_limit > 0.90
+      for: 5m
+      labels:
+        severity: warning
+      annotations:
+        summary: "Mnemo tenant approaching quota"
+        description: "Tenant {{ $labels.tenant }} at {{ $value | humanizePercentage }} of quota."
+    - alert: ChronicleHighBranchCount
+      expr: ferrite_chronicle_branches_total > 900
+      for: 10m
+      labels:
+        severity: warning
+      annotations:
+        summary: "Chronicle branch count near limit"
+        description: "Instance {{ $labels.instance }} has {{ $value }} branches (limit 1000)."
