@@ -56,7 +56,7 @@ RUN cargo build --release --bin ferrite --bin ferrite-cli
 RUN ls -lh /app/target/release/ferrite /app/target/release/ferrite-cli
 
 # Runtime stage: Minimal image
-FROM alpine:3.23.3 AS runtime
+FROM alpine:3.23.4 AS runtime
 
 # Install runtime dependencies
 RUN apk add --no-cache \
