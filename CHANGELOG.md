@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-04-20
+
+### Added
+
+- Moonshot Dockerfile (`Dockerfile.moonshot`) for extended runtime with Forge WASM support
+- Moonshot Helm values overlay (`charts/ferrite/values.moonshot.yaml`) for Kubernetes deployment
+- Moonshot Docker Compose override (`docker-compose.moonshot.yml`)
+- Grafana dashboard definitions for all 6 moonshot crates: Chronicle, Concord, Forge, Lucidity, Mnemo, Pangea
+- Moonshot health check script (`scripts/moonshot-health.sh`)
+- Rollback automation script (`scripts/rollback-atomic.sh`)
+- GitHub Discussion templates for ideas and Q&A
+
 ## [0.3.0] - 2026-03-09
 
 ### Added
