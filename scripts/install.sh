@@ -11,12 +11,28 @@ CONFIG_PATH="${FERRITE_CONFIG_PATH:-$CONFIG_DIR/ferrite.toml}"
 OS="$(uname -s | tr '[:upper:]' '[:lower:]')"
 ARCH="$(uname -m)"
 
+# Detect musl vs glibc on Linux (Alpine, Void, etc. use musl)
+LIBC=""
+if [ "$OS" = "linux" ]; then
+  if ldd --version 2>&1 | grep -qi musl; then
+    LIBC="musl"
+  fi
+fi
+
 case "${OS}-${ARCH}" in
   linux-x86_64)
-    ASSET="ferrite-linux-amd64"
+    if [ "$LIBC" = "musl" ]; then
+      ASSET="ferrite-linux-amd64-musl"
+    else
+      ASSET="ferrite-linux-amd64"
+    fi
     ;;
   linux-aarch64|linux-arm64)
-    ASSET="ferrite-linux-arm64"
+    if [ "$LIBC" = "musl" ]; then
+      ASSET="ferrite-linux-arm64-musl"
+    else
+      ASSET="ferrite-linux-arm64"
+    fi
     ;;
   darwin-x86_64)
     ASSET="ferrite-macos-amd64"

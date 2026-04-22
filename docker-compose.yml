@@ -14,7 +14,7 @@ services:
       dockerfile: Dockerfile
       args:
           RUST_VERSION: "1.94"
-    image: ferrite:latest
+    image: ferrite:${FERRITE_VERSION:-latest}
     container_name: ferrite
     hostname: ferrite
     labels:
@@ -95,6 +95,11 @@ services:
       - '--web.console.templates=/usr/share/prometheus/consoles'
       - '--web.enable-lifecycle'
       - '--storage.tsdb.retention.time=30d'
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:9090/-/healthy || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
     restart: unless-stopped
     depends_on:
       ferrite:
@@ -118,15 +123,20 @@ services:
       - ./docker/grafana/dashboards:/var/lib/grafana/dashboards:ro
     environment:
       - GF_SECURITY_ADMIN_USER=${GRAFANA_ADMIN_USER:-admin}
-      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD:-ferrite}
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD:?Set GRAFANA_ADMIN_PASSWORD environment variable}
       - GF_USERS_ALLOW_SIGN_UP=false
       - GF_SERVER_ROOT_URL=http://localhost:3000
       - GF_ANALYTICS_REPORTING_ENABLED=false
       - GF_ANALYTICS_CHECK_FOR_UPDATES=false
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:3000/api/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
     restart: unless-stopped
     depends_on:
       prometheus:
-        condition: service_started
+        condition: service_healthy
     networks:
       - ferrite-network
     profiles:

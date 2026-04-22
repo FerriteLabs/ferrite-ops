@@ -7,7 +7,9 @@
 
 services:
   ferrite:
-    image: ghcr.io/ferritelabs/ferrite:latest
+    # Pin to a specific version for reproducible deployments
+    # Update to latest release: https://github.com/ferritelabs/ferrite/releases
+    image: ghcr.io/ferritelabs/ferrite:0.3.0
     ports:
       - "6379:6379"      # RESP protocol (Redis-compatible)
       - "8080:8080"      # Studio web UI

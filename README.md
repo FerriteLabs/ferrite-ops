@@ -193,7 +193,7 @@ redis-cli PING  # → PONG
 
 | Repository | Description |
 |-----------|-------------|
-| [ferrite](https://github.com/ferritelabs/ferrite) | Core database engine (Rust, 12 crates) |
+| [ferrite](https://github.com/ferritelabs/ferrite) | Core database engine (Rust, 19 crates) |
 | [ferrite-docs](https://github.com/ferritelabs/ferrite-docs) | Documentation website |
 | **ferrite-ops** | 📍 You are here |
 | [ferrite-bench](https://github.com/ferritelabs/ferrite-bench) | Performance benchmarks |

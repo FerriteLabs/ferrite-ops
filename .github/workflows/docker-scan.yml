@@ -46,7 +46,7 @@ jobs:
             .
 
       - name: Run Trivy vulnerability scanner
-        uses: aquasecurity/trivy-action@master
+        uses: aquasecurity/trivy-action@0.28.0
         with:
           image-ref: "ferrite-scan:${{ github.sha }}"
           format: "sarif"
@@ -62,7 +62,7 @@ jobs:
 
       - name: Run Trivy in table format (for PR comments)
         if: always()
-        uses: aquasecurity/trivy-action@master
+        uses: aquasecurity/trivy-action@0.28.0
         with:
           image-ref: "ferrite-scan:${{ github.sha }}"
           format: "table"

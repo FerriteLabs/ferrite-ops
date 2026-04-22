@@ -42,7 +42,7 @@ docker compose up -d
 echo ""
 echo -e "${GREEN}✅ Monitoring stack is running!${NC}"
 echo ""
-echo -e "  Grafana:    ${YELLOW}http://localhost:${GRAFANA_PORT:-3000}${NC}  (admin / ferrite)"
+echo -e "  Grafana:    ${YELLOW}http://localhost:${GRAFANA_PORT:-3000}${NC}  (set GRAFANA_ADMIN_PASSWORD env var)"
 echo -e "  Prometheus: ${YELLOW}http://localhost:${PROMETHEUS_PORT:-9091}${NC}"
 echo ""
 echo "Pre-configured dashboards:"

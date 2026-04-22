@@ -27,7 +27,7 @@ Thank you for your interest in contributing! This repository contains deployment
 
 ### Docker
 - Use multi-stage builds to minimize image size
-- Pin base image versions (e.g., `rust:1.88-bookworm`, not `rust:latest`)
+- Pin base image versions (e.g., `rust:1.80-bookworm`, not `rust:latest`)
 - Include health checks in Dockerfiles and compose files
 
 ### Helm Charts

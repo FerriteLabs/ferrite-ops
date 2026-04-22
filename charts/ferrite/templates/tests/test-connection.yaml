@@ -15,8 +15,14 @@ spec:
       args:
         - |
           set -e
+          {{- if .Values.ferrite.auth.enabled }}
+          AUTH_FLAG="-a ${FERRITE_PASSWORD}"
+          {{- else }}
+          AUTH_FLAG=""
+          {{- end }}
+
           echo "Testing PING..."
-          response=$(redis-cli -h {{ include "ferrite.fullname" . }} -p {{ .Values.service.port }} PING)
+          response=$(redis-cli -h {{ include "ferrite.fullname" . }} -p {{ .Values.service.port }} $AUTH_FLAG PING)
           if [ "$response" != "PONG" ]; then
             echo "PING failed: got '$response'"
             exit 1
@@ -24,8 +30,8 @@ spec:
           echo "PING: OK"
 
           echo "Testing SET/GET..."
-          redis-cli -h {{ include "ferrite.fullname" . }} -p {{ .Values.service.port }} SET helm-test "pass"
-          response=$(redis-cli -h {{ include "ferrite.fullname" . }} -p {{ .Values.service.port }} GET helm-test)
+          redis-cli -h {{ include "ferrite.fullname" . }} -p {{ .Values.service.port }} $AUTH_FLAG SET helm-test "pass"
+          response=$(redis-cli -h {{ include "ferrite.fullname" . }} -p {{ .Values.service.port }} $AUTH_FLAG GET helm-test)
           if [ "$response" != "pass" ]; then
             echo "SET/GET failed: got '$response'"
             exit 1
@@ -33,7 +39,15 @@ spec:
           echo "SET/GET: OK"
 
           echo "Cleaning up..."
-          redis-cli -h {{ include "ferrite.fullname" . }} -p {{ .Values.service.port }} DEL helm-test
+          redis-cli -h {{ include "ferrite.fullname" . }} -p {{ .Values.service.port }} $AUTH_FLAG DEL helm-test
 
           echo "All tests passed!"
+      {{- if .Values.ferrite.auth.enabled }}
+      env:
+        - name: FERRITE_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: {{ .Values.ferrite.auth.existingSecret | default (printf "%s-auth" (include "ferrite.fullname" .)) }}
+              key: password
+      {{- end }}
   restartPolicy: Never

@@ -86,10 +86,13 @@ spec:
                   {{- end }}
                   key: password
             {{- end }}
-            {{- with .Values.ferrite.extraEnv }}
-            {{- toYaml . | nindent 12 }}
+            {{- with .Values.ferrite.env.extra }}
+            {{- range $key, $value := . }}
+            - name: {{ $key }}
+              value: {{ $value | quote }}
             {{- end }}
-          {{- with .Values.ferrite.extraEnvFrom }}
+            {{- end }}
+          {{- with .Values.ferrite.env.fromResources }}
           envFrom:
             {{- toYaml . | nindent 12 }}
           {{- end }}

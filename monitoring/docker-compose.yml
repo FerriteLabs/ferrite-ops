@@ -11,7 +11,7 @@
 #   FERRITE_HOST=10.0.0.5 FERRITE_METRICS_PORT=9090 docker compose up -d
 #
 # Access:
-#   Grafana:    http://localhost:3000  (admin / ferrite)
+#   Grafana:    http://localhost:3000  (set GRAFANA_ADMIN_PASSWORD)
 #   Prometheus: http://localhost:9091
 
 services:
@@ -44,7 +44,7 @@ services:
       - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
     environment:
       - GF_SECURITY_ADMIN_USER=${GRAFANA_ADMIN_USER:-admin}
-      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD:-ferrite}
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD:?Set GRAFANA_ADMIN_PASSWORD environment variable}
       - GF_USERS_ALLOW_SIGN_UP=false
       - GF_ANALYTICS_REPORTING_ENABLED=false
       - GF_ANALYTICS_CHECK_FOR_UPDATES=false

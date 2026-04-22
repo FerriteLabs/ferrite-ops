@@ -97,6 +97,9 @@ affinity: {}
 topologySpreadConstraints: []
 
 # -- Network Policy
+# ⚠️  PRODUCTION WARNING: NetworkPolicy is disabled by default. Enable it in
+# production to restrict network access to Ferrite pods. Without it, any pod
+# in the cluster can reach Ferrite.
 networkPolicy:
   # -- Enable NetworkPolicy
   enabled: false
@@ -104,6 +107,8 @@ networkPolicy:
   allowFromNamespaces: []
 
 # -- Autoscaling (HPA)
+# ⚠️  PRODUCTION WARNING: Autoscaling is disabled by default. Enable it in
+# production to handle variable workloads automatically.
 autoscaling:
   # -- Enable HorizontalPodAutoscaler
   enabled: false
@@ -320,6 +325,9 @@ prometheusRule:
         description: "Instance {{ $labels.instance }} is rejecting {{ $value }} connections/sec."
 
 # Pod Disruption Budget
+# ⚠️  PRODUCTION WARNING: PDB is disabled by default. Enable it in HA
+# deployments (replicaCount > 1) to prevent simultaneous pod evictions
+# during node maintenance or cluster upgrades.
 podDisruptionBudget:
   # -- Enable PDB
   enabled: false
@@ -432,6 +440,8 @@ tls:
       kind: ClusterIssuer
 
 # Backup configuration
+# ⚠️  PRODUCTION WARNING: Backups are disabled by default. Enable and configure
+# backups before running in production to prevent data loss.
 backup:
   # -- Enable scheduled backups
   enabled: false

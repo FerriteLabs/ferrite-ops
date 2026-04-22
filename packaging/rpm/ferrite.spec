@@ -61,6 +61,13 @@ if [ -d "ferrite-tui" ]; then
     cargo build --release --locked --manifest-path ferrite-tui/Cargo.toml
 fi
 
+%check
+# Verify binaries are functional
+target/release/ferrite --version
+if [ -f "target/release/ferrite-cli" ]; then
+    target/release/ferrite-cli --version
+fi
+
 %install
 # Install main binary
 install -D -m 755 target/release/ferrite %{buildroot}%{_bindir}/ferrite

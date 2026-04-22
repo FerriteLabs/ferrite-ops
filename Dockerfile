@@ -1,8 +1,10 @@
 # syntax=docker/dockerfile:1
 
 # Security: container image is scanned by Trivy in CI before push
-# See .github/workflows/container-scan.yml for details# Build stage 1: Compute a recipe file
+# See .github/workflows/container-scan.yml for details
+# Build stage 1: Compute a recipe file
 ARG BUILDPLATFORM=linux/amd64
+# Override at build time: docker build --build-arg FERRITE_VERSION=0.4.0
 ARG FERRITE_VERSION=0.3.0
 FROM --platform=$BUILDPLATFORM rust:1.95-slim-bookworm AS chef
 ARG TARGETARCH=amd64

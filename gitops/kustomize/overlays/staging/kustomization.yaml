@@ -8,6 +8,9 @@ resources:
 
 namePrefix: staging-
 
+commonLabels:
+  environment: staging
+
 patches:
   - target:
       kind: StatefulSet

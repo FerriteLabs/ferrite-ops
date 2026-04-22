@@ -272,7 +272,8 @@ if [ "$RESTORE_SKIP_STOP" != "true" ]; then
         done
 
         if [ "$WAIT_COUNT" -ge "$MAX_WAIT" ]; then
-            log "WARNING: Server did not respond within ${MAX_WAIT}s"
+            log "ERROR: Server did not respond within ${MAX_WAIT}s — restore may be incomplete"
+            EXIT_CODE=1
         else
             log "Server is ready"
         fi
@@ -281,7 +282,13 @@ if [ "$RESTORE_SKIP_STOP" != "true" ]; then
     fi
 fi
 
-log "Restore completed successfully"
+if [ "${EXIT_CODE:-0}" -ne 0 ]; then
+    log "Restore completed with warnings — check server status"
+else
+    log "Restore completed successfully"
+fi
 if [ -n "${PRE_RESTORE_BACKUP:-}" ]; then
     log "Previous data backed up to: $PRE_RESTORE_BACKUP"
 fi
+
+exit "${EXIT_CODE:-0}"
