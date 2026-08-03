@@ -31,15 +31,22 @@ jobs:
       - name: Extract version and source checksum
         id: version
         env:
+          EVENT_NAME: ${{ github.event_name }}
+          DISPATCH_VERSION: ${{ github.event.client_payload.version }}
+          WORKFLOW_VERSION: ${{ inputs.version }}
           INPUT_SHA256: ${{ github.event.client_payload.sha256 || inputs.sha256 }}
+          REPOSITORY_OWNER: ${{ github.repository_owner }}
         run: |
           set -euo pipefail
 
-          if [ "${{ github.event_name }}" = "repository_dispatch" ]; then
-            VERSION="${{ github.event.client_payload.version }}"
-          else
-            VERSION="${{ inputs.version }}"
-          fi
+          case "$EVENT_NAME" in
+            repository_dispatch) VERSION="$DISPATCH_VERSION" ;;
+            workflow_dispatch) VERSION="$WORKFLOW_VERSION" ;;
+            *)
+              echo "::error::Unsupported version sync event: ${EVENT_NAME}"
+              exit 1
+              ;;
+          esac
           # Accept either "v0.4.1" or "0.4.1".
           VERSION="${VERSION#v}"
 
@@ -48,21 +55,27 @@ jobs:
             exit 1
           fi
 
-          if ! echo "$VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.]+)?$'; then
+          if ! printf '%s\n' "$VERSION" |
+            grep -qE '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?$'; then
             echo "::error::Invalid semver: $VERSION"
+            exit 1
+          fi
+          if ! printf '%s\n' "$REPOSITORY_OWNER" | grep -qE '^[A-Za-z0-9_.-]+$'; then
+            echo "::error::Invalid repository owner"
             exit 1
           fi
 
           if [ -n "$INPUT_SHA256" ]; then
             SHA256="$INPUT_SHA256"
           else
-            TARBALL_URL="https://github.com/${{ github.repository_owner }}/ferrite/archive/refs/tags/v${VERSION}.tar.gz"
+            TARBALL_URL="https://github.com/${REPOSITORY_OWNER}/ferrite/archive/refs/tags/v${VERSION}.tar.gz"
             echo "Computing source archive SHA256 for ${TARBALL_URL} ..."
-            SHA256=$(curl -fsSL "$TARBALL_URL" | shasum -a 256 | awk '{print $1}')
+            SHA256="$(curl -fsSL "$TARBALL_URL" | shasum -a 256 | awk '{print $1}')"
           fi
 
-          if [ -z "$SHA256" ]; then
-            echo "::error::Failed to determine a SHA256 for Ferrite v${VERSION}"
+          SHA256="$(printf '%s' "$SHA256" | tr 'A-F' 'a-f')"
+          if ! printf '%s\n' "$SHA256" | grep -qE '^[0-9a-f]{64}$'; then
+            echo "::error::SHA256 must be exactly 64 hexadecimal characters"
             exit 1
           fi
 
@@ -71,11 +84,21 @@ jobs:
           echo "📦 Syncing to version ${VERSION} (source SHA256: ${SHA256})"
 
       - name: Update Dockerfiles
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          SHA256: ${{ steps.version.outputs.sha256 }}
         run: |
           set -euo pipefail
 
-          VERSION="${{ steps.version.outputs.version }}"
-          SHA256="${{ steps.version.outputs.sha256 }}"
+          if ! printf '%s\n' "$VERSION" |
+            grep -qE '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?$'; then
+            echo "::error::Invalid normalized release version"
+            exit 1
+          fi
+          if ! printf '%s\n' "$SHA256" | grep -qE '^[0-9a-f]{64}$'; then
+            echo "::error::Invalid normalized source SHA256"
+            exit 1
+          fi
           DOCKERFILES=(Dockerfile Dockerfile.moonshot Dockerfile.playground)
 
           # Validate every target before editing any of them. This prevents a
@@ -94,8 +117,15 @@ jobs:
           done
 
       - name: Update Helm chart
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
         run: |
-          VERSION="${{ steps.version.outputs.version }}"
+          set -euo pipefail
+          if ! printf '%s\n' "$VERSION" |
+            grep -qE '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?$'; then
+            echo "::error::Invalid normalized release version"
+            exit 1
+          fi
           PRIMARY_CHART="charts/ferrite/Chart.yaml"
           SIDECAR_CHART="charts/ferrite-sidecar/Chart.yaml"
           test -f "$PRIMARY_CHART"
@@ -105,8 +135,15 @@ jobs:
           perl -pi -e "s/^appVersion:.*/appVersion: \"${VERSION}\"/" "$SIDECAR_CHART"
 
       - name: Update RPM spec
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
         run: |
-          VERSION="${{ steps.version.outputs.version }}"
+          set -euo pipefail
+          if ! printf '%s\n' "$VERSION" |
+            grep -qE '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?$'; then
+            echo "::error::Invalid normalized release version"
+            exit 1
+          fi
           SPEC="packaging/rpm/ferrite.spec"
           if [ -f "$SPEC" ]; then
             sed -i "s/^Version:.*/Version:        ${VERSION}/" "$SPEC"

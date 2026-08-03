@@ -20,10 +20,6 @@ on:
         type: boolean
         default: false
 
-env:
-  VERSION: ${{ github.event.client_payload.version || inputs.version }}
-  DRY_RUN: ${{ inputs.dry_run || false }}
-
 jobs:
   # ── Step 1: Validate inputs and compute metadata ─────────────────────────────
   prepare:
@@ -37,9 +33,13 @@ jobs:
       - name: Compute release metadata
         id: meta
         env:
+          INPUT_VERSION: ${{ github.event.client_payload.version || inputs.version }}
           INPUT_SHA256: ${{ github.event.client_payload.sha256 || inputs.sha256 }}
+          REPOSITORY_OWNER: ${{ github.repository_owner }}
         run: |
-          VERSION="${{ env.VERSION }}"
+          set -euo pipefail
+
+          VERSION="${INPUT_VERSION#v}"
           TAG="v${VERSION}"
 
           if [ -z "$VERSION" ]; then
@@ -48,8 +48,13 @@ jobs:
           fi
 
           # Validate semver format
-          if ! echo "$VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.]+)?$'; then
+          if ! printf '%s\n' "$VERSION" |
+            grep -qE '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?$'; then
             echo "::error::Invalid semver: $VERSION"
+            exit 1
+          fi
+          if ! printf '%s\n' "$REPOSITORY_OWNER" | grep -qE '^[A-Za-z0-9_.-]+$'; then
+            echo "::error::Invalid repository owner"
             exit 1
           fi
 
@@ -57,8 +62,13 @@ jobs:
           if [ -n "$INPUT_SHA256" ]; then
             SHA256="$INPUT_SHA256"
           else
-            TARBALL_URL="https://github.com/${{ github.repository_owner }}/ferrite/archive/refs/tags/${TAG}.tar.gz"
-            SHA256=$(curl -sL "$TARBALL_URL" | shasum -a 256 | awk '{print $1}')
+            TARBALL_URL="https://github.com/${REPOSITORY_OWNER}/ferrite/archive/refs/tags/${TAG}.tar.gz"
+            SHA256="$(curl -fsSL "$TARBALL_URL" | shasum -a 256 | awk '{print $1}')"
+          fi
+          SHA256="$(printf '%s' "$SHA256" | tr 'A-F' 'a-f')"
+          if ! printf '%s\n' "$SHA256" | grep -qE '^[0-9a-f]{64}$'; then
+            echo "::error::SHA256 must be exactly 64 hexadecimal characters"
+            exit 1
           fi
 
           printf 'version=%s\ntag=%s\nsha256=%s\n' \
@@ -78,16 +88,23 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Update Helm Chart version
-        if: env.DRY_RUN != 'true'
+        if: ${{ !(inputs.dry_run || false) }}
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
         run: |
-          VERSION="${{ needs.prepare.outputs.version }}"
+          set -euo pipefail
+          if ! printf '%s\n' "$VERSION" |
+            grep -qE '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?$'; then
+            echo "::error::Invalid normalized release version"
+            exit 1
+          fi
           perl -pi -e "s/^version:.*/version: ${VERSION}/" charts/ferrite/Chart.yaml
           perl -pi -e "s/^appVersion:.*/appVersion: \"${VERSION}\"/" charts/ferrite/Chart.yaml
           perl -pi -e "s/^appVersion:.*/appVersion: \"${VERSION}\"/" charts/ferrite-sidecar/Chart.yaml
           echo "Updated primary chart version/appVersion and sidecar appVersion to ${VERSION}"
 
       - name: Create version bump PR
-        if: env.DRY_RUN != 'true'
+        if: ${{ !(inputs.dry_run || false) }}
         uses: peter-evans/create-pull-request@v6
         with:
           title: "chore: release v${{ needs.prepare.outputs.version }}"
@@ -104,9 +121,11 @@ jobs:
           commit-message: "chore: bump to v${{ needs.prepare.outputs.version }}"
 
       - name: Dry run log
-        if: env.DRY_RUN == 'true'
+        if: ${{ inputs.dry_run || false }}
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
         run: |
-          echo "::notice::[DRY RUN] Would update primary chart version/appVersion and sidecar appVersion to v${{ needs.prepare.outputs.version }}"
+          echo "::notice::[DRY RUN] Would update primary chart version/appVersion and sidecar appVersion to v${VERSION}"
 
   # ── Step 3: Trigger Homebrew formula update ──────────────────────────────────
   update-homebrew:
@@ -115,12 +134,27 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Trigger Homebrew tap update
-        if: env.DRY_RUN != 'true'
+        if: ${{ !(inputs.dry_run || false) }}
         env:
           GH_TOKEN: ${{ secrets.CROSS_REPO_TOKEN }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+          SHA256: ${{ needs.prepare.outputs.sha256 }}
+          REPOSITORY_OWNER: ${{ github.repository_owner }}
         run: |
-          VERSION="${{ needs.prepare.outputs.version }}"
-          SHA256="${{ needs.prepare.outputs.sha256 }}"
+          set -euo pipefail
+          if ! printf '%s\n' "$VERSION" |
+            grep -qE '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?$'; then
+            echo "::error::Invalid normalized release version"
+            exit 1
+          fi
+          if ! printf '%s\n' "$SHA256" | grep -qE '^[0-9a-f]{64}$'; then
+            echo "::error::Invalid normalized source SHA256"
+            exit 1
+          fi
+          if ! printf '%s\n' "$REPOSITORY_OWNER" | grep -qE '^[A-Za-z0-9_.-]+$'; then
+            echo "::error::Invalid repository owner"
+            exit 1
+          fi
 
           if [ -z "$GH_TOKEN" ]; then
             echo "::warning::CROSS_REPO_TOKEN not set. Skipping homebrew-tap update."
@@ -128,18 +162,22 @@ jobs:
             exit 0
           fi
 
-          curl -X POST \
+          PAYLOAD="$(jq -cn --arg version "$VERSION" --arg sha256 "$SHA256" \
+            '{event_type:"ferrite-release",client_payload:{version:$version,sha256:$sha256}}')"
+          curl -fsS -X POST \
             -H "Authorization: token ${GH_TOKEN}" \
             -H "Accept: application/vnd.github.v3+json" \
-            "https://api.github.com/repos/${{ github.repository_owner }}/homebrew-tap/dispatches" \
-            -d "{\"event_type\":\"ferrite-release\",\"client_payload\":{\"version\":\"${VERSION}\",\"sha256\":\"${SHA256}\"}}"
+            "https://api.github.com/repos/${REPOSITORY_OWNER}/homebrew-tap/dispatches" \
+            --data "$PAYLOAD"
 
           echo "::notice::Triggered homebrew-tap update for v${VERSION}"
 
       - name: Dry run log
-        if: env.DRY_RUN == 'true'
+        if: ${{ inputs.dry_run || false }}
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
         run: |
-          echo "::notice::[DRY RUN] Would trigger homebrew-tap for v${{ needs.prepare.outputs.version }}"
+          echo "::notice::[DRY RUN] Would trigger homebrew-tap for v${VERSION}"
 
   # ── Step 4: Trigger documentation site update ────────────────────────────────
   update-docs:
@@ -148,29 +186,44 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Trigger docs version update
-        if: env.DRY_RUN != 'true'
+        if: ${{ !(inputs.dry_run || false) }}
         env:
           GH_TOKEN: ${{ secrets.CROSS_REPO_TOKEN }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+          REPOSITORY_OWNER: ${{ github.repository_owner }}
         run: |
-          VERSION="${{ needs.prepare.outputs.version }}"
+          set -euo pipefail
+          if ! printf '%s\n' "$VERSION" |
+            grep -qE '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?$'; then
+            echo "::error::Invalid normalized release version"
+            exit 1
+          fi
+          if ! printf '%s\n' "$REPOSITORY_OWNER" | grep -qE '^[A-Za-z0-9_.-]+$'; then
+            echo "::error::Invalid repository owner"
+            exit 1
+          fi
 
           if [ -z "$GH_TOKEN" ]; then
             echo "::warning::CROSS_REPO_TOKEN not set. Skipping docs update."
             exit 0
           fi
 
-          curl -X POST \
+          PAYLOAD="$(jq -cn --arg version "$VERSION" \
+            '{event_type:"ferrite-release",client_payload:{version:$version}}')"
+          curl -fsS -X POST \
             -H "Authorization: token ${GH_TOKEN}" \
             -H "Accept: application/vnd.github.v3+json" \
-            "https://api.github.com/repos/${{ github.repository_owner }}/ferrite-docs/dispatches" \
-            -d "{\"event_type\":\"ferrite-release\",\"client_payload\":{\"version\":\"${VERSION}\"}}"
+            "https://api.github.com/repos/${REPOSITORY_OWNER}/ferrite-docs/dispatches" \
+            --data "$PAYLOAD"
 
           echo "::notice::Triggered ferrite-docs update for v${VERSION}"
 
       - name: Dry run log
-        if: env.DRY_RUN == 'true'
+        if: ${{ inputs.dry_run || false }}
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
         run: |
-          echo "::notice::[DRY RUN] Would trigger ferrite-docs for v${{ needs.prepare.outputs.version }}"
+          echo "::notice::[DRY RUN] Would trigger ferrite-docs for v${VERSION}"
 
   # ── Step 5: Trigger SDK and IDE extension updates ────────────────────────────
   update-sdks:
@@ -179,12 +232,22 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Trigger SDK repository updates
-        if: env.DRY_RUN != 'true'
+        if: ${{ !(inputs.dry_run || false) }}
         env:
           GH_TOKEN: ${{ secrets.CROSS_REPO_TOKEN }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+          OWNER: ${{ github.repository_owner }}
         run: |
-          VERSION="${{ needs.prepare.outputs.version }}"
-          OWNER="${{ github.repository_owner }}"
+          set -euo pipefail
+          if ! printf '%s\n' "$VERSION" |
+            grep -qE '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?$'; then
+            echo "::error::Invalid normalized release version"
+            exit 1
+          fi
+          if ! printf '%s\n' "$OWNER" | grep -qE '^[A-Za-z0-9_.-]+$'; then
+            echo "::error::Invalid repository owner"
+            exit 1
+          fi
 
           if [ -z "$GH_TOKEN" ]; then
             echo "::warning::CROSS_REPO_TOKEN not set. Skipping SDK updates."
@@ -209,11 +272,13 @@ jobs:
 
           for REPO in "${REPOS[@]}"; do
             echo "Triggering ${REPO} update for v${VERSION}..."
+            PAYLOAD="$(jq -cn --arg version "$VERSION" \
+              '{event_type:"ferrite-release",client_payload:{version:$version}}')"
             HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X POST \
               -H "Authorization: token ${GH_TOKEN}" \
               -H "Accept: application/vnd.github.v3+json" \
               "https://api.github.com/repos/${OWNER}/${REPO}/dispatches" \
-              -d "{\"event_type\":\"ferrite-release\",\"client_payload\":{\"version\":\"${VERSION}\"}}")
+              --data "$PAYLOAD")
 
             if [ "$HTTP_CODE" = "204" ]; then
               echo "::notice::Triggered ${REPO} update for v${VERSION}"
@@ -227,7 +292,7 @@ jobs:
           echo "SDK updates triggered: ${SUCCEEDED} succeeded, ${FAILED} failed"
 
       - name: Dry run log
-        if: env.DRY_RUN == 'true'
+        if: ${{ inputs.dry_run || false }}
         run: |
           echo "::notice::[DRY RUN] Would trigger SDK updates for: vscode-ferrite, jetbrains-ferrite, ferrite-python-sdk, ferrite-go-sdk, ferrite-node-sdk, ferrite-java-sdk, ferrite-dotnet-sdk, ferrite-rust-sdk"
 
@@ -241,19 +306,36 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Report orchestration results
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          SHA256: ${{ needs.prepare.outputs.sha256 }}
+          DRY_RUN: ${{ inputs.dry_run || false }}
+          UPDATE_OPS_RESULT: ${{ needs.update-ops.result }}
+          UPDATE_HOMEBREW_RESULT: ${{ needs.update-homebrew.result }}
+          UPDATE_DOCS_RESULT: ${{ needs.update-docs.result }}
+          UPDATE_SDKS_RESULT: ${{ needs.update-sdks.result }}
         run: |
-          VERSION="${{ needs.prepare.outputs.version }}"
+          set -euo pipefail
+          if ! printf '%s\n' "$VERSION" |
+            grep -qE '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?$'; then
+            echo "::error::Invalid normalized release version"
+            exit 1
+          fi
+          if ! printf '%s\n' "$SHA256" | grep -qE '^[0-9a-f]{64}$'; then
+            echo "::error::Invalid normalized source SHA256"
+            exit 1
+          fi
           {
             echo "## Release Orchestration Summary — v${VERSION}"
             echo ""
             echo "| Repository | Status |"
             echo "|-----------|--------|"
-            echo "| ferrite-ops (Helm) | ${{ needs.update-ops.result }} |"
-            echo "| homebrew-tap | ${{ needs.update-homebrew.result }} |"
-            echo "| ferrite-docs | ${{ needs.update-docs.result }} |"
-            echo "| SDKs & Extensions | ${{ needs.update-sdks.result }} |"
+            echo "| ferrite-ops (Helm) | ${UPDATE_OPS_RESULT} |"
+            echo "| homebrew-tap | ${UPDATE_HOMEBREW_RESULT} |"
+            echo "| ferrite-docs | ${UPDATE_DOCS_RESULT} |"
+            echo "| SDKs & Extensions | ${UPDATE_SDKS_RESULT} |"
             echo ""
             echo "**Version:** ${VERSION}"
-            echo "**SHA256:** ${{ needs.prepare.outputs.sha256 }}"
-            echo "**Dry Run:** ${{ env.DRY_RUN }}"
+            echo "**SHA256:** ${SHA256}"
+            echo "**Dry Run:** ${DRY_RUN}"
           } >> "$GITHUB_STEP_SUMMARY"

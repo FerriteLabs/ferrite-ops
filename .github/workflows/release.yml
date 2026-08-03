@@ -29,6 +29,7 @@ jobs:
     outputs:
       digest: ${{ steps.build.outputs.digest }}
       image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+      version: ${{ steps.release_meta.outputs.version }}
     steps:
       - uses: actions/checkout@v4
 
@@ -58,20 +59,29 @@ jobs:
       # is releasing.
       - name: Determine release version and source checksum
         id: release_meta
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          DISPATCH_VERSION: ${{ github.event.client_payload.version }}
+          WORKFLOW_TAG: ${{ inputs.tag }}
+          REPOSITORY_OWNER: ${{ github.repository_owner }}
         run: |
           set -euo pipefail
 
           RAW_VERSION=""
-          case "${{ github.event_name }}" in
+          case "$EVENT_NAME" in
             push)
               # Triggered by a `v*` tag push; GITHUB_REF_NAME is the tag itself.
               RAW_VERSION="${GITHUB_REF_NAME}"
               ;;
             repository_dispatch)
-              RAW_VERSION="${{ github.event.client_payload.version }}"
+              RAW_VERSION="$DISPATCH_VERSION"
               ;;
             workflow_dispatch)
-              RAW_VERSION="${{ inputs.tag }}"
+              RAW_VERSION="$WORKFLOW_TAG"
+              ;;
+            *)
+              echo "::error::Unsupported release event: ${EVENT_NAME}"
+              exit 1
               ;;
           esac
 
@@ -79,20 +89,26 @@ jobs:
           VERSION="${RAW_VERSION#v}"
 
           if [ -z "$VERSION" ]; then
-            echo "::error::Could not determine a Ferrite release version from event '${{ github.event_name }}' (raw value: '${RAW_VERSION}')."
+            echo "::error::Could not determine a Ferrite release version from event '${EVENT_NAME}'."
             exit 1
           fi
 
-          if ! echo "$VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.]+)?$'; then
+          if ! printf '%s\n' "$VERSION" |
+            grep -qE '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?$'; then
             echo "::error::Invalid semver version derived for this release: '${VERSION}'"
             exit 1
           fi
+          if ! printf '%s\n' "$REPOSITORY_OWNER" | grep -qE '^[A-Za-z0-9_.-]+$'; then
+            echo "::error::Invalid repository owner"
+            exit 1
+          fi
 
-          TARBALL_URL="https://github.com/${{ github.repository_owner }}/ferrite/archive/refs/tags/v${VERSION}.tar.gz"
+          TARBALL_URL="https://github.com/${REPOSITORY_OWNER}/ferrite/archive/refs/tags/v${VERSION}.tar.gz"
           echo "Computing source archive SHA256 for ${TARBALL_URL} ..."
           SHA256="$(curl -fsSL "$TARBALL_URL" | shasum -a 256 | awk '{print $1}')"
-          if [ -z "$SHA256" ]; then
-            echo "::error::Failed to download or checksum the source tarball at ${TARBALL_URL}"
+          SHA256="$(printf '%s' "$SHA256" | tr 'A-F' 'a-f')"
+          if ! printf '%s\n' "$SHA256" | grep -qE '^[0-9a-f]{64}$'; then
+            echo "::error::Failed to obtain a valid SHA256 checksum for the source tarball"
             exit 1
           fi
 
@@ -219,21 +235,23 @@ jobs:
         env:
           IMAGE: ${{ needs.build-and-push.outputs.image }}
           DIGEST: ${{ needs.build-and-push.outputs.digest }}
+          CERTIFICATE_IDENTITY_REGEXP: ^https://github\.com/${{ github.repository_owner }}/
         run: |
           cosign verify \
             --certificate-oidc-issuer=https://token.actions.githubusercontent.com \
-            --certificate-identity-regexp="^https://github\\.com/${{ github.repository_owner }}/" \
+            --certificate-identity-regexp="$CERTIFICATE_IDENTITY_REGEXP" \
             "${IMAGE}@${DIGEST}"
 
       - name: Verify SBOM attestation
         env:
           IMAGE: ${{ needs.build-and-push.outputs.image }}
           DIGEST: ${{ needs.build-and-push.outputs.digest }}
+          CERTIFICATE_IDENTITY_REGEXP: ^https://github\.com/${{ github.repository_owner }}/
         run: |
           cosign verify-attestation \
             --type spdxjson \
             --certificate-oidc-issuer=https://token.actions.githubusercontent.com \
-            --certificate-identity-regexp="^https://github\\.com/${{ github.repository_owner }}/" \
+            --certificate-identity-regexp="$CERTIFICATE_IDENTITY_REGEXP" \
             "${IMAGE}@${DIGEST}"
 
   # Bump Chart.yaml version when triggered by a core release
@@ -259,6 +277,7 @@ jobs:
   bump-chart:
     name: Bump Chart Version
     runs-on: ubuntu-latest
+    needs: build-and-push
     if: github.event_name == 'repository_dispatch'
     permissions:
       contents: write
@@ -266,19 +285,23 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Update Chart.yaml
+        env:
+          VERSION: ${{ needs.build-and-push.outputs.version }}
         run: |
-          VERSION="${{ github.event.client_payload.version }}"
-          VERSION="${VERSION#v}"
-          if [ -n "$VERSION" ]; then
-            perl -pi -e "s/^version:.*/version: ${VERSION}/" charts/ferrite/Chart.yaml
-            perl -pi -e "s/^appVersion:.*/appVersion: \"${VERSION}\"/" charts/ferrite/Chart.yaml
-            perl -pi -e "s/^appVersion:.*/appVersion: \"${VERSION}\"/" charts/ferrite-sidecar/Chart.yaml
-            echo "Updated primary chart version/appVersion and sidecar appVersion to ${VERSION}"
+          set -euo pipefail
+          if ! printf '%s\n' "$VERSION" |
+            grep -qE '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?$'; then
+            echo "::error::Invalid normalized release version"
+            exit 1
           fi
+          perl -pi -e "s/^version:.*/version: ${VERSION}/" charts/ferrite/Chart.yaml
+          perl -pi -e "s/^appVersion:.*/appVersion: \"${VERSION}\"/" charts/ferrite/Chart.yaml
+          perl -pi -e "s/^appVersion:.*/appVersion: \"${VERSION}\"/" charts/ferrite-sidecar/Chart.yaml
+          echo "Updated primary chart version/appVersion and sidecar appVersion to ${VERSION}"
       - name: Create PR for version bump
         uses: peter-evans/create-pull-request@v6
         with:
-          title: "chore: bump chart version to ${{ github.event.client_payload.version }}"
+          title: "chore: bump chart version to ${{ needs.build-and-push.outputs.version }}"
           body: "Auto-generated by ferrite-release dispatch."
-          branch: "chart-bump-${{ github.event.client_payload.version }}"
+          branch: "chart-bump-${{ needs.build-and-push.outputs.version }}"
           labels: dependencies

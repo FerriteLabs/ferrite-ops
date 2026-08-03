@@ -42,6 +42,8 @@ assert_contains "$RELEASE_CONTENT" "build-args: \${{ steps.release_meta.outputs.
   "release.yml passes the derived FERRITE_VERSION/FERRITE_SOURCE_SHA256 to docker/build-push-action"
 assert_contains "$RELEASE_CONTENT" 'grep -qE' \
   "release.yml validates the derived version against a semver pattern"
+assert_contains "$RELEASE_CONTENT" "'^[0-9a-f]{64}$'" \
+  "release.yml validates computed source checksums as exactly 64 hexadecimal characters"
 assert_contains "$RELEASE_CONTENT" "shasum -a 256" \
   "release.yml computes the source archive checksum"
 assert_contains "$RELEASE_CONTENT" "GITHUB_REF_NAME" \
@@ -82,10 +84,40 @@ assert_contains "$VERSION_SYNC_CONTENT" "ARG FERRITE_VERSION=" \
   "version-sync.yml updates each Dockerfile's FERRITE_VERSION default"
 assert_contains "$VERSION_SYNC_CONTENT" 'grep -qE' \
   "version-sync.yml validates the version against a semver pattern"
+assert_contains "$VERSION_SYNC_CONTENT" "'^[0-9a-f]{64}$'" \
+  "version-sync.yml validates supplied and computed source checksums"
 assert_contains "$VERSION_SYNC_CONTENT" "shasum -a 256" \
   "version-sync.yml computes the source checksum when not explicitly provided"
 assert_contains "$VERSION_SYNC_CONTENT" "charts/ferrite-sidecar/Chart.yaml" \
   "version-sync.yml keeps the sidecar appVersion synchronized"
+assert_contains "$ORCHESTRATION_CONTENT" "'^[0-9a-f]{64}$'" \
+  "release-orchestration.yml validates supplied and computed source checksums"
+
+# No GitHub expression is allowed inside a run script in these privileged
+# release workflows. Untrusted values enter scripts only through step env.
+if command -v python3 >/dev/null 2>&1 &&
+  python3 -c "import yaml" >/dev/null 2>&1 &&
+  python3 - "$RELEASE_YML" "$VERSION_SYNC_YML" "$ORCHESTRATION_YML" <<'PYEOF'
+import sys
+import yaml
+
+for path in sys.argv[1:]:
+    with open(path) as workflow_file:
+        workflow = yaml.safe_load(workflow_file)
+    for job_name, job in workflow.get("jobs", {}).items():
+        for index, step in enumerate(job.get("steps", [])):
+            script = step.get("run")
+            if script and "${{" in script:
+                name = step.get("name", f"step {index}")
+                raise SystemExit(
+                    f"{path}: {job_name}/{name} interpolates a GitHub expression in run"
+                )
+PYEOF
+then
+  harness_ok "release workflow run scripts contain no direct GitHub expression interpolation"
+else
+  harness_fail "release workflow run scripts must receive GitHub expressions through step env"
+fi
 
 # --- Static checks: ordinary CI/scan workflows retain pinned defaults -------
 for wf in ci.yml docker-scan.yml sbom.yml; do
@@ -122,7 +154,8 @@ trap 'rm -rf "$EXTRACT_DIR"' EXIT
 
 EXTRACT_LOG="${EXTRACT_DIR}/extract.log"
 if ! python3 - "$RELEASE_YML" "$VERSION_SYNC_YML" "$ORCHESTRATION_YML" \
-  "$EXTRACT_DIR/release_meta.sh" "$EXTRACT_DIR/update_dockerfiles.sh" \
+  "$EXTRACT_DIR/release_meta.sh" "$EXTRACT_DIR/version_sync_meta.sh" \
+  "$EXTRACT_DIR/orchestration_meta.sh" "$EXTRACT_DIR/update_dockerfiles.sh" \
   "$EXTRACT_DIR/release_chart.sh" "$EXTRACT_DIR/version_sync_chart.sh" \
   "$EXTRACT_DIR/orchestration_chart.sh" "$EXTRACT_DIR/metadata_tags.txt" \
   >"${EXTRACT_DIR}/extract.stdout" 2>"${EXTRACT_DIR}/extract.log" << 'PYEOF'
@@ -134,6 +167,8 @@ import yaml
     version_sync_yml_path,
     orchestration_yml_path,
     release_out_path,
+    version_sync_meta_out_path,
+    orchestration_meta_out_path,
     sync_out_path,
     release_chart_out_path,
     version_sync_chart_out_path,
@@ -185,6 +220,12 @@ with open(version_sync_yml_path) as f:
     sync_doc = yaml.safe_load(f)
 
 sync_steps = sync_doc["jobs"]["sync"]["steps"]
+version_sync_meta_script = next(
+    s["run"] for s in sync_steps if s.get("name") == "Extract version and source checksum"
+)
+with open(version_sync_meta_out_path, "w") as f:
+    f.write(version_sync_meta_script)
+
 sync_script = next(s["run"] for s in sync_steps if s.get("name") == "Update Dockerfiles")
 with open(sync_out_path, "w") as f:
     f.write(sync_script)
@@ -197,6 +238,14 @@ with open(version_sync_chart_out_path, "w") as f:
 
 with open(orchestration_yml_path) as f:
     orchestration_doc = yaml.safe_load(f)
+orchestration_meta_script = next(
+    s["run"]
+    for s in orchestration_doc["jobs"]["prepare"]["steps"]
+    if s.get("name") == "Compute release metadata"
+)
+with open(orchestration_meta_out_path, "w") as f:
+    f.write(orchestration_meta_script)
+
 orchestration_chart_script = next(
     s["run"]
     for s in orchestration_doc["jobs"]["update-ops"]["steps"]
@@ -216,14 +265,12 @@ fi
 SYNC_VERSION="9.8.7"
 SYNC_SHA256="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 SYNC_SCRIPT="$(cat "${EXTRACT_DIR}/update_dockerfiles.sh")"
-SYNC_SCRIPT="${SYNC_SCRIPT//\$\{\{ steps.version.outputs.version \}\}/${SYNC_VERSION}}"
-SYNC_SCRIPT="${SYNC_SCRIPT//\$\{\{ steps.version.outputs.sha256 \}\}/${SYNC_SHA256}}"
 
 SYNC_DIR="${EXTRACT_DIR}/sync-success"
 mkdir -p "$SYNC_DIR"
 cp "${REPO_ROOT}/Dockerfile" "${REPO_ROOT}/Dockerfile.moonshot" \
   "${REPO_ROOT}/Dockerfile.playground" "$SYNC_DIR/"
-if (cd "$SYNC_DIR" && bash -c "$SYNC_SCRIPT"); then
+if (cd "$SYNC_DIR" && VERSION="$SYNC_VERSION" SHA256="$SYNC_SHA256" bash -c "$SYNC_SCRIPT"); then
   for dockerfile in Dockerfile Dockerfile.moonshot Dockerfile.playground; do
     assert_contains "$(cat "${SYNC_DIR}/${dockerfile}")" "ARG FERRITE_VERSION=${SYNC_VERSION}" \
       "version-sync functional replay updates ${dockerfile}'s version"
@@ -241,7 +288,7 @@ cp "${REPO_ROOT}/Dockerfile" "${REPO_ROOT}/Dockerfile.moonshot" \
 sed '/^ARG FERRITE_SOURCE_SHA256=/d' "${DRIFT_DIR}/Dockerfile.playground" \
   > "${DRIFT_DIR}/Dockerfile.playground.tmp"
 mv "${DRIFT_DIR}/Dockerfile.playground.tmp" "${DRIFT_DIR}/Dockerfile.playground"
-if (cd "$DRIFT_DIR" && bash -c "$SYNC_SCRIPT"); then
+if (cd "$DRIFT_DIR" && VERSION="$SYNC_VERSION" SHA256="$SYNC_SHA256" bash -c "$SYNC_SCRIPT"); then
   harness_fail "version-sync unexpectedly accepted a structurally drifted auxiliary Dockerfile"
 else
   UNCHANGED_COUNT="$(grep -l '^ARG FERRITE_VERSION=0.4.0$' \
@@ -261,11 +308,7 @@ for chart_path in release_chart version_sync_chart orchestration_chart; do
     "${CHART_DIR}/charts/ferrite-sidecar/Chart.yaml"
 
   CHART_SCRIPT="$(cat "${EXTRACT_DIR}/${chart_path}.sh")"
-  CHART_SCRIPT="${CHART_SCRIPT//\$\{\{ github.event.client_payload.version \}\}/v9.8.7}"
-  CHART_SCRIPT="${CHART_SCRIPT//\$\{\{ steps.version.outputs.version \}\}/9.8.7}"
-  CHART_SCRIPT="${CHART_SCRIPT//\$\{\{ needs.prepare.outputs.version \}\}/9.8.7}"
-
-  if (cd "$CHART_DIR" && bash -c "$CHART_SCRIPT"); then
+  if (cd "$CHART_DIR" && VERSION="9.8.7" bash -c "$CHART_SCRIPT"); then
     assert_contains "$(cat "${CHART_DIR}/charts/ferrite/Chart.yaml")" "version: 9.8.7" \
       "${chart_path} updates the primary chart package version"
     assert_contains "$(cat "${CHART_DIR}/charts/ferrite/Chart.yaml")" 'appVersion: "9.8.7"' \
@@ -319,19 +362,17 @@ assert_tag_set() {
 
 run_case() {
   local name="$1" event_name="$2" client_payload_version="$3" input_tag="$4" ref_name="${5:-}"
-  local script
-  script="$(cat "${EXTRACT_DIR}/release_meta.sh")"
-  script="${script//\$\{\{ github.event_name \}\}/${event_name}}"
-  script="${script//\$\{\{ github.event.client_payload.version \}\}/${client_payload_version}}"
-  script="${script//\$\{\{ inputs.tag \}\}/${input_tag}}"
-  script="${script//\$\{\{ github.repository_owner \}\}/FerriteLabs}"
 
   local out_file="${EXTRACT_DIR}/output_${name}.txt"
   : > "$out_file"
   (
     export GITHUB_REF_NAME="$ref_name"
     export GITHUB_OUTPUT="$out_file"
-    bash -c "$script"
+    export EVENT_NAME="$event_name"
+    export DISPATCH_VERSION="$client_payload_version"
+    export WORKFLOW_TAG="$input_tag"
+    export REPOSITORY_OWNER="FerriteLabs"
+    bash "${EXTRACT_DIR}/release_meta.sh"
   )
 }
 
@@ -398,6 +439,104 @@ if run_case "bad_semver" push "" "" "not-a-version" >"${EXTRACT_DIR}/log_bad_sem
 else
   assert_contains "$(cat "${EXTRACT_DIR}/log_bad_semver.txt")" "Invalid semver" \
     "an invalid semver version fails release.yml's derivation step with a clear error"
+fi
+
+# Exercise every payload-consuming metadata script with shell-substitution
+# strings. They must reject the value as invalid data without executing it.
+MALICIOUS_MARKER="${EXTRACT_DIR}/payload-executed"
+MALICIOUS_VERSION="0.4.0\$(touch ${MALICIOUS_MARKER})"
+MALICIOUS_SHA256="\$(touch ${MALICIOUS_MARKER})"
+
+if run_case "malicious_release" repository_dispatch "$MALICIOUS_VERSION" "" \
+  >"${EXTRACT_DIR}/log_malicious_release.txt" 2>&1; then
+  harness_fail "release.yml unexpectedly accepted a malicious dispatch version"
+else
+  harness_ok "release.yml rejects malicious dispatch versions"
+fi
+if [[ ! -e "$MALICIOUS_MARKER" ]]; then
+  harness_ok "release.yml treats command substitutions as inert input data"
+else
+  harness_fail "release.yml executed a command substitution from input data"
+fi
+
+run_version_sync_meta() {
+  local version="$1" checksum="$2" output="$3"
+  (
+    export EVENT_NAME="repository_dispatch"
+    export DISPATCH_VERSION="$version"
+    export WORKFLOW_VERSION=""
+    export INPUT_SHA256="$checksum"
+    export REPOSITORY_OWNER="FerriteLabs"
+    export GITHUB_OUTPUT="$output"
+    bash "${EXTRACT_DIR}/version_sync_meta.sh"
+  )
+}
+
+if run_version_sync_meta "$MALICIOUS_VERSION" "$SYNC_SHA256" \
+  "${EXTRACT_DIR}/malicious_sync_version.out" >/dev/null 2>&1; then
+  harness_fail "version-sync.yml unexpectedly accepted a malicious dispatch version"
+else
+  harness_ok "version-sync.yml rejects malicious dispatch versions"
+fi
+if run_version_sync_meta "0.4.0" "$MALICIOUS_SHA256" \
+  "${EXTRACT_DIR}/malicious_sync_checksum.out" >/dev/null 2>&1; then
+  harness_fail "version-sync.yml unexpectedly accepted a malicious checksum"
+else
+  harness_ok "version-sync.yml rejects malicious supplied checksums"
+fi
+if [[ ! -e "$MALICIOUS_MARKER" ]]; then
+  harness_ok "version-sync.yml treats command substitutions as inert input data"
+else
+  harness_fail "version-sync.yml executed a command substitution from input data"
+fi
+
+run_orchestration_meta() {
+  local version="$1" checksum="$2" output="$3"
+  (
+    export INPUT_VERSION="$version"
+    export INPUT_SHA256="$checksum"
+    export REPOSITORY_OWNER="FerriteLabs"
+    export GITHUB_OUTPUT="$output"
+    bash "${EXTRACT_DIR}/orchestration_meta.sh"
+  )
+}
+
+if run_orchestration_meta "$MALICIOUS_VERSION" "$SYNC_SHA256" \
+  "${EXTRACT_DIR}/malicious_orchestration_version.out" >/dev/null 2>&1; then
+  harness_fail "release-orchestration.yml unexpectedly accepted a malicious version"
+else
+  harness_ok "release-orchestration.yml rejects malicious versions"
+fi
+if run_orchestration_meta "0.4.0" "$MALICIOUS_SHA256" \
+  "${EXTRACT_DIR}/malicious_orchestration_checksum.out" >/dev/null 2>&1; then
+  harness_fail "release-orchestration.yml unexpectedly accepted a malicious checksum"
+else
+  harness_ok "release-orchestration.yml rejects malicious supplied checksums"
+fi
+if [[ ! -e "$MALICIOUS_MARKER" ]]; then
+  harness_ok "release-orchestration.yml treats command substitutions as inert input data"
+else
+  harness_fail "release-orchestration.yml executed a command substitution from input data"
+fi
+
+# Uppercase supplied checksums are normalized before being emitted.
+UPPER_SHA256="AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+if run_version_sync_meta "v9.8.7" "$UPPER_SHA256" \
+  "${EXTRACT_DIR}/normalized_sync.out" >/dev/null 2>&1; then
+  assert_contains "$(cat "${EXTRACT_DIR}/normalized_sync.out")" "sha256=${SYNC_SHA256}" \
+    "version-sync.yml normalizes a valid supplied checksum to lowercase"
+else
+  harness_fail "version-sync.yml rejected a valid uppercase checksum"
+fi
+
+if command -v actionlint >/dev/null 2>&1; then
+  if actionlint "$RELEASE_YML" "$VERSION_SYNC_YML" "$ORCHESTRATION_YML"; then
+    harness_ok "actionlint accepts hardened release workflows"
+  else
+    harness_fail "actionlint rejected hardened release workflows"
+  fi
+else
+  echo "  skip: actionlint not available; workflow YAML was parsed and structurally checked with PyYAML."
 fi
 
 harness_summary
