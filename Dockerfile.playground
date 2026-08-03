@@ -73,11 +73,11 @@ FROM source AS builder
 # Build the RESP server and CLI from the fetched, verified Ferrite source.
 RUN cargo build --release --bin ferrite --bin ferrite-cli
 
-# The repository-owned launcher directly depends on ferrite-studio from the
-# fetched v0.4.0 source tree. It supervises both the embedded Studio HTTP
-# server and the Ferrite RESP child process.
+# The repository-owned launcher provides the HTTP playground and supervises
+# the Ferrite RESP child process. It talks to Ferrite over the same real RESP
+# interface exposed to users, so HTTP and RESP clients share one data store.
 COPY playground-launcher /app/playground-launcher
-RUN CARGO_TARGET_DIR=/app/target cargo build --release \
+RUN FERRITE_VERSION="${FERRITE_VERSION}" CARGO_TARGET_DIR=/app/target cargo build --release \
     --manifest-path /app/playground-launcher/Cargo.toml
 
 # Verify all runtime binaries were built.
@@ -108,11 +108,12 @@ RUN groupadd --gid 1000 ferrite \
     && mkdir -p /var/lib/ferrite/data \
     && chown -R ferrite:ferrite /var/lib/ferrite
 
-ENV RUST_LOG=ferrite=info
+ENV RUST_LOG=ferrite=info \
+    FERRITE_VERSION=${FERRITE_VERSION}
 
 EXPOSE 8080 6379
 
-# Probe the actual Studio endpoint served by the repository-owned launcher.
+# Probe the actual RESP-backed HTTP endpoint served by the launcher.
 HEALTHCHECK --interval=30s --timeout=3s --retries=3 \
     CMD curl --fail --silent --show-error http://127.0.0.1:8080/api/health >/dev/null || exit 1
 
@@ -122,7 +123,7 @@ ENTRYPOINT ["/usr/local/bin/ferrite-playground-launcher"]
 
 # Build information labels
 LABEL org.opencontainers.image.title="Ferrite Playground"
-LABEL org.opencontainers.image.description="Interactive web playground for Ferrite (ferrite-studio)"
+LABEL org.opencontainers.image.description="Interactive RESP-backed web playground for Ferrite"
 LABEL org.opencontainers.image.version="${FERRITE_VERSION}"
 LABEL org.opencontainers.image.authors="Jose David Baena"
 LABEL org.opencontainers.image.source="https://github.com/ferritelabs/ferrite"

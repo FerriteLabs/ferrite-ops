@@ -45,14 +45,14 @@ if grep -E '^\s*(COPY|ADD)\s.*(\|\||&&|[0-9]?>)' "$DOCKERFILE" >/dev/null; then
 fi
 assert_eq 0 "$INVALID_COPY_SYNTAX" "no COPY/ADD instruction embeds shell operators (||, &&, redirection)"
 
-# 3. The repository-owned launcher must build against ferrite-studio from the
-#    fetched source and the healthcheck must probe its real HTTP endpoint.
+# 3. The repository-owned launcher must provide its own RESP-backed HTTP
+#    server and the healthcheck must probe its real HTTP endpoint.
 assert_contains "$CONTENT" "HEALTHCHECK" "Dockerfile.playground defines a HEALTHCHECK"
 RUNTIME_STAGE_BODY="$(sed -n '/^FROM debian:bookworm-slim AS runtime$/,$p' "$DOCKERFILE")"
 assert_contains "$CONTENT" "COPY playground-launcher /app/playground-launcher" "builder includes the repository-owned runtime launcher"
 assert_contains "$CONTENT" "--manifest-path /app/playground-launcher/Cargo.toml" "builder compiles the launcher crate against fetched source"
 assert_contains "$RUNTIME_STAGE_BODY" "ferrite-playground-launcher" "runtime stage includes the compiled launcher"
-assert_contains "$RUNTIME_STAGE_BODY" "curl --fail --silent --show-error http://127.0.0.1:8080/api/health" "HEALTHCHECK probes the actual Studio HTTP endpoint"
+assert_contains "$RUNTIME_STAGE_BODY" "curl --fail --silent --show-error http://127.0.0.1:8080/api/health" "HEALTHCHECK probes the actual playground HTTP endpoint"
 INVALID_HEALTHCHECK=0
 if grep -A2 '^HEALTHCHECK' "$DOCKERFILE" | grep -E 'CMD\s*\[.*\]\s*(\|\||&&)' >/dev/null; then
   INVALID_HEALTHCHECK=1
@@ -90,12 +90,20 @@ assert_not_contains "$CONTENT" "FROM alpine" "no build stage uses an Alpine (mus
 #    environment variables that the upstream executable does not consume.
 LAUNCHER="${REPO_ROOT}/playground-launcher/src/main.rs"
 LAUNCHER_CONTENT="$(cat "$LAUNCHER")"
-assert_contains "$LAUNCHER_CONTENT" 'host: "0.0.0.0".to_string()' "Studio HTTP binds to 0.0.0.0"
+MANIFEST_CONTENT="$(cat "${REPO_ROOT}/playground-launcher/Cargo.toml")"
+assert_contains "$LAUNCHER_CONTENT" 'const HTTP_ADDR: &str = "0.0.0.0:8080"' "playground HTTP binds to 0.0.0.0:8080"
 assert_contains "$LAUNCHER_CONTENT" '"--bind"' "launcher explicitly configures the RESP bind address"
 assert_contains "$LAUNCHER_CONTENT" '"0.0.0.0"' "RESP server binds to 0.0.0.0"
 assert_contains "$LAUNCHER_CONTENT" '"6379"' "RESP server listens on port 6379"
+assert_contains "$LAUNCHER_CONTENT" '"/api/execute"' "launcher exposes command execution over HTTP"
+assert_contains "$LAUNCHER_CONTENT" '"/api/keys/detail/{key}"' "launcher exposes real key detail over HTTP"
+assert_contains "$LAUNCHER_CONTENT" "execute_resp" "HTTP handlers execute commands through the RESP server"
+assert_contains "$LAUNCHER_CONTENT" "INDEX_HTML" "launcher serves an interactive HTML page"
 assert_contains "$LAUNCHER_CONTENT" "shutdown_signal" "launcher handles process shutdown signals"
 assert_contains "$LAUNCHER_CONTENT" "stop_child" "launcher cleans up the RESP child process"
+assert_contains "$LAUNCHER_CONTENT" "Signal::SIGTERM" "launcher forwards SIGTERM before escalating"
+assert_contains "$LAUNCHER_CONTENT" "start_kill" "launcher retains SIGKILL as bounded shutdown escalation"
+assert_not_contains "$MANIFEST_CONTENT" "ferrite-studio" "launcher no longer depends on placeholder ferrite-studio APIs"
 assert_not_contains "$RUNTIME_STAGE_BODY" "FERRITE_STUDIO_ENABLED" "runtime does not rely on unused Studio environment variables"
 assert_not_contains "$RUNTIME_STAGE_BODY" "FERRITE_STUDIO_HOST" "runtime does not rely on an unused Studio host environment variable"
 
