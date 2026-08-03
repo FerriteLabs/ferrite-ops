@@ -1,0 +1,72 @@
+# Merge-time guard that stops a stale, already-clean version-sync PR from
+# regressing the canonical release. A version-sync PR is opened against the
+# active-release.env that existed when it was created; if main is bumped to a
+# newer release before that PR merges, the stale PR would silently downgrade
+# active-release.env on merge. This check compares the PR's proposed
+# active-release.env against the current tip of the PR's base branch (main)
+# and fails the PR if it would move the canonical version backwards — so a
+# superseded PR must be rebased (or closed) before it can merge.
+
+name: Version Supersession Check
+
+on:
+  pull_request:
+    paths:
+      - active-release.env
+
+permissions:
+  contents: read
+
+jobs:
+  supersession:
+    name: Reject superseded release PRs
+    runs-on: ubuntu-latest
+    steps:
+      # Check out the PR head itself (not the merge ref) so the proposed
+      # active-release.env is read regardless of whether the PR is currently
+      # mergeable against an advanced main.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+
+      - name: Reject a superseded active-release change
+        env:
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+          ORDER_SCRIPT: scripts/release-ordering.sh
+        run: |
+          set -euo pipefail
+
+          ACTIVE_RELEASE="active-release.env"
+
+          # Proposed values from the PR head working tree.
+          PR_VERSION="$(sed -n 's/^FERRITE_VERSION=//p' "$ACTIVE_RELEASE")"
+          PR_SHA256="$(sed -n 's/^FERRITE_SOURCE_SHA256=//p' "$ACTIVE_RELEASE")"
+
+          # Canonical values from the current tip of the base branch (main).
+          git fetch --no-tags --depth=1 origin "$BASE_REF"
+          BASE_ENV="$(git show "FETCH_HEAD:${ACTIVE_RELEASE}")"
+          BASE_VERSION="$(printf '%s\n' "$BASE_ENV" | sed -n 's/^FERRITE_VERSION=//p')"
+          BASE_SHA256="$(printf '%s\n' "$BASE_ENV" | sed -n 's/^FERRITE_SOURCE_SHA256=//p')"
+
+          CLASS="$(bash "$ORDER_SCRIPT" classify \
+            "$PR_VERSION" "$PR_SHA256" "$BASE_VERSION" "$BASE_SHA256")"
+          echo "::notice::Supersession check: PR ${PR_VERSION} vs ${BASE_REF} tip ${BASE_VERSION} => ${CLASS}"
+
+          case "$CLASS" in
+            NEWER|EQUAL_SAME)
+              echo "::notice::PR active-release.env does not regress ${BASE_REF}."
+              ;;
+            EQUAL_DIFFERENT)
+              echo "::error::This PR keeps version ${PR_VERSION} but changes its source checksum relative to ${BASE_REF}. A released version's source must not be rewritten."
+              exit 1
+              ;;
+            OLDER)
+              echo "::error::This PR would downgrade active-release.env from ${BASE_VERSION} (current ${BASE_REF}) to ${PR_VERSION}. ${BASE_REF} has been superseded since this PR was opened; rebase or close it."
+              exit 1
+              ;;
+            *)
+              echo "::error::Unexpected release-ordering classification: ${CLASS}"
+              exit 1
+              ;;
+          esac

@@ -23,6 +23,10 @@ on:
       sha256:
         description: 'Source tarball SHA256 (optional — computed automatically if empty)'
         required: false
+      allow_downgrade:
+        description: 'Manually allow syncing to a version older than active-release.env (default false).'
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -92,7 +96,73 @@ jobs:
           echo "sha256=${SHA256}" >> "$GITHUB_OUTPUT"
           echo "📦 Syncing to version ${VERSION} (source SHA256: ${SHA256})"
 
+      # Compare the candidate release against the canonical active-release.env
+      # from the checked-out repository (a trustworthy artifact, not raw input)
+      # and refuse to move backwards. An automated ferrite-release dispatch that
+      # arrives out of order or is retried can never regress the canonical pins:
+      #   NEWER           -> proceed with the sync PR.
+      #   EQUAL_SAME      -> no-op; the canonical release already matches.
+      #   EQUAL_DIFFERENT -> fail loudly; a released version's source changed.
+      #   OLDER           -> skip, unless a manual run set allow_downgrade=true.
+      # allow_downgrade is read ONLY from workflow_dispatch inputs, so a
+      # repository_dispatch client payload can never bypass the guard.
+      - name: Guard release ordering
+        id: guard
+        env:
+          CANDIDATE_VERSION: ${{ steps.version.outputs.version }}
+          CANDIDATE_SHA256: ${{ steps.version.outputs.sha256 }}
+          ALLOW_DOWNGRADE: ${{ inputs.allow_downgrade || false }}
+          ORDER_SCRIPT: scripts/release-ordering.sh
+        run: |
+          set -euo pipefail
+
+          ACTIVE_RELEASE="active-release.env"
+          CURRENT_VERSION="$(sed -n 's/^FERRITE_VERSION=//p' "$ACTIVE_RELEASE")"
+          CURRENT_SHA256="$(sed -n 's/^FERRITE_SOURCE_SHA256=//p' "$ACTIVE_RELEASE")"
+          if ! printf '%s\n' "$CURRENT_VERSION" |
+            grep -qE '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?$'; then
+            echo "::error::active-release.env contains an invalid canonical version"
+            exit 1
+          fi
+          if ! printf '%s\n' "$CURRENT_SHA256" | grep -qE '^[0-9a-f]{64}$'; then
+            echo "::error::active-release.env contains an invalid canonical checksum"
+            exit 1
+          fi
+
+          CLASS="$(bash "$ORDER_SCRIPT" classify \
+            "$CANDIDATE_VERSION" "$CANDIDATE_SHA256" "$CURRENT_VERSION" "$CURRENT_SHA256")"
+          echo "::notice::Release ordering: candidate ${CANDIDATE_VERSION} vs canonical ${CURRENT_VERSION} => ${CLASS}"
+
+          PROCEED=false
+          case "$CLASS" in
+            NEWER)
+              PROCEED=true
+              ;;
+            EQUAL_SAME)
+              echo "::notice::Candidate ${CANDIDATE_VERSION} already matches the canonical release with an identical source checksum; nothing to sync."
+              ;;
+            EQUAL_DIFFERENT)
+              echo "::error::Candidate ${CANDIDATE_VERSION} matches the canonical version but its source checksum differs (${CANDIDATE_SHA256} != ${CURRENT_SHA256}). Refusing to silently rewrite a released version's source."
+              exit 1
+              ;;
+            OLDER)
+              if [ "$ALLOW_DOWNGRADE" = "true" ]; then
+                echo "::warning::Candidate ${CANDIDATE_VERSION} is older than the canonical ${CURRENT_VERSION}; proceeding because allow_downgrade was explicitly requested."
+                PROCEED=true
+              else
+                echo "::warning::Candidate ${CANDIDATE_VERSION} is older than the canonical ${CURRENT_VERSION}; skipping downgrade. Re-run manually with allow_downgrade=true to override."
+              fi
+              ;;
+            *)
+              echo "::error::Unexpected release-ordering classification: ${CLASS}"
+              exit 1
+              ;;
+          esac
+
+          echo "proceed=${PROCEED}" >> "$GITHUB_OUTPUT"
+
       - name: Synchronize active release metadata and pins
+        if: steps.guard.outputs.proceed == 'true'
         env:
           VERSION: ${{ steps.version.outputs.version }}
           SHA256: ${{ steps.version.outputs.sha256 }}
@@ -243,6 +313,7 @@ jobs:
           done
 
       - name: Update RPM spec
+        if: steps.guard.outputs.proceed == 'true'
         env:
           VERSION: ${{ steps.version.outputs.version }}
         run: |
@@ -269,6 +340,7 @@ jobs:
           fi
 
       - name: Create version sync PR
+        if: steps.guard.outputs.proceed == 'true'
         uses: peter-evans/create-pull-request@v6
         with:
           title: "chore: sync version to v${{ steps.version.outputs.version }}"
