@@ -49,9 +49,28 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Determine Docker Hub publishing eligibility
+        id: dockerhub
+        env:
+          DOCKERHUB_ENABLED: ${{ vars.DOCKERHUB_ENABLED }}
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          ENABLED=false
+          if [ "$DOCKERHUB_ENABLED" = "true" ]; then
+            if [ -n "$DOCKERHUB_USERNAME" ] && [ -n "$DOCKERHUB_TOKEN" ]; then
+              ENABLED=true
+            else
+              echo "::warning::DOCKERHUB_ENABLED is true, but Docker Hub credentials are not fully configured; publishing GHCR only."
+            fi
+          fi
+          echo "enabled=${ENABLED}" >> "$GITHUB_OUTPUT"
+
       - name: Log in to Docker Hub
         uses: docker/login-action@v3
-        if: vars.DOCKERHUB_ENABLED == 'true'
+        if: steps.dockerhub.outputs.enabled == 'true'
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
@@ -160,14 +179,14 @@ jobs:
 
       # Docker Hub is optional: this step (and therefore every Docker Hub
       # tag) only runs when the repository variable DOCKERHUB_ENABLED is
-      # explicitly set to 'true' — the same condition that gates the
-      # "Log in to Docker Hub" step above. If the variable is unset,
-      # missing, or anything other than 'true', this step does not run,
-      # steps.meta_dockerhub.outputs.tags is empty, and no Docker Hub tag
-      # is generated or pushed.
+      # explicitly set to 'true' and both login credentials are configured
+      # — the same eligibility output that gates the "Log in to Docker Hub"
+      # step above. If the variable is unset/false or either credential is
+      # missing, this step does not run, steps.meta_dockerhub.outputs.tags
+      # is empty, and no Docker Hub tag is generated or pushed.
       - name: Extract metadata (tags, labels) — Docker Hub
         id: meta_dockerhub
-        if: vars.DOCKERHUB_ENABLED == 'true'
+        if: steps.dockerhub.outputs.enabled == 'true'
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.DOCKERHUB_IMAGE }}

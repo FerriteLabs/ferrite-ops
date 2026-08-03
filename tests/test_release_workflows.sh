@@ -74,12 +74,20 @@ assert_contains "$RELEASE_CONTENT" "latest=false" \
   "release.yml disables docker/metadata-action's implicit latest tag"
 
 # --- Docker Hub is optional; GHCR is always published -----------------------
+assert_contains "$RELEASE_CONTENT" "id: dockerhub" \
+  "release.yml computes Docker Hub publishing eligibility before login and metadata generation"
+assert_contains "$RELEASE_CONTENT" 'DOCKERHUB_ENABLED: ${{ vars.DOCKERHUB_ENABLED }}' \
+  "release.yml includes the explicit DOCKERHUB_ENABLED repository variable in Docker Hub eligibility"
+assert_contains "$RELEASE_CONTENT" 'DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}' \
+  "release.yml includes Docker Hub username presence in publishing eligibility"
+assert_contains "$RELEASE_CONTENT" 'DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}' \
+  "release.yml includes Docker Hub token presence in publishing eligibility"
 assert_contains "$RELEASE_CONTENT" "id: meta_dockerhub" \
   "release.yml extracts Docker Hub metadata as its own gated step"
-assert_contains "$RELEASE_CONTENT" "if: vars.DOCKERHUB_ENABLED == 'true'" \
-  "release.yml only runs Docker Hub metadata extraction when DOCKERHUB_ENABLED is true"
-assert_eq "2" "$(grep -c "if: vars.DOCKERHUB_ENABLED == 'true'" "$RELEASE_YML")" \
-  "release.yml gates both the Docker Hub login and metadata steps on the same DOCKERHUB_ENABLED condition"
+assert_eq "2" "$(grep -c "if: steps.dockerhub.outputs.enabled == 'true'" "$RELEASE_YML")" \
+  "release.yml gates both Docker Hub login and metadata on enabled plus configured credentials"
+assert_not_contains "$RELEASE_CONTENT" "if: vars.DOCKERHUB_ENABLED == 'true'" \
+  "release.yml does not generate Docker Hub metadata based on the variable alone"
 assert_not_contains "$RELEASE_CONTENT" '            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
             ${{ env.DOCKERHUB_IMAGE }}' \
   "release.yml no longer bundles GHCR and Docker Hub into a single unconditional metadata-action images list"
@@ -256,7 +264,7 @@ if ! python3 - "$RELEASE_YML" "$VERSION_SYNC_YML" "$ORCHESTRATION_YML" \
   "$EXTRACT_DIR/release_meta.sh" "$EXTRACT_DIR/version_sync_meta.sh" \
   "$EXTRACT_DIR/orchestration_meta.sh" "$EXTRACT_DIR/update_dockerfiles.sh" \
   "$EXTRACT_DIR/version_sync_chart.sh" "$EXTRACT_DIR/metadata_tags.txt" \
-  "$EXTRACT_DIR/combine_tags.sh" \
+  "$EXTRACT_DIR/combine_tags.sh" "$EXTRACT_DIR/dockerhub_eligibility.sh" \
   >"${EXTRACT_DIR}/extract.stdout" 2>"${EXTRACT_DIR}/extract.log" << 'PYEOF'
 import sys
 import yaml
@@ -272,6 +280,7 @@ import yaml
     version_sync_chart_out_path,
     metadata_tags_out_path,
     combine_tags_out_path,
+    dockerhub_eligibility_out_path,
 ) = sys.argv[1:]
 with open(release_yml_path) as f:
     doc = yaml.safe_load(f)
@@ -303,13 +312,19 @@ if "latest=false" not in metadata_flavor:
 with open(metadata_tags_out_path, "w") as f:
     f.write(metadata_tags)
 
-# Docker Hub metadata extraction must be conditional on DOCKERHUB_ENABLED,
-# target only the Docker Hub image, and use the same required tag template
-# as GHCR so a stable release publishes the same normalized tag set to
-# both registries when Docker Hub is actually enabled.
+# Docker Hub metadata extraction and login must use one eligibility result
+# that requires both DOCKERHUB_ENABLED=true and configured credentials.
+dockerhub_eligibility_step = next(s for s in steps if s.get("id") == "dockerhub")
+with open(dockerhub_eligibility_out_path, "w") as f:
+    f.write(dockerhub_eligibility_step["run"])
+
 dockerhub_step = next(s for s in steps if s.get("id") == "meta_dockerhub")
-if dockerhub_step.get("if") != "vars.DOCKERHUB_ENABLED == 'true'":
-    raise SystemExit("meta_dockerhub step must be gated on vars.DOCKERHUB_ENABLED == 'true'")
+dockerhub_login_step = next(s for s in steps if s.get("name") == "Log in to Docker Hub")
+dockerhub_condition = "steps.dockerhub.outputs.enabled == 'true'"
+if dockerhub_step.get("if") != dockerhub_condition:
+    raise SystemExit("meta_dockerhub step must be gated on Docker Hub publishing eligibility")
+if dockerhub_login_step.get("if") != dockerhub_condition:
+    raise SystemExit("Docker Hub login must use the same publishing eligibility gate as metadata")
 if dockerhub_step["with"]["images"] != "${{ env.DOCKERHUB_IMAGE }}":
     raise SystemExit("meta_dockerhub step must target only the Docker Hub image")
 dockerhub_tags = dockerhub_step["with"]["tags"]
@@ -599,11 +614,46 @@ else
     "an invalid semver version fails release.yml's derivation step with a clear error"
 fi
 
+# Functional replay of Docker Hub publishing eligibility. Docker Hub tags
+# may be generated only when the repository variable is exactly true and
+# both credentials needed by docker/login-action are non-empty.
+DOCKERHUB_ELIGIBILITY_SCRIPT="$(cat "${EXTRACT_DIR}/dockerhub_eligibility.sh")"
+
+run_dockerhub_eligibility() {
+  local enabled="$1" username="$2" token="$3" output="$4"
+  (
+    export DOCKERHUB_ENABLED="$enabled"
+    export DOCKERHUB_USERNAME="$username"
+    export DOCKERHUB_TOKEN="$token"
+    export GITHUB_OUTPUT="$output"
+    bash -c "$DOCKERHUB_ELIGIBILITY_SCRIPT"
+  )
+}
+
+assert_dockerhub_eligibility() {
+  local case_name="$1" enabled="$2" username="$3" token="$4" expected="$5"
+  local output="${EXTRACT_DIR}/dockerhub_${case_name}.out"
+  : > "$output"
+  if run_dockerhub_eligibility "$enabled" "$username" "$token" "$output" \
+    >"${EXTRACT_DIR}/log_dockerhub_${case_name}.txt" 2>&1; then
+    assert_contains "$(cat "$output")" "enabled=${expected}" \
+      "Docker Hub eligibility ${case_name} resolves to enabled=${expected}"
+  else
+    harness_fail "Docker Hub eligibility ${case_name} unexpectedly failed: $(cat "${EXTRACT_DIR}/log_dockerhub_${case_name}.txt")"
+  fi
+}
+
+assert_dockerhub_eligibility "disabled" "false" "user" "token" "false"
+assert_dockerhub_eligibility "missing_variable" "" "user" "token" "false"
+assert_dockerhub_eligibility "missing_username" "true" "" "token" "false"
+assert_dockerhub_eligibility "missing_token" "true" "user" "" "false"
+assert_dockerhub_eligibility "configured" "true" "user" "token" "true"
+
 # Functional replay of the "Combine registry tags and labels" step: prove
 # that an empty DOCKERHUB_TAGS (meta_dockerhub did not run, i.e.
-# DOCKERHUB_ENABLED is unset/false) yields a combined tag list containing
-# only the GHCR tags, and that a non-empty DOCKERHUB_TAGS (DOCKERHUB_ENABLED
-# is true) appends the Docker Hub tags alongside them.
+# DOCKERHUB_ENABLED is unset/false or credentials are missing) yields a
+# combined tag list containing only the GHCR tags, and that a non-empty
+# DOCKERHUB_TAGS (enabled and fully configured) appends Docker Hub tags.
 COMBINE_SCRIPT="$(cat "${EXTRACT_DIR}/combine_tags.sh")"
 GHCR_SAMPLE_TAGS="$(printf 'ghcr.io/ferritelabs/ferrite:%s\nghcr.io/ferritelabs/ferrite:latest' "$EXPECTED_VERSION")"
 GHCR_SAMPLE_LABELS="org.opencontainers.image.version=${EXPECTED_VERSION}"
