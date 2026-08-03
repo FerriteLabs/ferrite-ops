@@ -23,10 +23,6 @@ on:
       sha256:
         description: 'Source tarball SHA256 (optional — computed automatically if empty)'
         required: false
-      allow_downgrade:
-        description: 'Manually allow syncing to a version older than active-release.env (default false).'
-        type: boolean
-        default: false
 
 permissions:
   contents: write
@@ -103,15 +99,21 @@ jobs:
       #   NEWER           -> proceed with the sync PR.
       #   EQUAL_SAME      -> no-op; the canonical release already matches.
       #   EQUAL_DIFFERENT -> fail loudly; a released version's source changed.
-      #   OLDER           -> skip, unless a manual run set allow_downgrade=true.
-      # allow_downgrade is read ONLY from workflow_dispatch inputs, so a
-      # repository_dispatch client payload can never bypass the guard.
+      #   OLDER           -> always skip. There is no override, manual or
+      #                      automated: a version-sync run (whether triggered
+      #                      by repository_dispatch or workflow_dispatch) can
+      #                      never move active-release.env backwards. A real
+      #                      rollback is an intentional, human-operated
+      #                      decision with broader implications (registry
+      #                      tags, GitOps revisions, RPM Release bumps, ...)
+      #                      than a version bump, so it is deliberately out of
+      #                      scope for this workflow and is deferred to a
+      #                      future, separate, explicitly human-driven process.
       - name: Guard release ordering
         id: guard
         env:
           CANDIDATE_VERSION: ${{ steps.version.outputs.version }}
           CANDIDATE_SHA256: ${{ steps.version.outputs.sha256 }}
-          ALLOW_DOWNGRADE: ${{ inputs.allow_downgrade || false }}
           ORDER_SCRIPT: scripts/release-ordering.sh
         run: |
           set -euo pipefail
@@ -146,12 +148,7 @@ jobs:
               exit 1
               ;;
             OLDER)
-              if [ "$ALLOW_DOWNGRADE" = "true" ]; then
-                echo "::warning::Candidate ${CANDIDATE_VERSION} is older than the canonical ${CURRENT_VERSION}; proceeding because allow_downgrade was explicitly requested."
-                PROCEED=true
-              else
-                echo "::warning::Candidate ${CANDIDATE_VERSION} is older than the canonical ${CURRENT_VERSION}; skipping downgrade. Re-run manually with allow_downgrade=true to override."
-              fi
+              echo "::warning::Candidate ${CANDIDATE_VERSION} is older than the canonical ${CURRENT_VERSION}; skipping downgrade. A downgrade is never applied automatically or via manual override; rollbacks are a separate, explicitly human-driven process."
               ;;
             *)
               echo "::error::Unexpected release-ordering classification: ${CLASS}"

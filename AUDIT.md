@@ -427,11 +427,10 @@ stops a stale PR from doing the same:
 
 - `version-sync.yml` gains a `Guard release ordering` step that classifies the candidate against the
   checked-out canonical `active-release.env` with the shared guard. NEWER proceeds; EQUAL with an
-  identical source checksum is a no-op; EQUAL with a differing checksum fails loudly; OLDER is skipped
-  unless a manual run set `allow_downgrade=true`. The sync, RPM, and PR steps are gated on the guard.
-- `allow_downgrade` is read only from `workflow_dispatch` inputs (default `false`); a
-  `repository_dispatch` client payload can never supply it, so an automated dispatch can never bypass
-  the downgrade guard.
+  identical source checksum is a no-op; EQUAL with a differing checksum fails loudly; OLDER is skipped.
+  The sync, RPM, and PR steps are gated on the guard. (At the time of this change, a manual
+  `workflow_dispatch`-only override existed for the `OLDER` case; it was fully removed in a later
+  change — see "Downgrade Override Removal Resolution" below — and no override remains today.)
 - New `version-supersession.yml` compares proposed `active-release.env` metadata against the current
   tip of `main` for normal pull requests and merge-queue candidates. Because GitHub intentionally
   suppresses `pull_request` events for the automated PRs created with `GITHUB_TOKEN`, it also
@@ -457,6 +456,61 @@ stops a stale PR from doing the same:
 - No production behavior outside the release/version-sync workflows and the shared ordering script was
   changed; existing Docker, Helm, Compose, GitOps, Terraform, and playground coverage is unchanged and
   still green.
+
+## Supersession Trust Boundary and Strict SemVer Resolution (this change)
+
+Two hardening gaps remained after the prior release-ordering/supersession work: the merge-time
+supersession check executed a script from the untrusted PR/merge-queue candidate checkout, and the
+shared ordering engine used Bash 64-bit arithmetic and a permissive SemVer shape that both break down
+at the edges.
+
+- `version-supersession.yml`'s `supersession` job now checks out the untrusted PR/merge-queue candidate
+  into its own `candidate/` directory purely to read `active-release.env` as inert data (`sed`), and
+  separately checks out the trusted base branch (`main`) into `trusted/`. Only
+  `trusted/scripts/release-ordering.sh` is ever invoked — a PR that replaces
+  `scripts/release-ordering.sh` with a malicious script (e.g. one that always reports `NEWER` to bypass
+  the guard) has that replacement never invoked, and can no longer influence its own classification,
+  because that file is never read from the candidate checkout at all.
+- `reconcile-automated-prs` gains a `version-supersession-reconcile` concurrency group with
+  `cancel-in-progress: true`, and reads and validates `origin/main`'s `active-release.env` in a dedicated
+  step immediately before the classification/posting loop, instead of relying on the job's initial
+  checkout. Together these prevent an older, slower reconciliation run (e.g. an overlapping
+  `workflow_run` and `push` trigger) from overwriting a newer run's correct check results with stale
+  ones.
+- `scripts/release-ordering.sh` now enforces strict SemVer 2.0: the `MAJOR.MINOR.PATCH` core and any
+  purely-numeric pre-release identifier must not have a leading zero (a bare `0` remains valid; alphanumeric
+  identifiers that merely start with a digit, e.g. `0a1`, are unaffected). Numeric comparison (core fields
+  and numeric pre-release identifiers) now compares normalized digit-string length first, then lexical
+  order for equal-length strings, entirely replacing the previous `((10#a < 10#b))` Bash arithmetic —
+  which is bounded by 64-bit signed range and cannot correctly compare version fields with more than
+  ~19 digits. A new `validate VERSION` subcommand exposes the strict check standalone.
+- `tests/test_version_supersession.sh` (37 checks) adds a functional replay of a malicious PR shipping
+  its own `release-ordering.sh` (always reports `NEWER`, leaves an execution marker) and proves it is
+  both rejected and never executed, plus a freshness replay proving a later reconciliation read observes
+  main's advanced tip rather than a value cached from an earlier checkout.
+- `tests/test_release_ordering.sh` (41 checks) adds coverage for 38-40 digit numeric fields (core and
+  pre-release), leading-zero rejection in the core and in pre-release identifiers, legitimate bare-zero
+  fields, alphanumeric identifiers that start with a digit, and `classify`'s leading-zero rejection.
+
+## Downgrade Override Removal Resolution (this change)
+
+`version-sync.yml` previously accepted a manual `allow_downgrade` `workflow_dispatch` input that let an
+operator force a sync backwards past the canonical `active-release.env`. This override is removed
+entirely:
+
+- The `allow_downgrade` workflow input, the `ALLOW_DOWNGRADE` environment variable, and the override
+  branch of the `OLDER` case are all gone. Both automated (`repository_dispatch`) and manual
+  (`workflow_dispatch`) sync runs now handle an `OLDER` classification identically: skip, with no
+  override of any kind. A stray `ALLOW_DOWNGRADE=true` left in a step's environment has no effect, since
+  the variable is no longer read anywhere.
+- A real rollback is an intentional, human-operated decision with implications far beyond a version
+  bump (registry tags, GitOps revisions, RPM `Release` bumps, downstream SDK/IDE updates, ...), so it is
+  deliberately out of scope for this workflow. Rollbacks are deferred to a future, separate,
+  explicitly human-driven process rather than a workflow input.
+- `tests/test_version_sync_ordering.sh` (22 checks) asserts `allow_downgrade`/`ALLOW_DOWNGRADE` are
+  absent from both the workflow source and the extracted guard step, and functionally replays that an
+  older candidate is always skipped — including when a stray `ALLOW_DOWNGRADE=true` is present in the
+  step's own environment.
 
 ## Deferred Items
 

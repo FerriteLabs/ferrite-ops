@@ -59,8 +59,12 @@ assert_contains "$AUDIT_CONTENT" "docker buildx imagetools create" \
   "AUDIT.md records digest promotion via imagetools compatible with cosign"
 assert_contains "$AUDIT_CONTENT" "## Release Ordering and Supersession Resolution" \
   "AUDIT.md records the version-sync ordering and supersession resolution"
-assert_contains "$AUDIT_CONTENT" "allow_downgrade" \
-  "AUDIT.md records the manual-only allow_downgrade override"
+assert_contains "$AUDIT_CONTENT" "## Downgrade Override Removal Resolution" \
+  "AUDIT.md records the allow_downgrade removal resolution"
+assert_contains "$AUDIT_CONTENT" "it was fully removed in a later" \
+  "AUDIT.md's historical ordering section notes the override was later fully removed"
+assert_contains "$AUDIT_CONTENT" "explicitly human-driven process" \
+  "AUDIT.md records that rollbacks are deferred to a future human-driven process"
 assert_contains "$AUDIT_CONTENT" "scripts/release-ordering.sh" \
   "AUDIT.md records the shared SemVer ordering guard"
 assert_contains "$AUDIT_CONTENT" "suppresses \`pull_request\` events" \
@@ -69,5 +73,14 @@ assert_contains "$AUDIT_CONTENT" "merge-queue" \
   "AUDIT.md records merge-time supersession enforcement"
 assert_contains "$AUDIT_CONTENT" "28/28 discovered suites" \
   "AUDIT.md records the full 28-suite verification pass"
+
+assert_contains "$AUDIT_CONTENT" "## Supersession Trust Boundary and Strict SemVer Resolution" \
+  "AUDIT.md records the supersession trust-boundary and strict-SemVer resolution"
+assert_contains "$AUDIT_CONTENT" "never invoked" \
+  "AUDIT.md records that the candidate checkout's scripts are never invoked"
+assert_contains "$AUDIT_CONTENT" "version-supersession-reconcile" \
+  "AUDIT.md records the reconciliation concurrency group"
+assert_contains "$AUDIT_CONTENT" "validate VERSION" \
+  "AUDIT.md records the new strict-SemVer validate subcommand"
 
 harness_summary
