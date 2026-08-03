@@ -41,6 +41,69 @@ assert_cmp "0.5.0-alpha" "0.5.0-alpha.1" "lt"
 assert_cmp "0.5.0-alpha.1" "0.5.0-beta" "lt"
 assert_cmp "1.0.0-rc.1" "1.0.0-rc.1" "eq"
 
+# Arbitrary-size numeric core fields: comparison must use string
+# length/lexical order, never Bash 64-bit arithmetic, so fields far larger
+# than a machine word still compare correctly.
+HUGE_A="99999999999999999999999999999999999999"          # 38 nines
+HUGE_B="100000000000000000000000000000000000000"         # 1 followed by 39 zeros (one digit longer)
+assert_cmp "${HUGE_A}.0.0" "${HUGE_B}.0.0" "lt"
+assert_cmp "${HUGE_B}.0.0" "${HUGE_A}.0.0" "gt"
+assert_cmp "${HUGE_A}.0.0" "${HUGE_A}.0.0" "eq"
+# Same digit count, different value: falls back to lexical (== numeric for
+# equal-length, leading-zero-free decimal strings).
+assert_cmp "99999999999999999999999999999999999998.0.0" "${HUGE_A}.0.0" "lt"
+# A huge value must still correctly outrank an ordinary small version.
+assert_cmp "${HUGE_A}.0.0" "999.999.999" "gt"
+# Huge numeric pre-release identifiers compare the same way.
+assert_cmp "1.0.0-${HUGE_A}" "1.0.0-${HUGE_B}" "lt"
+assert_cmp "1.0.0-${HUGE_B}" "1.0.0-${HUGE_A}" "gt"
+
+# Strict SemVer: leading zeros are rejected outright, in the core and in any
+# purely-numeric pre-release identifier (a bare "0" remains valid).
+for bad in "01.0.0" "0.01.0" "0.0.01" "1.00.0"; do
+  if "$ORDER" validate "$bad" >/dev/null 2>&1; then
+    harness_fail "validate accepted a leading-zero core version: ${bad}"
+  else
+    harness_ok "validate rejects a leading-zero core version: ${bad}"
+  fi
+done
+if "$ORDER" validate "1.0.0-rc.01" >/dev/null 2>&1; then
+  harness_fail "validate accepted a leading-zero numeric pre-release identifier"
+else
+  harness_ok "validate rejects a leading-zero numeric pre-release identifier (rc.01)"
+fi
+if "$ORDER" validate "1.0.0-01.rc" >/dev/null 2>&1; then
+  harness_fail "validate accepted a leading-zero numeric pre-release identifier as the first component"
+else
+  harness_ok "validate rejects a leading-zero numeric pre-release identifier (01.rc)"
+fi
+# A bare "0" core field or pre-release identifier remains valid (not a
+# leading zero — it IS zero).
+if "$ORDER" validate "0.0.0" >/dev/null 2>&1; then
+  harness_ok "validate accepts an all-zero core version (0.0.0)"
+else
+  harness_fail "validate rejected a legitimate all-zero core version"
+fi
+if "$ORDER" validate "1.0.0-0" >/dev/null 2>&1; then
+  harness_ok "validate accepts a bare-zero numeric pre-release identifier"
+else
+  harness_fail "validate rejected a legitimate bare-zero pre-release identifier"
+fi
+# An alphanumeric pre-release identifier (contains a non-digit) may take any
+# form, including one that looks like it has a leading zero (e.g. "0a").
+if "$ORDER" validate "1.0.0-0a1" >/dev/null 2>&1; then
+  harness_ok "validate accepts a non-numeric pre-release identifier that merely starts with a digit"
+else
+  harness_fail "validate rejected a legitimate alphanumeric pre-release identifier (0a1)"
+fi
+# classify must also reject a leading-zero candidate or current version
+# rather than silently comparing it.
+if "$ORDER" classify "1.01.0" "$ZERO" "1.0.0" "$ZERO" >/dev/null 2>&1; then
+  harness_fail "classify accepted a leading-zero candidate version"
+else
+  harness_ok "classify rejects a leading-zero candidate version"
+fi
+
 # ge exit-code contract.
 if "$ORDER" ge "0.4.1" "0.4.0"; then
   harness_ok "ge treats a strictly newer version as promotable"
