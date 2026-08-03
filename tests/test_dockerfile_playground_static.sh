@@ -127,16 +127,22 @@ assert_not_contains "$POLICY_CONTENT" "ADMINISTRATIVE_COMMANDS" \
   "the shared policy no longer relies on an administrative-command denylist"
 assert_not_contains "$POLICY_CONTENT" "ADMINISTRATIVE_FAMILIES" \
   "the shared policy no longer relies on a privileged-family denylist"
-for allowed_command in PING ECHO GET SET LRANGE HSCAN SSCAN ZRANGE XRANGE; do
+for allowed_command in PING ECHO GET SET LRANGE ZRANGE XRANGE; do
   assert_contains "$POLICY_CONTENT" "\"${allowed_command}\"" \
     "shared command policy explicitly allows bounded/basic ${allowed_command}"
+done
+for removed_command in SCAN HSCAN SSCAN ZSCAN XREAD XREADGROUP; do
+  assert_not_contains "$POLICY_CONTENT" "policy(&[\"${removed_command}\"]" \
+    "shared command policy does not allow unbounded ${removed_command}"
 done
 assert_contains "$POLICY_CONTENT" "MAX_COLLECTION_PAGE: usize = 100" \
   "collection and stream pages are capped at 100"
 assert_contains "$POLICY_CONTENT" "MAX_MULTI_ITEMS: usize = 32" \
   "multi-key/field/member commands use a conservative item cap"
-assert_contains "$POLICY_CONTENT" "duplicate_count_options_cannot_bypass_bounds" \
-  "policy tests cover duplicate COUNT bypass attempts"
+assert_contains "$POLICY_CONTENT" "removed_scan_and_stream_read_commands_cannot_bypass_the_allowlist" \
+  "policy tests cover removed scan/read bypass attempts"
+assert_contains "$POLICY_CONTENT" '"XREAD", "STREAMS", "COUNT"' \
+  "policy tests cover the reordered XREAD STREAMS COUNT bypass"
 assert_contains "$LAUNCHER_CONTENT" "unexpected_exit_error" "any unsolicited Ferrite child exit is treated as a launcher error"
 
 # 7c. Response and resource bounds: replies are bounded by one cumulative
@@ -149,19 +155,30 @@ assert_contains "$RESP_MODULE_CONTENT" "struct ResponseBudget" "the cumulative b
 assert_contains "$RESP_MODULE_CONTENT" "read_value_budgeted" "every decoded reply is charged to a budget"
 assert_not_contains "$RESP_MODULE_CONTENT" "pub fn read_value<" "no unbudgeted reply decoding entry point remains"
 assert_contains "$PROXY_CONTENT" "ResponseBudget::default()" "public RESP replies are bounded by the cumulative budget"
-assert_contains "$KEYS_CONTENT" '"SSCAN"' "set key detail uses a bounded cursor scan"
-assert_contains "$KEYS_CONTENT" '"HSCAN"' "hash key detail uses a bounded cursor scan"
+assert_not_contains "$KEYS_CONTENT" 'execute(addr, &["SSCAN"' "set key detail never invokes SSCAN"
+assert_not_contains "$KEYS_CONTENT" 'execute(addr, &["HSCAN"' "hash key detail never invokes HSCAN"
+assert_contains "$KEYS_CONTENT" '"SCARD"' "set key detail reports the real set length"
+assert_contains "$KEYS_CONTENT" '"HLEN"' "hash key detail reports the real hash length"
+assert_contains "$KEYS_CONTENT" '"value_omitted"' "hash/set key detail clearly marks omitted values"
 assert_contains "$KEYS_CONTENT" '"GETRANGE"' "string key detail returns a bounded preview"
 assert_contains "$KEYS_CONTENT" 'PAGE_LIMIT: i64 = 100' "list/zset/stream key detail pages are limited to 100 elements"
 assert_contains "$KEYS_CONTENT" '"truncated"' "key detail reports truncation metadata"
-assert_contains "$KEYS_CONTENT" '"cursor"' "key detail reports a continuation cursor for scanned types"
 for unbounded in SMEMBERS HGETALL; do
   assert_not_contains "$KEYS_CONTENT" "&[\"${unbounded}\"" "key detail never issues the unbounded read ${unbounded}"
 done
 assert_not_contains "$KEYS_CONTENT" '"LRANGE", key, "0", "-1"' "list key detail never reads the whole list"
 assert_not_contains "$KEYS_CONTENT" '"ZRANGE", key, "0", "-1"' "sorted set key detail never reads the whole zset"
 assert_contains "$KEYS_CONTENT" '"XRANGE"' "stream key detail uses a bounded XRANGE"
-assert_contains "$KEYS_CONTENT" '"COUNT"' "stream and scan key detail pass an explicit COUNT bound"
+assert_contains "$KEYS_CONTENT" '"COUNT"' "stream key detail passes an explicit COUNT bound"
+assert_contains "$PROXY_CONTENT" "CLIENT_WRITE_TIMEOUT" "public RESP writes have a strict timeout"
+assert_contains "$PROXY_CONTENT" "write_backend_response" \
+  "backend permits are held through public RESP response writes"
+assert_contains "$HTTP_CONTENT" "MAX_HTTP_CONNECTIONS" \
+  "HTTP accepts have a real connection-lifetime limit"
+assert_contains "$HTTP_CONTENT" "HTTP_CONNECTION_LIFETIME" \
+  "HTTP connections have a strict lifetime deadline"
+assert_contains "$HTTP_CONTENT" "MAX_RESPONSE_BODY_BYTES" \
+  "HTTP API output bodies have a fixed byte ceiling"
 
 # 8. Distinct purpose preserved: image name, ports, and version metadata remain.
 assert_contains "$CONTENT" "EXPOSE 8080 6379" "Dockerfile.playground still exposes both the studio (8080) and Redis-compatible (6379) ports"

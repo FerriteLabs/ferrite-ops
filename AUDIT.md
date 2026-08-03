@@ -35,14 +35,18 @@
 | F-24 | P0 | Playground lifecycle | The Ferrite child owned the public `0.0.0.0:6379` port, so any unauthenticated client could `SHUTDOWN`, `CONFIG`, `DEBUG`, `MODULE`, `ACL`, `SAVE`, `BGSAVE`, `BGREWRITEAOF`, or `REPLICAOF` the shared instance, and its clean `exit(0)` was treated as success. | Fixed; the child binds `127.0.0.1:6380` only, the launcher owns the public RESP port behind one shared command policy, and any unsolicited child exit is an error |
 | F-25 | P1 | Playground API parity | `/api/execute` forwarded any command straight to Ferrite, so the HTTP path bypassed whatever the RESP path enforced. | Fixed; both entry points classify commands with the same `policy` module |
 | F-26 | P1 | Response bounds | Replies were bounded per bulk string and per array element only, so many individually small elements could still be buffered without limit. | Fixed; one cumulative `ResponseBudget` bounds each whole reply and the unbudgeted decode path was removed |
-| F-27 | P1 | Key inspection bounds | Key detail issued `LRANGE 0 -1`, `SMEMBERS`, `HGETALL`, `ZRANGE 0 -1`, and a whole-value `GET`. | Fixed; every type is read as a bounded range, bounded `COUNT`, or validated cursor scan that reports total/returned/limit/truncated/cursor |
+| F-27 | P1 | Key inspection bounds | Key detail issued `LRANGE 0 -1`, `SMEMBERS`, `HGETALL`, `ZRANGE 0 -1`, and a whole-value `GET`. | Fixed; strings/lists/zsets/streams use bounded reads, while hash/set values are omitted with type/TTL/length metadata because v0.4.0 scans are not effectively bounded |
 | F-28 | P2 | Release tags | `docker/metadata-action` could still add its implicit `latest` tag outside the explicit stable gate. | Fixed; `latest=false` plus functional per-trigger assertions on the effective published tag set |
 | F-30 | P1 | Playground RESP3 | The launcher's decoder understood RESP2 only, so a client that negotiated RESP3 with `HELLO 3` on the public port broke on the first map/set/double reply. | Fixed; every RESP3 type is decoded, re-encoded byte-for-byte, and converted to JSON |
 | F-29 | P2 | Sidecar image | `sidecar.image.tag` defaulted to the floating `latest`, so a synchronized chart appVersion did not move the injected Ferrite image. | Fixed; the default is empty and the helper falls back to `.Chart.AppVersion` |
 | F-31 | P0 | Playground command policy | Ferrite v0.4.0 dotted and root/subcommand forms such as `MIGRATE.START` could bypass an exact-name-only denylist, and outward/topology/code-execution families were incomplete. | Fixed; one explicit allowlist defaults every unknown command to rejection and applies identical normalized, argument-aware bounds over HTTP and RESP |
 | F-32 | P1 | Playground decoded memory | Wire bytes bounded payload data but did not bound decoded RESP node/element overhead, and aggregate declarations allowed up to one million elements. | Fixed; independent decoded-node/element budgets are charged before allocation, aggregate size is 4,096, and re-encoding has a hard output ceiling |
-| F-33 | P1 | Playground concurrency | HTTP and RESP could independently create backend work without one total operation limit. | Fixed; one launcher-owned 32-permit semaphore is shared by public RESP and HTTP execute/key-detail/health, with non-blocking overload responses |
+| F-33 | P1 | Playground concurrency | HTTP and RESP could independently create backend work without one total operation limit. | Fixed; one launcher-owned 32-permit semaphore is shared by public RESP and HTTP execute/key-detail/health, RESP permits cover bounded response writes, and overload fails fast |
 | F-34 | P1 | Playground task lifecycle | A service `JoinHandle` selected after completion was polled again during common cleanup, which can panic and hide the original exit error. | Fixed; optional handles are taken exactly once, timeout aborts are reaped, and selected errors are preserved |
+| F-35 | P0 | Release workflow injection | Dispatch/workflow payloads were interpolated directly into privileged shell scripts and checksums were not uniformly validated before use/output. | Fixed; GitHub expressions enter through step environments, semver is normalized/validated, every checksum is exactly 64 hex characters, and malicious substitutions are inert in functional tests |
+| F-36 | P1 | Playground unbounded reads | `SCAN` variants and `XREAD` appeared bounded by syntax but are not effectively bounded in Ferrite v0.4.0; reordered arguments could bypass the validator. | Fixed; `SCAN`/`SSCAN`/`HSCAN`/`ZSCAN`, `XREAD`, and `XREADGROUP` are absent from the public allowlist over HTTP and RESP |
+| F-37 | P1 | Slow clients and resources | Backend permits ended before RESP writes, HTTP limited handlers rather than accepted connections, and writes/connections lacked strict deadlines. | Fixed; RESP permits cover timed writes, public RESP and HTTP connections are lifetime-capped, HTTP connections expire, and HTTP/RESP output budgets are reduced and tested under saturation |
+| F-38 | P1 | Inline RESP parsing | Inline commands split on whitespace and silently truncated beyond `MAX_ARGUMENTS`, so quoting/escaping semantics differed from HTTP. | Fixed; inline RESP reuses the tested quoted/escaped parser and rejects invalid UTF-8, unterminated input, and oversized argument lists |
 
 ## D-01 Resolution
 
@@ -91,6 +95,11 @@ Release tag derivation additionally disables `docker/metadata-action`'s implicit
 `tests/test_release_workflows.sh` resolves the tag template against each trigger's real derived
 outputs: `push`, `repository_dispatch`, and `workflow_dispatch` of a stable release publish exactly
 `0.4.0`, `0.4`, `0`, and `latest`, while a prerelease publishes only its normalized exact tag.
+All privileged `run` blocks in `release.yml`, `version-sync.yml`, and
+`release-orchestration.yml` receive GitHub expressions through step `env`; none interpolate expressions
+inside shell source. Supplied and computed checksums are normalized and validated as exactly 64
+hexadecimal characters before use or output. Functional tests replay command-substitution payloads
+against every metadata script and prove no payload executes; actionlint accepts all three workflows.
 
 The sidecar chart's `sidecar.image.tag` now defaults to empty and resolves to the chart's
 `appVersion`, so the release paths that synchronize that appVersion also move the injected Ferrite
@@ -110,59 +119,66 @@ Lifecycle and administrative safety:
 
 - the Ferrite child is spawned with `--bind 127.0.0.1 --port 6380` and is never publicly reachable;
 - the launcher owns `0.0.0.0:6379`, decodes RESP array and inline commands, classifies each one, and
-  forwards only approved commands to the child, re-encoding the real reply byte-for-byte;
+  forwards only approved commands to the child, re-encoding the real reply byte-for-byte. Inline
+  commands share the HTTP parser's quoted/escaped syntax and reject malformed or oversized argv;
 - `policy` is an explicit public allowlist rather than a denylist. It permits health/introspection and
   bounded Redis-compatible string, hash, list, set, sorted-set, stream, bit, HyperLogLog, key, and
   expiry operations; every other command is rejected before forwarding. This default rejection covers
   `PLUGIN`, `AUDIT`, every Ferrite-native external/admin/execution family, and both root/subcommand and
   dotted spellings such as `MIGRATE START` and `MIGRATE.START`;
-- argument-aware policy validation requires list/sorted-set windows of at most 100 elements,
-  `XRANGE`/`XREVRANGE` and every scan form to carry `COUNT 1..100`, rejects blocking stream reads and
-  duplicate `COUNT` bypasses, limits multi-key/field/member operations to 32 items, and refuses
+- argument-aware policy validation requires list/sorted-set windows of at most 100 elements and
+  `XRANGE`/`XREVRANGE` to carry `COUNT 1..100`, limits multi-key/field/member operations to 32 items, and refuses
   whole-dataset forms including `HGETALL`, `HKEYS`, `HVALS`, and `SMEMBERS`. Redis keys and values
   remain binary-safe because only policy-relevant views are normalized. `COPY DB` is constrained to
   an existing playground database, `XTRIM`/`XADD` grammar is validated before forwarding, and bit
   offsets are capped so tiny requests cannot trigger large allocations. Public `XADD` accepts only
   server-generated `*` IDs, avoiding explicit-ID overflow that can violate stream ordering;
+- `SCAN`, `SSCAN`, `HSCAN`, `ZSCAN`, `XREAD`, and `XREADGROUP` are rejected by default because their
+  apparent `COUNT` bounds are not effective in Ferrite v0.4.0. This also removes reordered and
+  duplicate-option bypasses such as `XREAD STREAMS COUNT ...`;
 - ordinary Redis-compatible commands and the public port are preserved: a rejection does not close
   the connection and subsequent `SET`/`GET` succeed;
 - `/api/execute` applies the identical policy and answers `403` for refused commands;
 - any Ferrite child exit that the launcher did not initiate is an error, including `exit(0)`;
 - the proxy bounds request line length, per-argument and total request size, argument count,
-  concurrent connections, and client idle time;
+  concurrent connections, client idle time, and response-write time;
 - RESP2 and RESP3 are both preserved: `HELLO 3` and every RESP3 reply type (`_`, `#`, `,`, `(`,
   `!`, `=`, `%`, `~`, `>`) are decoded, charged to the response budget, and re-encoded unchanged.
 - one launcher-owned 32-permit semaphore limits aggregate Ferrite backend work across public RESP
   commands and HTTP execute/key-detail/health requests; acquisition never waits, overload returns
   HTTP `429` or a RESP error without forwarding, and health deliberately follows the same simple
-  fail-fast rule so a saturated pool cannot deadlock a probe;
+  fail-fast rule so a saturated pool cannot deadlock a probe. RESP permits remain held until the
+  bounded response write completes or its strict two-second deadline expires;
+- HTTP accepts are limited to 32 live connections rather than only limiting handler execution. Each
+  accepted HTTP connection owns its permit for its full lifetime and expires after 30 seconds;
 - HTTP and RESP service tasks have explicit single ownership: a selected completed handle is removed
   before common cleanup, remaining handles are taken once, and timed-out aborts are awaited.
 
 Response and resource bounds:
 
-- a cumulative `ResponseBudget` charges every header line and payload byte of one reply (8 MiB by
+- a cumulative `ResponseBudget` charges every header line and payload byte of one reply (1 MiB by
   default, 1 MiB for key detail), plus at most 8,192 decoded values and 8,192 aggregate child slots;
   aggregate declarations are limited to 4,096 entries and charged before vector allocation, so
   empty-element and deeply nested replies cannot consume unbounded object overhead;
-- re-encoding is fallible and checks every append against the 8 MiB public output ceiling, so a
+- re-encoding is fallible and checks every append against the 1 MiB public output ceiling, so a
   decoded reply cannot grow an unbounded forwarding buffer;
+- JSON API bodies have an independent 64 KiB ceiling and oversized results are replaced with a
+  bounded error response;
 - an over-budget reply drops the desynchronized upstream connection, returns an error, and the
   client's next command is served normally;
-- key detail is bounded per type — `GETRANGE` with `STRLEN` for strings, 100-element `LRANGE`,
-  `ZRANGE ... WITHSCORES`, and `XRANGE ... COUNT` pages, and `SSCAN`/`HSCAN` cursor pages for sets
-  and hashes — and reports `length`, `returned`, `limit`, `truncated`, and `cursor`. Cursors from
-  query strings are validated as non-negative integers before being forwarded.
+- key detail is bounded per type — `GETRANGE` with `STRLEN` for strings and 100-element `LRANGE`,
+  `ZRANGE ... WITHSCORES`, and `XRANGE ... COUNT` pages. Hashes and sets return type, TTL, length,
+  `value_omitted: true`, and a clear v0.4.0 scan-omission reason without invoking `HSCAN`/`SSCAN`.
 
 ## Runtime Verification Completed
 
-- 64 `playground-launcher` unit tests pass (`cargo test`), run from `tests/run.sh` via
+- 67 `playground-launcher` unit tests pass (`cargo test`), run from `tests/run.sh` via
   `tests/test_playground_launcher_unit.sh` and from a dedicated CI job.
 - The exact Playground image build, start, and probe suite passes: `SHUTDOWN`, `PLUGIN`, `AUDIT`,
   `MIGRATE.START`, unbounded `LRANGE`, and `XRANGE` without `COUNT` are refused over both HTTP and
   RESP before forwarding; bounded basics continue to work; the child is confirmed to run with
-  `--bind 127.0.0.1 --port 6380`; bounded key detail returns honest totals/truncation/cursors; and an
-  invalid cursor returns `400`. A `HELLO 3` session returns the real RESP3 map and keeps serving
+  `--bind 127.0.0.1 --port 6380`; bounded key detail returns honest totals/truncation and explicit
+  hash/set omission metadata. A `HELLO 3` session returns the real RESP3 map and keeps serving
   ordinary commands.
 - The exact primary image builds and reports `ferrite 0.4.0` / `ferrite-cli 0.4.0`; the exact
   Moonshot image builds with `FERRITE_COMPILED_FEATURES=forge-runtime`, answers `PONG`, and serves

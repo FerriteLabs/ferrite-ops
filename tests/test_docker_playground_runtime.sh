@@ -160,11 +160,10 @@ done
 HASH_DETAIL="$(curl -fsS --max-time 10 \
   "http://127.0.0.1:${HTTP_PORT}/api/keys/detail/bounded-hash" 2>/dev/null || true)"
 assert_contains "$HASH_DETAIL" '"length":150' "hash key detail reports the real total"
-assert_contains "$HASH_DETAIL" '"cursor":' "hash key detail returns a continuation cursor"
-
-BAD_CURSOR_CODE="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 \
-  "http://127.0.0.1:${HTTP_PORT}/api/keys/detail/bounded-hash?cursor=MATCH%20*" 2>/dev/null || true)"
-assert_eq "400" "$BAD_CURSOR_CODE" "an invalid key-detail cursor is rejected with 400"
+assert_contains "$HASH_DETAIL" '"returned":0' "hash key detail does not enumerate fields"
+assert_contains "$HASH_DETAIL" '"value_omitted":true' "hash key detail marks its value as omitted"
+assert_contains "$HASH_DETAIL" 'HSCAN is not effectively bounded' \
+  "hash key detail explains why enumeration is omitted"
 
 # --- Playground lifecycle/admin policy -------------------------------------
 # The public RESP port is owned by the launcher's proxy, not by Ferrite, so
@@ -197,7 +196,14 @@ for rejected_command in \
   "XTRIM stream MAXLEN 100 LIMIT 10" \
   "XADD stream MAXLEN = 100 LIMIT 10 * field value" \
   "XADD stream 18446744073709551615-18446744073709551615 field value" \
-  "SETBIT bitmap 4294967288 1"; do
+  "SETBIT bitmap 4294967288 1" \
+  "SCAN 0 COUNT 100" \
+  "SSCAN set 0 COUNT 100" \
+  "HSCAN bounded-hash 0 COUNT 100" \
+  "ZSCAN zset 0 COUNT 100" \
+  "XREAD COUNT 10 STREAMS stream 0-0" \
+  "XREAD STREAMS COUNT 10 stream 0-0" \
+  "XREADGROUP GROUP group consumer COUNT 10 STREAMS stream >"; do
   REJECTED_REPLY="$(curl -s --max-time 5 -X POST -H 'content-type: application/json' \
     --data "{\"command\":\"${rejected_command}\"}" \
     "http://127.0.0.1:${HTTP_PORT}/api/execute" 2>/dev/null || true)"
@@ -222,7 +228,14 @@ for rejected_command in \
   "XTRIM stream MAXLEN 100 LIMIT 10" \
   "XADD stream MAXLEN = 100 LIMIT 10 * field value" \
   "XADD stream 18446744073709551615-18446744073709551615 field value" \
-  "SETBIT bitmap 4294967288 1"; do
+  "SETBIT bitmap 4294967288 1" \
+  "SCAN 0 COUNT 100" \
+  "SSCAN set 0 COUNT 100" \
+  "HSCAN bounded-hash 0 COUNT 100" \
+  "ZSCAN zset 0 COUNT 100" \
+  "XREAD COUNT 10 STREAMS stream 0-0" \
+  "XREAD STREAMS COUNT 10 stream 0-0" \
+  "XREADGROUP GROUP group consumer COUNT 10 STREAMS stream >"; do
   read -r -a rejected_arguments <<<"$rejected_command"
   REJECTED_REPLY="$(resp_cmd 127.0.0.1 "$RESP_PORT" "${rejected_arguments[@]}" 2>/dev/null || true)"
   assert_contains "$REJECTED_REPLY" "playground" \
