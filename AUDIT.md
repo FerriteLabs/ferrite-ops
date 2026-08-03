@@ -366,6 +366,33 @@ Request memory bounds:
 - No test/lint/build artifacts, temporary containers, or images were left behind; `git status` is
   clean after committing.
 
+## Final Verification Pass (immutable ops and playground sessions)
+
+- `cargo fmt --manifest-path playground-launcher/Cargo.toml --check`,
+  `cargo clippy --manifest-path playground-launcher/Cargo.toml --all-targets -- -D warnings`, and
+  `cargo test --manifest-path playground-launcher/Cargo.toml` pass; the Rust suite is 76/76.
+- `bash tests/run.sh` passes all 24/24 discovered suites. This includes the new immutable-tag,
+  Flux-rendering, stable/prerelease RPM, HTTP `SELECT`, and public-saturation/internal-health coverage;
+  the exact Playground runtime suite is 93/93.
+- `shellcheck --severity=warning scripts/*.sh tests/*.sh` and
+  `actionlint .github/workflows/*.yml` pass with no findings.
+- Helm 4.2.0 lints both charts and renders the primary default/HA and sidecar templates successfully.
+  `kubectl kustomize` renders the base plus development, staging, and production overlays.
+- Docker Compose 2.29.7 resolves the default, monitoring profile, custom-config override, TLS
+  override, quickstart, Moonshot, HA, and standalone monitoring files. The files that deliberately
+  require `GRAFANA_ADMIN_PASSWORD` were validated with a non-secret verification-only value.
+- The full test suite builds and runs the default image, default Compose service, custom-config
+  override, and Playground image. The default image answers `PING`, serves `SET`/`GET`, exposes
+  metrics, and becomes healthy; the custom-config flow becomes healthy and mounts the exact generated
+  config; the Playground image passes direct-child health under public HTTP saturation, HTTP/RESP
+  policy checks, persistent RESP `SELECT`, RESP3, bounds, and clean shutdown.
+- An additional exact `Dockerfile.moonshot` runtime probe builds with
+  `FERRITE_COMPILED_FEATURES=forge-runtime`, becomes healthy, answers `PONG`, and serves `FN.HELP`.
+  `docker-compose.moonshot.yml` then starts both primary and replica healthy; both answer `PONG` and
+  the primary serves `FN.HELP`.
+- Verification containers, volumes, and temporary images were removed. No required external tool was
+  unavailable.
+
 ## Deferred Items
 
 | ID | Description | Reason deferred |
