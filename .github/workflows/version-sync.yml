@@ -11,6 +11,9 @@ on:
       version:
         description: 'New version to sync (e.g. 0.3.1)'
         required: true
+      sha256:
+        description: 'Source tarball SHA256 (optional — computed automatically if empty)'
+        required: false
 
 permissions:
   contents: write
@@ -25,22 +28,57 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Extract version
+      - name: Extract version and source checksum
         id: version
+        env:
+          INPUT_SHA256: ${{ github.event.client_payload.sha256 || inputs.sha256 }}
         run: |
+          set -euo pipefail
+
           if [ "${{ github.event_name }}" = "repository_dispatch" ]; then
             VERSION="${{ github.event.client_payload.version }}"
           else
             VERSION="${{ inputs.version }}"
           fi
+          # Accept either "v0.3.1" or "0.3.1".
+          VERSION="${VERSION#v}"
+
+          if [ -z "$VERSION" ]; then
+            echo "::error::No version specified"
+            exit 1
+          fi
+
+          if ! echo "$VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.]+)?$'; then
+            echo "::error::Invalid semver: $VERSION"
+            exit 1
+          fi
+
+          if [ -n "$INPUT_SHA256" ]; then
+            SHA256="$INPUT_SHA256"
+          else
+            TARBALL_URL="https://github.com/${{ github.repository_owner }}/ferrite/archive/refs/tags/v${VERSION}.tar.gz"
+            echo "Computing source archive SHA256 for ${TARBALL_URL} ..."
+            SHA256=$(curl -fsSL "$TARBALL_URL" | shasum -a 256 | awk '{print $1}')
+          fi
+
+          if [ -z "$SHA256" ]; then
+            echo "::error::Failed to determine a SHA256 for Ferrite v${VERSION}"
+            exit 1
+          fi
+
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
-          echo "📦 Syncing to version ${VERSION}"
+          echo "sha256=${SHA256}" >> "$GITHUB_OUTPUT"
+          echo "📦 Syncing to version ${VERSION} (source SHA256: ${SHA256})"
 
       - name: Update Dockerfile
         run: |
           VERSION="${{ steps.version.outputs.version }}"
+          SHA256="${{ steps.version.outputs.sha256 }}"
           if grep -q 'ARG FERRITE_VERSION' Dockerfile; then
             sed -i "s/ARG FERRITE_VERSION=.*/ARG FERRITE_VERSION=${VERSION}/" Dockerfile
+          fi
+          if grep -q 'ARG FERRITE_SOURCE_SHA256' Dockerfile; then
+            sed -i "s/ARG FERRITE_SOURCE_SHA256=.*/ARG FERRITE_SOURCE_SHA256=${SHA256}/" Dockerfile
           fi
 
       - name: Update Helm chart
@@ -68,9 +106,10 @@ jobs:
             Automated version sync triggered by ferrite core version bump.
 
             **Version**: `${{ steps.version.outputs.version }}`
+            **Source SHA256**: `${{ steps.version.outputs.sha256 }}`
 
             Updates:
-            - Dockerfile `FERRITE_VERSION` arg
+            - Dockerfile `FERRITE_VERSION` and `FERRITE_SOURCE_SHA256` args
             - Helm chart `version` and `appVersion`
             - RPM spec `Version`
           branch: version-sync/${{ steps.version.outputs.version }}
