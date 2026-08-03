@@ -280,7 +280,7 @@ where
     };
 
     if !line.starts_with(b"*") {
-        return Ok(Request::Command(parse_inline(&line)));
+        return parse_inline(&line).map(Request::Command);
     }
 
     let count = parse_number(&line[1..], "argument count")?;
@@ -358,12 +358,17 @@ where
     Ok(Some(line))
 }
 
-fn parse_inline(line: &[u8]) -> Vec<Vec<u8>> {
-    line.split(|byte| byte.is_ascii_whitespace())
-        .filter(|token| !token.is_empty())
-        .take(MAX_ARGUMENTS)
-        .map(|token| token.to_vec())
-        .collect()
+fn parse_inline(line: &[u8]) -> Result<Vec<Vec<u8>>, String> {
+    let command = std::str::from_utf8(line)
+        .map_err(|_| "ERR Protocol error: inline commands must be valid UTF-8".to_string())?;
+    crate::command::parse(command)
+        .map(|arguments| {
+            arguments
+                .into_iter()
+                .map(String::into_bytes)
+                .collect::<Vec<_>>()
+        })
+        .map_err(|error| format!("ERR Protocol error: {error}"))
 }
 
 fn parse_number(payload: &[u8], field: &str) -> Result<i64, String> {
@@ -395,6 +400,24 @@ mod tests {
             decode(b"PING\r\n").await.unwrap(),
             Request::Command(vec![b"PING".to_vec()])
         );
+        assert_eq!(
+            decode(b"SET \"hello world\" 'value with spaces'\r\n")
+                .await
+                .unwrap(),
+            Request::Command(vec![
+                b"SET".to_vec(),
+                b"hello world".to_vec(),
+                b"value with spaces".to_vec(),
+            ])
+        );
+        assert_eq!(
+            decode(b"SET escaped\\ key line\\nbreak\r\n").await.unwrap(),
+            Request::Command(vec![
+                b"SET".to_vec(),
+                b"escaped key".to_vec(),
+                b"line\nbreak".to_vec(),
+            ])
+        );
         assert_eq!(decode(b"").await.unwrap(), Request::Eof);
         assert_eq!(
             decode(b"*0\r\n").await.unwrap(),
@@ -425,6 +448,20 @@ mod tests {
             .await
             .unwrap_err()
             .contains("exceeds"));
+
+        assert!(decode(b"GET \"unterminated\r\n")
+            .await
+            .unwrap_err()
+            .contains("unterminated quote"));
+        let inline_many = format!("{}\r\n", vec!["X"; MAX_ARGUMENTS + 1].join(" "));
+        assert!(decode(inline_many.as_bytes())
+            .await
+            .unwrap_err()
+            .contains("too many arguments"));
+        assert!(decode(b"PING \xff\r\n")
+            .await
+            .unwrap_err()
+            .contains("valid UTF-8"));
     }
 
     async fn start_proxy_with_permits(
