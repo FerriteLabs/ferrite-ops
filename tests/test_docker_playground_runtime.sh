@@ -116,6 +116,31 @@ assert_contains "$HTTP_SET" '"data":"OK"' "HTTP execute returns Ferrite's real R
 RESP_GET="$(resp_cmd 127.0.0.1 "$RESP_PORT" GET from-http 2>/dev/null || true)"
 assert_eq "visible-over-resp" "$RESP_GET" "data written through HTTP is visible through public RESP"
 
+# --- Bounded key detail ------------------------------------------------------
+# A list far larger than one page must return a bounded page plus honest
+# total/truncation metadata rather than the whole collection.
+for index in $(seq 1 150); do
+  resp_cmd 127.0.0.1 "$RESP_PORT" RPUSH bounded-list "item-${index}" >/dev/null 2>&1 || true
+done
+LIST_DETAIL="$(curl -fsS --max-time 10 \
+  "http://127.0.0.1:${HTTP_PORT}/api/keys/detail/bounded-list" 2>/dev/null || true)"
+assert_contains "$LIST_DETAIL" '"length":150' "key detail reports the real list total"
+assert_contains "$LIST_DETAIL" '"returned":100' "key detail returns at most one bounded page"
+assert_contains "$LIST_DETAIL" '"truncated":true' "key detail reports truncation"
+assert_not_contains "$LIST_DETAIL" 'item-150' "key detail does not return the whole list"
+
+for index in $(seq 1 150); do
+  resp_cmd 127.0.0.1 "$RESP_PORT" HSET bounded-hash "field-${index}" "value-${index}" >/dev/null 2>&1 || true
+done
+HASH_DETAIL="$(curl -fsS --max-time 10 \
+  "http://127.0.0.1:${HTTP_PORT}/api/keys/detail/bounded-hash" 2>/dev/null || true)"
+assert_contains "$HASH_DETAIL" '"length":150' "hash key detail reports the real total"
+assert_contains "$HASH_DETAIL" '"cursor":' "hash key detail returns a continuation cursor"
+
+BAD_CURSOR_CODE="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 \
+  "http://127.0.0.1:${HTTP_PORT}/api/keys/detail/bounded-hash?cursor=MATCH%20*" 2>/dev/null || true)"
+assert_eq "400" "$BAD_CURSOR_CODE" "an invalid key-detail cursor is rejected with 400"
+
 # --- Playground lifecycle/admin policy -------------------------------------
 # The public RESP port is owned by the launcher's proxy, not by Ferrite, so
 # administrative/lifecycle commands must be refused on both entry points while

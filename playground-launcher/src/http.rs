@@ -4,7 +4,7 @@
 //! that guards the public RESP port, so neither entry point can administer the
 //! shared Ferrite instance.
 
-use axum::extract::{DefaultBodyLimit, Path, State};
+use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
@@ -27,6 +27,13 @@ pub struct AppState {
 #[derive(Debug, Deserialize)]
 pub struct ExecuteRequest {
     command: String,
+}
+
+/// Optional pagination for cursor-scanned key types (sets and hashes).
+#[derive(Debug, Default, Deserialize)]
+pub struct KeyDetailQuery {
+    #[serde(default)]
+    cursor: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -120,7 +127,11 @@ async fn execute(State(state): State<AppState>, Json(request): Json<ExecuteReque
     }
 }
 
-async fn key_detail(State(state): State<AppState>, Path(key): Path<String>) -> Response {
+async fn key_detail(
+    State(state): State<AppState>,
+    Path(key): Path<String>,
+    Query(query): Query<KeyDetailQuery>,
+) -> Response {
     if key.is_empty() {
         return api_response(
             StatusCode::BAD_REQUEST,
@@ -128,7 +139,14 @@ async fn key_detail(State(state): State<AppState>, Path(key): Path<String>) -> R
         );
     }
 
-    match keys::detail(&state.resp_addr, &key).await {
+    let cursor = query
+        .cursor
+        .unwrap_or_else(|| keys::CURSOR_COMPLETE.to_string());
+    if let Err(error) = keys::validate_cursor(&cursor) {
+        return api_response(StatusCode::BAD_REQUEST, ApiResponse::error(error));
+    }
+
+    match keys::detail(&state.resp_addr, &key, &cursor).await {
         Ok(Some(detail)) => api_response(StatusCode::OK, ApiResponse::ok(detail)),
         Ok(None) => api_response(StatusCode::NOT_FOUND, ApiResponse::error("Key not found")),
         Err(error) => api_response(
@@ -283,6 +301,63 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["data"], json!("http-value"));
         assert_eq!(upstream.received_commands().await, vec!["SET", "GET"]);
+    }
+
+    #[tokio::test]
+    async fn key_detail_is_bounded_and_paginated() {
+        let upstream = MockFerrite::start().await;
+        let values: Vec<(String, String)> = (0..150)
+            .map(|index| (format!("field-{index:03}"), format!("value-{index}")))
+            .collect();
+        upstream.seed_hash("big-hash", values).await;
+        let state = AppState {
+            resp_addr: upstream.addr(),
+            version: "test".into(),
+        };
+
+        let request = Request::builder()
+            .uri("/api/keys/detail/big-hash")
+            .body(Body::empty())
+            .unwrap();
+        let (status, body) = call(state.clone(), request).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["data"]["length"], json!(150));
+        assert_eq!(body["data"]["returned"], json!(100));
+        assert_eq!(body["data"]["truncated"], json!(true));
+        let cursor = body["data"]["cursor"].as_str().unwrap().to_string();
+
+        let request = Request::builder()
+            .uri(format!("/api/keys/detail/big-hash?cursor={cursor}"))
+            .body(Body::empty())
+            .unwrap();
+        let (status, body) = call(state.clone(), request).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["data"]["returned"], json!(50));
+        assert_eq!(body["data"]["truncated"], json!(false));
+
+        let request = Request::builder()
+            .uri("/api/keys/detail/big-hash?cursor=not-a-cursor")
+            .body(Body::empty())
+            .unwrap();
+        let (status, body) = call(state, request).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["success"], json!(false));
+    }
+
+    #[tokio::test]
+    async fn missing_keys_return_not_found() {
+        let upstream = MockFerrite::start().await;
+        let state = AppState {
+            resp_addr: upstream.addr(),
+            version: "test".into(),
+        };
+        let request = Request::builder()
+            .uri("/api/keys/detail/absent")
+            .body(Body::empty())
+            .unwrap();
+        let (status, body) = call(state, request).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["success"], json!(false));
     }
 
     #[tokio::test]

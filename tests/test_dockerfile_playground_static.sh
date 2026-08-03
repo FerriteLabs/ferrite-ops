@@ -125,6 +125,30 @@ for admin_command in SHUTDOWN DEBUG MODULE ACL CONFIG SAVE BGSAVE BGREWRITEAOF R
 done
 assert_contains "$LAUNCHER_CONTENT" "unexpected_exit_error" "any unsolicited Ferrite child exit is treated as a launcher error"
 
+# 7c. Response and resource bounds: replies are bounded by one cumulative
+#     byte budget, and key inspection never issues an unbounded collection
+#     read.
+RESP_MODULE_CONTENT="$(cat "${LAUNCHER_SRC}/resp.rs")"
+KEYS_CONTENT="$(cat "${LAUNCHER_SRC}/keys.rs")"
+assert_contains "$RESP_MODULE_CONTENT" "MAX_RESPONSE_BYTES" "the RESP codec defines a cumulative response byte budget"
+assert_contains "$RESP_MODULE_CONTENT" "struct ResponseBudget" "the cumulative budget is an explicit type, not a per-element check"
+assert_contains "$RESP_MODULE_CONTENT" "read_value_budgeted" "every decoded reply is charged to a budget"
+assert_not_contains "$RESP_MODULE_CONTENT" "pub fn read_value<" "no unbudgeted reply decoding entry point remains"
+assert_contains "$PROXY_CONTENT" "ResponseBudget::default()" "public RESP replies are bounded by the cumulative budget"
+assert_contains "$KEYS_CONTENT" '"SSCAN"' "set key detail uses a bounded cursor scan"
+assert_contains "$KEYS_CONTENT" '"HSCAN"' "hash key detail uses a bounded cursor scan"
+assert_contains "$KEYS_CONTENT" '"GETRANGE"' "string key detail returns a bounded preview"
+assert_contains "$KEYS_CONTENT" 'PAGE_LIMIT: i64 = 100' "list/zset/stream key detail pages are limited to 100 elements"
+assert_contains "$KEYS_CONTENT" '"truncated"' "key detail reports truncation metadata"
+assert_contains "$KEYS_CONTENT" '"cursor"' "key detail reports a continuation cursor for scanned types"
+for unbounded in SMEMBERS HGETALL; do
+  assert_not_contains "$KEYS_CONTENT" "&[\"${unbounded}\"" "key detail never issues the unbounded read ${unbounded}"
+done
+assert_not_contains "$KEYS_CONTENT" '"LRANGE", key, "0", "-1"' "list key detail never reads the whole list"
+assert_not_contains "$KEYS_CONTENT" '"ZRANGE", key, "0", "-1"' "sorted set key detail never reads the whole zset"
+assert_contains "$KEYS_CONTENT" '"XRANGE"' "stream key detail uses a bounded XRANGE"
+assert_contains "$KEYS_CONTENT" '"COUNT"' "stream and scan key detail pass an explicit COUNT bound"
+
 # 8. Distinct purpose preserved: image name, ports, and version metadata remain.
 assert_contains "$CONTENT" "EXPOSE 8080 6379" "Dockerfile.playground still exposes both the studio (8080) and Redis-compatible (6379) ports"
 assert_contains "$CONTENT" 'ENTRYPOINT ["/usr/local/bin/ferrite-playground-launcher"]' "Dockerfile.playground starts the dual-service launcher"

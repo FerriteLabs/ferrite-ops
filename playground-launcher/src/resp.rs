@@ -19,10 +19,54 @@ pub const MAX_RESP_BULK_LENGTH: usize = 16 * 1024 * 1024;
 pub const MAX_RESP_ARRAY_LENGTH: usize = 1_000_000;
 /// Upper bound on reply nesting.
 pub const MAX_RESP_DEPTH: usize = 64;
+/// Cumulative byte budget for one decoded reply.
+///
+/// This bounds the *whole* reply — every header line, every bulk payload, and
+/// every element of every nested array together — rather than each element
+/// individually, so a reply made of many individually small elements (for
+/// example `KEYS *` on a large keyspace) cannot exhaust the launcher's memory.
+pub const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 /// Maximum number of arguments accepted in one command.
 pub const MAX_ARGUMENTS: usize = 256;
 /// Time bound for a full connect/write/read cycle against the Ferrite child.
 pub const RESP_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Cumulative byte budget consumed while decoding a single reply.
+#[derive(Debug)]
+pub struct ResponseBudget {
+    limit: usize,
+    used: usize,
+}
+
+impl ResponseBudget {
+    pub fn new(limit: usize) -> Self {
+        Self { limit, used: 0 }
+    }
+
+    /// Charge `bytes` to the budget, failing once the cumulative total for
+    /// this reply exceeds the limit.
+    pub fn consume(&mut self, bytes: usize) -> Result<(), String> {
+        self.used = self.used.saturating_add(bytes);
+        if self.used > self.limit {
+            return Err(format!(
+                "response exceeds the playground response budget of {} bytes",
+                self.limit
+            ));
+        }
+        Ok(())
+    }
+
+    /// Bytes charged to this budget so far.
+    pub fn used(&self) -> usize {
+        self.used
+    }
+}
+
+impl Default for ResponseBudget {
+    fn default() -> Self {
+        Self::new(MAX_RESPONSE_BYTES)
+    }
+}
 
 #[derive(Debug, PartialEq, Clone)]
 pub enum RespValue {
@@ -85,9 +129,11 @@ pub fn encode_error(message: &str) -> Vec<u8> {
     out
 }
 
-pub fn read_value<'a, R>(
+/// Decode a single reply, charging every byte read to `budget`.
+pub fn read_value_budgeted<'a, R>(
     reader: &'a mut R,
     depth: usize,
+    budget: &'a mut ResponseBudget,
 ) -> Pin<Box<dyn Future<Output = Result<RespValue, String>> + Send + 'a>>
 where
     R: AsyncBufRead + Unpin + Send + 'a,
@@ -108,6 +154,7 @@ where
         if !line.ends_with(b"\r\n") {
             return Err("RESP response line did not end with CRLF".to_string());
         }
+        budget.consume(line.len())?;
         line.truncate(line.len() - 2);
         let (&prefix, payload) = line
             .split_first()
@@ -131,6 +178,7 @@ where
                     return Err(format!("invalid RESP bulk length: {length}"));
                 }
 
+                budget.consume(length as usize + 2)?;
                 let mut data = vec![0; length as usize + 2];
                 reader
                     .read_exact(&mut data)
@@ -153,7 +201,7 @@ where
 
                 let mut values = Vec::with_capacity(std::cmp::min(length as usize, 1024));
                 for _ in 0..length {
-                    values.push(read_value(reader, depth + 1).await?);
+                    values.push(read_value_budgeted(reader, depth + 1, budget).await?);
                 }
                 Ok(RespValue::Array(Some(values)))
             }
@@ -169,8 +217,19 @@ fn parse_number(payload: &[u8], field: &str) -> Result<i64, String> {
         .map_err(|error| format!("invalid RESP {field}: {error}"))
 }
 
-/// Execute a single command against `addr` on a fresh connection.
+/// Execute a single command against `addr` on a fresh connection, bounding
+/// the reply with the default cumulative response budget.
 pub async fn execute(addr: &str, arguments: &[String]) -> Result<RespValue, String> {
+    execute_within(addr, arguments, MAX_RESPONSE_BYTES).await
+}
+
+/// Execute a single command against `addr`, bounding the reply with an
+/// explicit cumulative byte budget.
+pub async fn execute_within(
+    addr: &str,
+    arguments: &[String],
+    budget_bytes: usize,
+) -> Result<RespValue, String> {
     if arguments.is_empty() {
         return Err("command must contain at least one argument".to_string());
     }
@@ -195,7 +254,8 @@ pub async fn execute(addr: &str, arguments: &[String]) -> Result<RespValue, Stri
             .map_err(|error| format!("failed to flush RESP command: {error}"))?;
 
         let mut reader = BufReader::new(stream);
-        read_value(&mut reader, 0).await
+        let mut budget = ResponseBudget::new(budget_bytes);
+        read_value_budgeted(&mut reader, 0, &mut budget).await
     })
     .await
     .map_err(|_| {
@@ -265,7 +325,9 @@ mod tests {
     async fn parses_and_converts_resp_values() {
         let input = b"*5\r\n+OK\r\n:42\r\n$5\r\nhello\r\n$-1\r\n*2\r\n$1\r\na\r\n$1\r\nb\r\n";
         let mut reader = BufReader::new(&input[..]);
-        let value = read_value(&mut reader, 0).await.unwrap();
+        let value = read_value_budgeted(&mut reader, 0, &mut ResponseBudget::default())
+            .await
+            .unwrap();
         assert_eq!(
             to_json(value).unwrap(),
             json!(["OK", 42, "hello", null, ["a", "b"]])
@@ -276,7 +338,9 @@ mod tests {
     async fn re_encodes_decoded_values_byte_for_byte() {
         let input: &[u8] = b"*4\r\n+OK\r\n:-7\r\n$3\r\nabc\r\n*-1\r\n";
         let mut reader = BufReader::new(input);
-        let value = read_value(&mut reader, 0).await.unwrap();
+        let value = read_value_budgeted(&mut reader, 0, &mut ResponseBudget::default())
+            .await
+            .unwrap();
         let mut out = Vec::new();
         encode_value(&value, &mut out);
         assert_eq!(out, input);
@@ -292,6 +356,83 @@ mod tests {
             to_json(RespValue::Error("ERR failure".into())).unwrap_err(),
             "ERR failure"
         );
+    }
+
+    #[tokio::test]
+    async fn budget_bounds_the_whole_response_not_each_element() {
+        // 20 individually tiny elements: no single element is anywhere near
+        // the budget, but together they exceed it.
+        let mut input = b"*20\r\n".to_vec();
+        for _ in 0..20 {
+            input.extend_from_slice(b"$8\r\nabcdefgh\r\n");
+        }
+
+        let mut reader = BufReader::new(&input[..]);
+        let mut budget = ResponseBudget::new(120);
+        let error = read_value_budgeted(&mut reader, 0, &mut budget)
+            .await
+            .unwrap_err();
+        assert!(
+            error.contains("response budget"),
+            "unexpected error: {error}"
+        );
+
+        let mut reader = BufReader::new(&input[..]);
+        let mut budget = ResponseBudget::new(4096);
+        let value = read_value_budgeted(&mut reader, 0, &mut budget)
+            .await
+            .unwrap();
+        assert!(matches!(value, RespValue::Array(Some(ref values)) if values.len() == 20));
+        assert!(budget.used() > 0);
+    }
+
+    #[tokio::test]
+    async fn budget_bounds_a_single_oversized_bulk_reply() {
+        let payload = vec![b'z'; 4096];
+        let mut input = format!("${}\r\n", payload.len()).into_bytes();
+        input.extend_from_slice(&payload);
+        input.extend_from_slice(b"\r\n");
+
+        let mut reader = BufReader::new(&input[..]);
+        let mut budget = ResponseBudget::new(1024);
+        assert!(read_value_budgeted(&mut reader, 0, &mut budget)
+            .await
+            .unwrap_err()
+            .contains("response budget"));
+    }
+
+    #[tokio::test]
+    async fn nested_arrays_share_one_cumulative_budget() {
+        let mut input = b"*4\r\n".to_vec();
+        for _ in 0..4 {
+            input.extend_from_slice(b"*2\r\n$4\r\nabcd\r\n$4\r\nefgh\r\n");
+        }
+        let mut reader = BufReader::new(&input[..]);
+        let mut budget = ResponseBudget::new(60);
+        assert!(read_value_budgeted(&mut reader, 0, &mut budget)
+            .await
+            .unwrap_err()
+            .contains("response budget"));
+    }
+
+    #[tokio::test]
+    async fn execute_within_applies_the_requested_budget() {
+        let upstream = crate::testing::MockFerrite::start().await;
+        let addr = upstream.addr();
+
+        let error = execute_within(&addr, &["MOCKBULK".to_string(), "8192".to_string()], 1024)
+            .await
+            .unwrap_err();
+        assert!(error.contains("response budget"), "unexpected: {error}");
+
+        let value = execute_within(
+            &addr,
+            &["MOCKBULK".to_string(), "512".to_string()],
+            1024 * 1024,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(value, RespValue::Bulk(Some(ref data)) if data.len() == 512));
     }
 
     #[test]

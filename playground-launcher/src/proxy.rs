@@ -174,7 +174,14 @@ async fn forward(
             .flush()
             .await
             .map_err(|error| format!("failed to flush RESP command: {error}"))?;
-        resp::read_value(stream, 0).await
+
+        // Every reply forwarded to a public client is bounded by one
+        // cumulative byte budget, so no single command can make the proxy
+        // buffer an unbounded response.
+        let mut budget = resp::ResponseBudget::default();
+        resp::read_value_budgeted(stream, 0, &mut budget)
+            .await
+            .map_err(|error| format!("{error} (read {} bytes)", budget.used()))
     })
     .await
     .map_err(|_| {
@@ -440,6 +447,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn public_replies_are_bounded_by_the_cumulative_response_budget() {
+        let upstream = MockFerrite::start().await;
+        let addr = start_proxy(upstream.leaked_addr()).await;
+        let mut client = crate::testing::RespClient::connect(&addr).await;
+
+        // Many individually small elements whose cumulative size exceeds the
+        // launcher's per-reply budget.
+        let elements = (resp::MAX_RESPONSE_BYTES / 1024 + 512).to_string();
+        let reply = client
+            .command(&["MOCKARRAY", elements.as_str(), "1024"])
+            .await;
+        match reply {
+            RespValue::Error(message) => assert!(
+                message.contains("response budget"),
+                "unexpected error: {message}"
+            ),
+            other => panic!("oversized reply should have been refused, got {other:?}"),
+        }
+
+        // The connection recovers: the desynchronized upstream is dropped and
+        // the next command is served on a fresh one.
+        assert_eq!(
+            client.command(&["PING"]).await,
+            RespValue::Simple("PONG".into())
+        );
+    }
+
+    #[tokio::test]
     async fn inline_administrative_commands_are_rejected_too() {
         let upstream = MockFerrite::start().await;
         let addr = start_proxy(upstream.leaked_addr()).await;
@@ -447,7 +482,9 @@ mod tests {
         stream.write_all(b"shutdown nosave\r\n").await.unwrap();
 
         let mut reader = BufReader::new(stream);
-        let reply = resp::read_value(&mut reader, 0).await.unwrap();
+        let reply = resp::read_value_budgeted(&mut reader, 0, &mut resp::ResponseBudget::default())
+            .await
+            .unwrap();
         assert!(matches!(reply, RespValue::Error(_)));
         assert!(!upstream.was_shutdown().await);
     }

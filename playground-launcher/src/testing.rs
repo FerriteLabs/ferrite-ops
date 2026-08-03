@@ -400,7 +400,9 @@ impl RespClient {
     pub async fn command(&mut self, arguments: &[&str]) -> RespValue {
         let encoded = resp::encode_command(arguments);
         self.writer.write_all(&encoded).await.unwrap();
-        resp::read_value(&mut self.reader, 0).await.unwrap()
+        resp::read_value_budgeted(&mut self.reader, 0, &mut resp::ResponseBudget::default())
+            .await
+            .unwrap()
     }
 
     pub async fn try_command(&mut self, arguments: &[&str]) -> Result<RespValue, String> {
@@ -409,6 +411,6 @@ impl RespClient {
             .write_all(&encoded)
             .await
             .map_err(|error| error.to_string())?;
-        resp::read_value(&mut self.reader, 0).await
+        resp::read_value_budgeted(&mut self.reader, 0, &mut resp::ResponseBudget::default()).await
     }
 }
