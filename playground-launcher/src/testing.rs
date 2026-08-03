@@ -46,8 +46,17 @@ impl Stored {
 #[derive(Default)]
 struct MockState {
     commands: Vec<String>,
+    session_commands: Vec<SessionCommand>,
     shutdown: bool,
     data: HashMap<String, Stored>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionCommand {
+    pub name: String,
+    pub arguments: Vec<String>,
+    pub database: u8,
+    pub protocol: u8,
 }
 
 pub struct MockFerrite {
@@ -87,6 +96,10 @@ impl MockFerrite {
 
     pub async fn received_commands(&self) -> Vec<String> {
         self.state.lock().await.commands.clone()
+    }
+
+    pub async fn session_commands(&self) -> Vec<SessionCommand> {
+        self.state.lock().await.session_commands.clone()
     }
 
     pub async fn was_shutdown(&self) -> bool {
@@ -131,6 +144,8 @@ impl MockFerrite {
 async fn serve_connection(stream: TcpStream, state: Arc<Mutex<MockState>>) {
     let (read_half, mut write_half) = stream.into_split();
     let mut reader = BufReader::new(read_half);
+    let mut database = 0;
+    let mut protocol = 2;
 
     loop {
         let request = match read_request(&mut reader).await {
@@ -146,19 +161,56 @@ async fn serve_connection(stream: TcpStream, state: Arc<Mutex<MockState>>) {
             .map(|argument| String::from_utf8_lossy(argument).into_owned())
             .collect();
         let name = arguments[0].to_ascii_uppercase();
+        match name.as_str() {
+            "SELECT" => {
+                database = arguments
+                    .get(1)
+                    .and_then(|value| value.parse().ok())
+                    .unwrap_or_default();
+            }
+            "HELLO" => {
+                protocol = arguments
+                    .get(1)
+                    .and_then(|value| value.parse().ok())
+                    .unwrap_or(2);
+            }
+            _ => {}
+        }
+        let malformed_reply = name == "GET"
+            && arguments
+                .get(1)
+                .is_some_and(|key| key == "__mock_malformed__");
 
         let reply = {
             let mut state = state.lock().await;
             state.commands.push(name.clone());
+            state.session_commands.push(SessionCommand {
+                name: name.clone(),
+                arguments: arguments[1..].to_vec(),
+                database,
+                protocol,
+            });
             if name == "SHUTDOWN" {
                 state.shutdown = true;
                 return;
             }
-            dispatch(&mut state, &name, &arguments[1..])
+            (!malformed_reply).then(|| dispatch(&mut state, &name, &arguments[1..]))
         };
 
+        if malformed_reply {
+            if write_half.write_all(b"?malformed\r\n").await.is_err() {
+                return;
+            }
+            continue;
+        }
+
         let mut encoded = Vec::new();
-        resp::encode_value(&reply, &mut encoded, usize::MAX).unwrap();
+        resp::encode_value(
+            &reply.expect("a non-malformed mock request has a reply"),
+            &mut encoded,
+            usize::MAX,
+        )
+        .unwrap();
         if write_half.write_all(&encoded).await.is_err() {
             return;
         }
@@ -172,6 +224,11 @@ fn bulk(value: &str) -> RespValue {
 fn dispatch(state: &mut MockState, name: &str, args: &[String]) -> RespValue {
     match name {
         "PING" => RespValue::Simple("PONG".into()),
+        "SELECT" => RespValue::Simple("OK".into()),
+        "HELLO" => RespValue::Map(vec![
+            (bulk("proto"), RespValue::Integer(3)),
+            (bulk("server"), bulk("ferrite-mock")),
+        ]),
         "ECHO" => match args.first() {
             Some(value) => bulk(value),
             None => RespValue::Error("ERR wrong number of arguments".into()),

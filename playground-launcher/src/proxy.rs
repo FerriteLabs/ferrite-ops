@@ -13,7 +13,7 @@ use std::time::Duration;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{oneshot, OwnedSemaphorePermit, Semaphore};
-use tokio::time::timeout;
+use tokio::time::{sleep, timeout};
 
 use crate::policy;
 use crate::resp::{self, RespValue, MAX_ARGUMENTS};
@@ -31,6 +31,11 @@ pub const MAX_CONNECTIONS: usize = 64;
 pub const CLIENT_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 /// A client must accept each bounded response within this deadline.
 pub const CLIENT_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
+/// Error returned once an upstream operation can no longer preserve this
+/// client's connection-scoped state. Keep this static so it is always a
+/// bounded public response regardless of the upstream parse/I/O error.
+const UPSTREAM_STATE_LOSS_ERROR: &str =
+    "ERR playground upstream state was lost; reconnect before sending another command";
 
 /// A decoded client request, or the end of the client's stream.
 #[derive(Debug, PartialEq)]
@@ -165,27 +170,35 @@ pub async fn handle_connection(
         };
 
         let reply = forward(&mut upstream, upstream_addr, &arguments).await;
-        let encoded = match reply {
+        let (encoded, close_client) = match reply {
             Ok(value) => {
                 let mut encoded = Vec::new();
                 match resp::encode_value(&value, &mut encoded, resp::MAX_RESPONSE_BYTES) {
-                    Ok(()) => encoded,
+                    Ok(()) => (encoded, false),
                     Err(error) => {
-                        upstream = None;
-                        resp::encode_error(&format!("ERR playground backend error: {error}"))
+                        eprintln!(
+                            "warning: closing public RESP client after oversized upstream response: {error}"
+                        );
+                        (resp::encode_error(UPSTREAM_STATE_LOSS_ERROR), true)
                     }
                 }
             }
             Err(error) => {
-                // The upstream stream may be desynchronized after a failure,
-                // so drop it; the next command reconnects.
-                upstream = None;
-                resp::encode_error(&format!("ERR playground backend error: {error}"))
+                // A timeout, oversized reply, parse failure, or upstream I/O
+                // error can leave unread bytes on the child connection. A
+                // reconnect would silently discard SELECT/HELLO/MULTI state,
+                // so return one bounded error and close this public client.
+                eprintln!("warning: closing public RESP client after upstream state loss: {error}");
+                (resp::encode_error(UPSTREAM_STATE_LOSS_ERROR), true)
             }
         };
         write_backend_response(&mut client_write, &encoded, permit, CLIENT_WRITE_TIMEOUT)
             .await
             .map_err(|error| format!("failed to write RESP reply: {error}"))?;
+        if close_client {
+            let _ = client_write.shutdown().await;
+            return Ok(());
+        }
     }
 }
 
@@ -627,28 +640,81 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn public_replies_are_bounded_by_the_cumulative_response_budget() {
+    async fn oversized_reply_closes_a_selected_client_without_resetting_to_database_zero() {
         let upstream = MockFerrite::start().await;
         upstream
-            .seed_string("oversized", &"x".repeat(resp::MAX_RESPONSE_BYTES + 1))
+            .seed_bytes("oversized", vec![0xff; resp::MAX_RESPONSE_BYTES + 1])
             .await;
         let addr = start_proxy(upstream.leaked_addr()).await;
         let mut client = crate::testing::RespClient::connect(&addr).await;
 
+        assert_eq!(
+            client.command(&["SELECT", "5"]).await,
+            RespValue::Simple("OK".into())
+        );
         let reply = client.command(&["GET", "oversized"]).await;
         match reply {
-            RespValue::Error(message) => assert!(
-                message.contains("response budget"),
-                "unexpected error: {message}"
-            ),
+            RespValue::Error(message) => assert!(message.contains("state was lost")),
             other => panic!("oversized reply should have been refused, got {other:?}"),
         }
+        assert!(
+            client
+                .try_command(&["GET", "must-not-run-on-database-zero"])
+                .await
+                .is_err(),
+            "the proxy must close instead of reconnecting after state loss"
+        );
 
-        // The connection recovers: the desynchronized upstream is dropped and
-        // the next command is served on a fresh one.
-        assert_eq!(
-            client.command(&["PING"]).await,
-            RespValue::Simple("PONG".into())
+        sleep(Duration::from_millis(20)).await;
+        let commands = upstream.session_commands().await;
+        assert!(commands.iter().any(|command| {
+            command.name == "GET"
+                && command.arguments == ["oversized"]
+                && command.database == 5
+                && command.protocol == 2
+        }));
+        assert!(
+            !commands.iter().any(|command| {
+                command.arguments == ["must-not-run-on-database-zero"] && command.database == 0
+            }),
+            "a state-losing reconnect must not execute the next command on database 0: {commands:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_reply_closes_a_resp3_client_without_resetting_the_protocol() {
+        let upstream = MockFerrite::start().await;
+        let addr = start_proxy(upstream.leaked_addr()).await;
+        let mut client = crate::testing::RespClient::connect(&addr).await;
+
+        assert!(matches!(
+            client.command(&["HELLO", "3"]).await,
+            RespValue::Map(_)
+        ));
+        assert!(matches!(
+            client.command(&["GET", "__mock_malformed__"]).await,
+            RespValue::Error(message) if message.contains("state was lost")
+        ));
+        assert!(
+            client
+                .try_command(&["GET", "must-not-run-with-default-protocol"])
+                .await
+                .is_err(),
+            "the proxy must close instead of reconnecting after a parse error"
+        );
+
+        sleep(Duration::from_millis(20)).await;
+        let commands = upstream.session_commands().await;
+        assert!(commands.iter().any(|command| {
+            command.name == "GET"
+                && command.arguments == ["__mock_malformed__"]
+                && command.protocol == 3
+        }));
+        assert!(
+            !commands.iter().any(|command| {
+                command.arguments == ["must-not-run-with-default-protocol"] && command.protocol == 2
+            }),
+            "a state-losing reconnect must not execute the next command as RESP2: {commands:?}"
         );
     }
 
