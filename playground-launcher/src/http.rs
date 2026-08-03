@@ -311,6 +311,12 @@ mod tests {
             "migrate start redis://example.invalid",
             "LRANGE list 0 -1",
             "XRANGE stream - +",
+            "COPY source destination DB 16",
+            "XTRIM stream MAXLEN =",
+            "XTRIM stream MAXLEN 100 LIMIT 10",
+            "XADD stream MAXLEN = 100 LIMIT 10 * field value",
+            "XADD stream 18446744073709551615-18446744073709551615 field value",
+            "SETBIT bitmap 4294967288 1",
         ] {
             let (status, body) = call(state.clone(), execute_request(command)).await;
             assert_eq!(status, StatusCode::FORBIDDEN, "{command} must be forbidden");

@@ -8,6 +8,7 @@
 const MAX_MULTI_ITEMS: usize = 32;
 const MAX_COLLECTION_PAGE: usize = 100;
 const MAX_STRING_RANGE: u64 = 64 * 1024;
+const MAX_BIT_OFFSET: u64 = MAX_STRING_RANGE * 8 - 1;
 const MAX_DATABASE: u64 = 15;
 
 type Validator = fn(&[String]) -> Result<(), String>;
@@ -51,11 +52,7 @@ const POLICIES: &[CommandPolicy] = &[
         &["RENAME", "source", "destination"],
         exact::<2>,
     ),
-    policy(
-        &["COPY"],
-        &["COPY", "source", "destination"],
-        between::<2, 5>,
-    ),
+    policy(&["COPY"], &["COPY", "source", "destination"], copy),
     policy(&["RANDOMKEY"], &["RANDOMKEY"], exact::<0>),
     policy(&["SCAN"], &["SCAN", "0", "COUNT", "100"], scan),
     policy(&["GET", "GETDEL"], &["GET", "key"], exact::<1>),
@@ -83,11 +80,8 @@ const POLICIES: &[CommandPolicy] = &[
         &["MSET", "key-1", "value-1"],
         key_value_pairs,
     ),
-    policy(
-        &["GETBIT", "SETBIT"],
-        &["GETBIT", "key", "0"],
-        between::<2, 3>,
-    ),
+    policy(&["GETBIT"], &["GETBIT", "key", "0"], getbit),
+    policy(&["SETBIT"], &["SETBIT", "key", "0", "1"], setbit),
     policy(&["BITCOUNT"], &["BITCOUNT", "key"], between::<1, 4>),
     policy(&["BITPOS"], &["BITPOS", "key", "1"], between::<2, 5>),
     policy(&["HSET"], &["HSET", "hash", "field", "value"], hash_pairs),
@@ -241,11 +235,7 @@ const POLICIES: &[CommandPolicy] = &[
         &["XREAD", "COUNT", "100", "STREAMS", "stream", "0-0"],
         stream_read,
     ),
-    policy(
-        &["XTRIM"],
-        &["XTRIM", "stream", "MAXLEN", "100"],
-        between::<3, 7>,
-    ),
+    policy(&["XTRIM"], &["XTRIM", "stream", "MAXLEN", "100"], xtrim),
     policy(&["PFADD"], &["PFADD", "hll", "element"], keyed_items),
     policy(
         &["PFCOUNT"],
@@ -424,6 +414,39 @@ fn select(arguments: &[String]) -> Result<(), String> {
     }
 }
 
+fn copy(arguments: &[String]) -> Result<(), String> {
+    between::<2, 5>(arguments)?;
+    let mut index = 2;
+    let mut saw_db = false;
+    let mut saw_replace = false;
+    while index < arguments.len() {
+        match arguments[index].as_str() {
+            "DB" if !saw_db => {
+                let database = arguments
+                    .get(index + 1)
+                    .ok_or_else(|| "DB requires a destination database".to_string())?;
+                let database = parse_u64(database, "destination database")?;
+                if database > MAX_DATABASE {
+                    return Err(format!(
+                        "destination database must be at most {MAX_DATABASE}"
+                    ));
+                }
+                saw_db = true;
+                index += 2;
+            }
+            "REPLACE" if !saw_replace => {
+                saw_replace = true;
+                index += 1;
+            }
+            "DB" | "REPLACE" => {
+                return Err(format!("{} may be specified only once", arguments[index]));
+            }
+            option => return Err(format!("unsupported COPY option {option}")),
+        }
+    }
+    Ok(())
+}
+
 fn key_value_pairs(arguments: &[String]) -> Result<(), String> {
     if arguments.is_empty()
         || !arguments.len().is_multiple_of(2)
@@ -464,6 +487,30 @@ fn optional_count(arguments: &[String]) -> Result<(), String> {
         bounded_positive_count(count)?;
     }
     Ok(())
+}
+
+fn getbit(arguments: &[String]) -> Result<(), String> {
+    exact::<2>(arguments)?;
+    parse_u64(&arguments[1], "bit offset").map(|_| ())
+}
+
+fn setbit(arguments: &[String]) -> Result<(), String> {
+    exact::<3>(arguments)?;
+    bounded_bit_offset(&arguments[1])?;
+    if matches!(arguments[2].as_str(), "0" | "1") {
+        Ok(())
+    } else {
+        Err("bit value must be 0 or 1".to_string())
+    }
+}
+
+fn bounded_bit_offset(value: &str) -> Result<(), String> {
+    let offset = parse_u64(value, "bit offset")?;
+    if offset <= MAX_BIT_OFFSET {
+        Ok(())
+    } else {
+        Err(format!("bit offset must be at most {MAX_BIT_OFFSET}"))
+    }
 }
 
 fn random_member(arguments: &[String]) -> Result<(), String> {
@@ -580,21 +627,154 @@ fn limited_sorted_range(arguments: &[String]) -> Result<(), String> {
 }
 
 fn zadd(arguments: &[String]) -> Result<(), String> {
-    between::<3, 72>(arguments)?;
-    if arguments.len() > 1 + MAX_MULTI_ITEMS * 2 + 7 {
+    if arguments.len() < 3 {
+        return Err("requires a key and at least one score/member pair".to_string());
+    }
+
+    let mut index = 1;
+    let mut options = Vec::new();
+    while let Some(option) = arguments.get(index) {
+        if !matches!(option.as_str(), "NX" | "XX" | "GT" | "LT" | "CH" | "INCR") {
+            break;
+        }
+        if options.contains(&option.as_str()) {
+            return Err(format!("{option} may be specified only once"));
+        }
+        options.push(option.as_str());
+        index += 1;
+    }
+
+    let pairs = &arguments[index..];
+    if pairs.is_empty() || !pairs.len().is_multiple_of(2) {
+        return Err("requires complete score/member pairs".to_string());
+    }
+    if pairs.len() / 2 > MAX_MULTI_ITEMS {
         return Err(format!("at most {MAX_MULTI_ITEMS} members may be added"));
+    }
+    for score in pairs.iter().step_by(2) {
+        parse_score(score)?;
+    }
+    if options.contains(&"INCR") && pairs.len() != 2 {
+        return Err("INCR permits exactly one score/member pair".to_string());
     }
     Ok(())
 }
 
 fn xadd(arguments: &[String]) -> Result<(), String> {
-    between::<4, 72>(arguments)?;
-    if arguments.len() > 1 + MAX_MULTI_ITEMS * 2 + 7 {
+    if arguments.len() < 4 {
+        return Err("requires a key, entry ID, and field/value pair".to_string());
+    }
+
+    let mut index = 1;
+    if arguments
+        .get(index)
+        .is_some_and(|value| value == "NOMKSTREAM")
+    {
+        index += 1;
+    }
+    if arguments
+        .get(index)
+        .is_some_and(|value| matches!(value.as_str(), "MAXLEN" | "MINID"))
+    {
+        index = validate_stream_trim_spec(arguments, index)?;
+    }
+
+    let entry_id = arguments
+        .get(index)
+        .ok_or_else(|| "requires an entry ID".to_string())?;
+    validate_xadd_id(entry_id)?;
+    index += 1;
+
+    let pairs = &arguments[index..];
+    if pairs.is_empty() || !pairs.len().is_multiple_of(2) {
+        return Err("requires complete field/value pairs".to_string());
+    }
+    if pairs.len() / 2 > MAX_MULTI_ITEMS {
         return Err(format!(
             "at most {MAX_MULTI_ITEMS} field/value pairs may be added"
         ));
     }
     Ok(())
+}
+
+fn xtrim(arguments: &[String]) -> Result<(), String> {
+    if arguments.len() < 3 {
+        return Err("requires a key, trim strategy, and threshold".to_string());
+    }
+    let end = validate_stream_trim_spec(arguments, 1)?;
+    if end == arguments.len() {
+        Ok(())
+    } else {
+        Err(format!("unsupported XTRIM option {}", arguments[end]))
+    }
+}
+
+fn validate_stream_trim_spec(arguments: &[String], start: usize) -> Result<usize, String> {
+    let strategy = arguments
+        .get(start)
+        .ok_or_else(|| "trim strategy is required".to_string())?;
+    if !matches!(strategy.as_str(), "MAXLEN" | "MINID") {
+        return Err("trim strategy must be MAXLEN or MINID".to_string());
+    }
+
+    let mut index = start + 1;
+    let approximate = arguments.get(index).is_some_and(|value| value == "~");
+    if arguments
+        .get(index)
+        .is_some_and(|value| matches!(value.as_str(), "=" | "~"))
+    {
+        index += 1;
+    }
+
+    let threshold = arguments
+        .get(index)
+        .ok_or_else(|| "trim strategy requires a threshold".to_string())?;
+    if strategy == "MAXLEN" {
+        parse_u64(threshold, "MAXLEN threshold")?;
+    } else {
+        validate_stream_id(threshold)?;
+    }
+    index += 1;
+
+    if arguments.get(index).is_some_and(|value| value == "LIMIT") {
+        if !approximate {
+            return Err("LIMIT is permitted only with approximate (~) trimming".to_string());
+        }
+        let limit = arguments
+            .get(index + 1)
+            .ok_or_else(|| "LIMIT requires a count".to_string())?;
+        bounded_positive_count(limit)?;
+        index += 2;
+    }
+    Ok(index)
+}
+
+fn validate_xadd_id(value: &str) -> Result<(), String> {
+    if value == "*" {
+        Ok(())
+    } else {
+        Err("XADD entry IDs must use '*' so Ferrite generates a monotonic ID".to_string())
+    }
+}
+
+fn validate_stream_id(value: &str) -> Result<(), String> {
+    let (milliseconds, sequence) = value
+        .split_once('-')
+        .ok_or_else(|| "stream ID must have milliseconds-sequence form".to_string())?;
+    parse_u64(milliseconds, "stream ID milliseconds")?;
+    parse_u64(sequence, "stream ID sequence")?;
+    Ok(())
+}
+
+fn parse_score(value: &str) -> Result<(), String> {
+    let score = value
+        .parse::<f64>()
+        .map_err(|_| "sorted-set score must be a number".to_string())?;
+    if score.is_nan() {
+        Err("sorted-set score must not be NaN".to_string())
+    } else {
+        Ok(())
+    }
 }
 
 fn stream_range(arguments: &[String]) -> Result<(), String> {
@@ -715,6 +895,9 @@ mod tests {
             &["SET", "key", "value"],
             &["GET", "key"],
             &["MGET", "one", "two"],
+            &["COPY", "source", "destination", "DB", "15", "REPLACE"],
+            &["GETBIT", "bitmap", "4294967288"],
+            &["SETBIT", "bitmap", "524287", "1"],
             &["HSET", "hash", "field", "value"],
             &["HMGET", "hash", "one", "two"],
             &["LRANGE", "list", "0", "99"],
@@ -725,6 +908,7 @@ mod tests {
             &["XRANGE", "stream", "-", "+", "COUNT", "100"],
             &["XREVRANGE", "stream", "+", "-", "COUNT", "1"],
             &["XREAD", "COUNT", "10", "STREAMS", "events", "0-0"],
+            &["XTRIM", "stream", "MAXLEN", "~", "100", "LIMIT", "100"],
         ] {
             assert_allowed(arguments);
         }
@@ -830,6 +1014,58 @@ mod tests {
             mset.extend(["key", "value"]);
         }
         assert_rejected(&mset, &MAX_MULTI_ITEMS.to_string());
+
+        let mut zadd = vec!["ZADD", "zset"];
+        for _ in 0..MAX_MULTI_ITEMS {
+            zadd.extend(["1", "member"]);
+        }
+        assert_allowed(&zadd);
+        zadd.extend(["1", "member"]);
+        assert_rejected(&zadd, &MAX_MULTI_ITEMS.to_string());
+
+        let mut xadd = vec!["XADD", "stream", "*"];
+        for _ in 0..MAX_MULTI_ITEMS {
+            xadd.extend(["field", "value"]);
+        }
+        assert_allowed(&xadd);
+        xadd.extend(["field", "value"]);
+        assert_rejected(&xadd, &MAX_MULTI_ITEMS.to_string());
+    }
+
+    #[test]
+    fn rejects_arguments_that_can_crash_or_exhaust_the_child() {
+        for (arguments, reason) in [
+            (
+                &["COPY", "source", "destination", "DB", "16"][..],
+                "at most 15",
+            ),
+            (&["XTRIM", "stream", "MAXLEN", "="], "threshold"),
+            (&["XTRIM", "stream", "MINID", "~"], "threshold"),
+            (
+                &["XTRIM", "stream", "MAXLEN", "100", "LIMIT", "10"],
+                "approximate",
+            ),
+            (
+                &[
+                    "XADD", "stream", "MAXLEN", "=", "100", "LIMIT", "10", "*", "field", "value",
+                ],
+                "approximate",
+            ),
+            (
+                &[
+                    "XADD",
+                    "stream",
+                    "18446744073709551615-18446744073709551615",
+                    "field",
+                    "value",
+                ],
+                "monotonic",
+            ),
+            (&["SETBIT", "bitmap", "4294967288", "1"], "bit offset"),
+            (&["SETBIT", "bitmap", "1", "2"], "0 or 1"),
+        ] {
+            assert_rejected(arguments, reason);
+        }
     }
 
     #[test]

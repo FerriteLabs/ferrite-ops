@@ -408,6 +408,20 @@ mod tests {
             vec!["MIGRATE", "START", "redis://example.invalid"],
             vec!["LRANGE", "list", "0", "-1"],
             vec!["XRANGE", "stream", "-", "+"],
+            vec!["COPY", "source", "destination", "DB", "16"],
+            vec!["XTRIM", "stream", "MAXLEN", "="],
+            vec!["XTRIM", "stream", "MAXLEN", "100", "LIMIT", "10"],
+            vec![
+                "XADD", "stream", "MAXLEN", "=", "100", "LIMIT", "10", "*", "field", "value",
+            ],
+            vec![
+                "XADD",
+                "stream",
+                "18446744073709551615-18446744073709551615",
+                "field",
+                "value",
+            ],
+            vec!["SETBIT", "bitmap", "4294967288", "1"],
         ] {
             let reply = client.command(&command).await;
             match reply {

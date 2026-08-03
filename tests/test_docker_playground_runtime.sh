@@ -191,7 +191,13 @@ for rejected_command in \
   "AUDIT START" \
   "MIGRATE.START redis://example.invalid" \
   "LRANGE bounded-list 0 -1" \
-  "XRANGE stream - +"; do
+  "XRANGE stream - +" \
+  "COPY source destination DB 16" \
+  "XTRIM stream MAXLEN =" \
+  "XTRIM stream MAXLEN 100 LIMIT 10" \
+  "XADD stream MAXLEN = 100 LIMIT 10 * field value" \
+  "XADD stream 18446744073709551615-18446744073709551615 field value" \
+  "SETBIT bitmap 4294967288 1"; do
   REJECTED_REPLY="$(curl -s --max-time 5 -X POST -H 'content-type: application/json' \
     --data "{\"command\":\"${rejected_command}\"}" \
     "http://127.0.0.1:${HTTP_PORT}/api/execute" 2>/dev/null || true)"
@@ -210,7 +216,13 @@ for rejected_command in \
   "AUDIT START" \
   "MIGRATE.START redis://example.invalid" \
   "LRANGE bounded-list 0 -1" \
-  "XRANGE stream - +"; do
+  "XRANGE stream - +" \
+  "COPY source destination DB 16" \
+  "XTRIM stream MAXLEN =" \
+  "XTRIM stream MAXLEN 100 LIMIT 10" \
+  "XADD stream MAXLEN = 100 LIMIT 10 * field value" \
+  "XADD stream 18446744073709551615-18446744073709551615 field value" \
+  "SETBIT bitmap 4294967288 1"; do
   read -r -a rejected_arguments <<<"$rejected_command"
   REJECTED_REPLY="$(resp_cmd 127.0.0.1 "$RESP_PORT" "${rejected_arguments[@]}" 2>/dev/null || true)"
   assert_contains "$REJECTED_REPLY" "playground" \

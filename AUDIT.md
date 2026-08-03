@@ -120,7 +120,10 @@ Lifecycle and administrative safety:
   `XRANGE`/`XREVRANGE` and every scan form to carry `COUNT 1..100`, rejects blocking stream reads and
   duplicate `COUNT` bypasses, limits multi-key/field/member operations to 32 items, and refuses
   whole-dataset forms including `HGETALL`, `HKEYS`, `HVALS`, and `SMEMBERS`. Redis keys and values
-  remain binary-safe because only policy-relevant views are normalized;
+  remain binary-safe because only policy-relevant views are normalized. `COPY DB` is constrained to
+  an existing playground database, `XTRIM`/`XADD` grammar is validated before forwarding, and bit
+  offsets are capped so tiny requests cannot trigger large allocations. Public `XADD` accepts only
+  server-generated `*` IDs, avoiding explicit-ID overflow that can violate stream ordering;
 - ordinary Redis-compatible commands and the public port are preserved: a rejection does not close
   the connection and subsequent `SET`/`GET` succeed;
 - `/api/execute` applies the identical policy and answers `403` for refused commands;
@@ -153,7 +156,7 @@ Response and resource bounds:
 
 ## Runtime Verification Completed
 
-- 63 `playground-launcher` unit tests pass (`cargo test`), run from `tests/run.sh` via
+- 64 `playground-launcher` unit tests pass (`cargo test`), run from `tests/run.sh` via
   `tests/test_playground_launcher_unit.sh` and from a dedicated CI job.
 - The exact Playground image build, start, and probe suite passes: `SHUTDOWN`, `PLUGIN`, `AUDIT`,
   `MIGRATE.START`, unbounded `LRANGE`, and `XRANGE` without `COUNT` are refused over both HTTP and
