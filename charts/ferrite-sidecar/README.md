@@ -195,7 +195,7 @@ helm install ferrite-cache ./charts/ferrite-sidecar \
 | Parameter | Description | Default |
 |-----------|-------------|---------|
 | `sidecar.image.repository` | Sidecar Ferrite image repository | `ghcr.io/ferritelabs/ferrite` |
-| `sidecar.image.tag` | Sidecar Ferrite image tag | `latest` |
+| `sidecar.image.tag` | Sidecar Ferrite image tag (defaults to the chart `appVersion`) | `""` |
 | `sidecar.resources.requests.cpu` | Sidecar CPU request | `100m` |
 | `sidecar.resources.requests.memory` | Sidecar memory request | `256Mi` |
 | `sidecar.resources.limits.cpu` | Sidecar CPU limit | `500m` |

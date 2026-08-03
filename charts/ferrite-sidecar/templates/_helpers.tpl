@@ -101,8 +101,12 @@ Return the proper injector image name
 {{- end }}
 
 {{/*
-Return the proper sidecar image name (for the injected container)
+Return the proper sidecar image name (for the injected container).
+The tag defaults to the chart appVersion, which release automation keeps in
+sync with the released Ferrite version, so the injected sidecar never silently
+tracks a floating tag.
 */}}
 {{- define "ferrite-sidecar.sidecar.image" -}}
-{{- printf "%s:%s" .Values.sidecar.image.repository .Values.sidecar.image.tag }}
+{{- $tag := .Values.sidecar.image.tag | default .Chart.AppVersion }}
+{{- printf "%s:%s" .Values.sidecar.image.repository $tag }}
 {{- end }}
