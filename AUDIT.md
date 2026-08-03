@@ -23,6 +23,20 @@ listed for completeness and explicitly deferred — no code changes were made fo
 | F-08 | P2 | `scripts/backup.sh` (177 lines), `scripts/restore.sh` (294 lines), `scripts/cost-estimate.sh` (151 lines) | Only shell scripts over the 150-line threshold. Reviewed for SRP violations — see "Cohesive Long Units" below. No high-confidence SRP violation found; not refactored. | No action (by design) |
 | F-09 | P3 | naming scan | Searched all shell scripts for `Manager`/`Helper`/`Utils`/`Service`/`Handler` symbol names (functions, files). Only prose matches found (e.g. "connection handler" in an issue-template string, "Helper to check a version" comment, "package-manager" GitHub topic) — no actual function/file names follow these patterns; bash scripts here use verb-based function names (`log`, `cleanup`, `usage`). No violation. | No action |
 | F-10 | P3 (informational) | `crates/ferrite-core/src/io/uring.rs` in the fetched `FerriteLabs/ferrite` v0.3.0 source | Discovered while verifying the repaired Dockerfile end-to-end: `cargo build --release --bin ferrite --bin ferrite-cli` fails to compile `ferrite-core` with `E0277` (`*const UringEngine` is not `Send`; `Result<usize, Error>: Clone` not satisfied). The `uring` module is gated only by `#[cfg(target_os = "linux")]`, not by the `io-uring` Cargo feature (which is off by default), so it always compiles on Linux build images. This is a defect in the pinned `ferrite` core repository's v0.3.0 release, not in `ferrite-ops`, and is out of scope to patch here (no access to modify sibling repos). | Documented, not fixed (out of scope) |
+| F-11 | P3 (informational) | `scripts/backup.sh`, `scripts/restore.sh`, `scripts/cost-estimate.sh` | Pre-existing ShellCheck warnings/errors (`SC3040`, `SC2034`, `SC2144`) reproduced identically on pre-audit commit `69b90b7`; unrelated to this audit's P0/P1 scope. CI's `shellcheck` job (`scandir: scripts`) was already failing on `main` for these reasons before this branch existed. | Documented, not fixed (out of scope) |
+
+## Note: Pre-Existing, Unrelated ShellCheck Findings (F-11, out of scope)
+
+Running `shellcheck --severity=warning scripts/*.sh` (i.e., the same invocation as CI's `shellcheck` job)
+surfaces pre-existing issues in three files this audit deliberately left untouched (see "Cohesive Long Units"
+below): `scripts/backup.sh:23` and `scripts/restore.sh:22` (`SC3040`, `pipefail` under `#!/usr/bin/env sh`),
+`scripts/cost-estimate.sh:16` (`SC2034`, unused `REGION`), and `scripts/restore.sh:145` (`SC2144`, `-f` used
+with a glob). Verified these are **not introduced by this pass** — they reproduce identically on the
+pre-audit commit (`69b90b7`). They are out of this audit's explicit P0/P1 scope (not related to the
+`smoke_test.sh`/`Dockerfile`/CI-verification findings this task targeted) and fixing them would mean editing
+scripts this audit otherwise found cohesive and intentionally left alone. Flagged here only so CI's
+`shellcheck` job's pass/fail status isn't misattributed to this branch's changes — that job's `scandir:
+scripts` was already failing on `main` before this audit for these unrelated reasons. Left unfixed.
 
 ## Detailed Findings
 
