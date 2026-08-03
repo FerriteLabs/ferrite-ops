@@ -4,31 +4,63 @@
 # Extends the standard Dockerfile with configurable feature flags for
 # moonshot capabilities (Forge, Mnemo, Chronicle, Lucidity, Concord, Pangea).
 #
-# Usage:
+# ferrite-ops does not vendor the Ferrite source (see the primary
+# Dockerfile). This build fetches the pinned source tarball for
+# FERRITE_VERSION from the public FerriteLabs/ferrite GitHub repository,
+# verified against FERRITE_SOURCE_SHA256, using the exact same defaults as
+# the primary Dockerfile.
+#
+# Usage (build context is this repository root, like the primary Dockerfile):
 #   docker build -f Dockerfile.moonshot -t ferrite:moonshot \
-#     --build-arg FERRITE_FEATURES="forge-runtime" ../ferrite/
+#     --build-arg FERRITE_FEATURES="forge-runtime" .
 #
 #   # Build with multiple features:
 #   docker build -f Dockerfile.moonshot -t ferrite:moonshot-full \
-#     --build-arg FERRITE_FEATURES="forge-runtime,experimental" ../ferrite/
+#     --build-arg FERRITE_FEATURES="experimental" .
+#
+#   # Override the pinned version (must be paired with a matching checksum):
+#   docker build -f Dockerfile.moonshot -t ferrite:moonshot \
+#     --build-arg FERRITE_VERSION=0.4.0 \
+#     --build-arg FERRITE_SOURCE_SHA256=<sha256 of that version's tarball> .
 
-ARG BUILDPLATFORM=linux/amd64
 ARG FERRITE_VERSION=0.3.0
-FROM --platform=$BUILDPLATFORM rust:1.94-slim-bookworm AS chef
-ARG TARGETARCH=amd64
+FROM rust:1.94-slim-bookworm AS chef
 
-# Install cargo-chef for caching dependencies
-RUN cargo install cargo-chef
+# Install cargo-chef for caching dependencies, plus curl/ca-certificates to
+# fetch the Ferrite source tarball (tar ships with the base image already).
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    curl \
+    && rm -rf /var/lib/apt/lists/* \
+    && cargo install cargo-chef
 
 WORKDIR /app
+
+# ---------- Source stage: fetch the pinned, checksum-verified source ----------
+# Same pin and checksum as the primary Dockerfile's `source` stage: any
+# override of FERRITE_VERSION/FERRITE_SOURCE_URL must be paired with a
+# matching --build-arg FERRITE_SOURCE_SHA256, or the build fails here.
+FROM chef AS source
+ARG FERRITE_VERSION
+ARG FERRITE_SOURCE_URL=https://github.com/FerriteLabs/ferrite/archive/refs/tags/v${FERRITE_VERSION}.tar.gz
+ARG FERRITE_SOURCE_SHA256=42cc9cd06b85fac0a09d6e1770d3eda61375324211be168dfb6dc7eab5825979
+
+RUN if [ -z "$FERRITE_SOURCE_SHA256" ]; then \
+        echo "error: FERRITE_SOURCE_SHA256 build-arg is required to verify the fetched Ferrite source tarball; refusing to build without it." >&2; \
+        exit 1; \
+    fi \
+    && curl -fsSL "$FERRITE_SOURCE_URL" -o /tmp/ferrite-src.tar.gz \
+    && echo "${FERRITE_SOURCE_SHA256}  /tmp/ferrite-src.tar.gz" | sha256sum -c - \
+    && mkdir -p /app \
+    && tar -xzf /tmp/ferrite-src.tar.gz -C /app --strip-components=1 \
+    && rm -f /tmp/ferrite-src.tar.gz \
+    && test -f /app/Cargo.toml \
+    && rm -f /app/.cargo/config.toml
 
 # ---------- Plan stage ----------
 FROM chef AS planner
 
-COPY Cargo.toml Cargo.lock ./
-COPY src ./src
-COPY crates ./crates
-COPY benches ./benches
+COPY --from=source /app /app
 
 RUN cargo chef prepare --recipe-path recipe.json
 
@@ -53,11 +85,25 @@ COPY --from=planner /app/recipe.json recipe.json
 # Note: we cook with features so the dep cache matches the final build
 RUN cargo chef cook --release --features "${FERRITE_FEATURES}" --recipe-path recipe.json
 
-# Copy source code
-COPY Cargo.toml Cargo.lock ./
-COPY src ./src
-COPY crates ./crates
-COPY benches ./benches
+# Copy the fetched source code
+COPY --from=source /app /app
+
+# Preserve the Dockerfile's explicit Rust toolchain instead of allowing the
+# fetched contributor toolchain file to replace it. Ferrite v0.3.0 also
+# exposes its Linux io_uring implementation when the optional feature is
+# disabled; gate that module consistently with the declared Cargo feature.
+# Identical fix to the primary Dockerfile's `builder` stage, scoped the
+# same way to the v0.3.0 default release.
+ARG FERRITE_VERSION
+RUN rm -f rust-toolchain rust-toolchain.toml \
+    && if [ "$FERRITE_VERSION" = "0.3.0" ]; then \
+        sed -i \
+          -e 's/#\[cfg(target_os = "linux")\]/#[cfg(all(target_os = "linux", feature = "io-uring"))]/g' \
+          -e 's/#\[cfg(not(target_os = "linux"))\]/#[cfg(any(not(target_os = "linux"), not(feature = "io-uring")))]/g' \
+          crates/ferrite-core/src/io/mod.rs; \
+        sed -i 's/let fields = vec!\[/let mut fields = vec![/g' \
+          src/commands/handlers/ebpf.rs; \
+    fi
 
 # Build the application with the requested moonshot features
 RUN cargo build --release --features "${FERRITE_FEATURES}" \
@@ -66,16 +112,58 @@ RUN cargo build --release --features "${FERRITE_FEATURES}" \
 # Verify the binaries were built
 RUN ls -lh /app/target/release/ferrite /app/target/release/ferrite-cli
 
-# ---------- Runtime stage ----------
-FROM alpine:3.23.3 AS runtime
+# ---------- Runtime config stage ----------
+# Bakes a loadable, reachable default config using the exact freshly built
+# binary above, instead of an optional/nonexistent local ferrite.toml copy.
+# Same approach and rationale as the primary Dockerfile's `runtime-config`
+# stage (see AUDIT.md F-13/F-17): `ferrite init --minimal` generates a
+# config guaranteed to load with this exact binary, both [server] and
+# [metrics] binds are rewritten to 0.0.0.0 for reachability through
+# Docker's published-port mapping, and `ferrite --test-config` asserts the
+# result loads before the image is exported.
+FROM debian:bookworm-slim AS runtime-config
 
-# Install runtime dependencies
-RUN apk add --no-cache \
+RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
-    libssl3
+    libssl3 \
+    && rm -rf /var/lib/apt/lists/*
 
-# Create a non-root user for running the application
-RUN adduser -D -u 1000 -s /bin/sh ferrite
+COPY --from=builder /app/target/release/ferrite /usr/local/bin/ferrite
+
+RUN mkdir -p /etc/ferrite \
+    && /usr/local/bin/ferrite init --minimal --force \
+        -o /etc/ferrite/ferrite.toml -d /var/lib/ferrite/data \
+    && sed -i 's/^bind = "127\.0\.0\.1"$/bind = "0.0.0.0"/' \
+        /etc/ferrite/ferrite.toml \
+    && test "$(grep -c '^bind = "0\.0\.0\.0"$' /etc/ferrite/ferrite.toml)" -eq 2 \
+    && ! grep -q '127\.0\.0\.1' /etc/ferrite/ferrite.toml \
+    && /usr/local/bin/ferrite --test-config --config /etc/ferrite/ferrite.toml \
+        --data-dir /var/lib/ferrite/data
+
+# ---------- Runtime stage ----------
+# Uses debian-slim (glibc) rather than Alpine (musl) so the runtime's C
+# library ABI matches the `rust:1.94-slim-bookworm` builder stage above.
+# Identical ABI-compatibility rationale/fix as the primary Dockerfile
+# (see AUDIT.md F-12): building with glibc and running on musl is not
+# guaranteed to work and can fail at startup with a missing dynamic
+# linker/library error.
+FROM debian:bookworm-slim AS runtime
+
+# Re-declare ARGs so they're visible in this stage (not automatically
+# inherited from before the first FROM).
+ARG FERRITE_VERSION
+ARG FERRITE_FEATURES="default"
+
+# Install only the runtime shared libraries the compiled binaries need.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    libssl3 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create a non-root user for running the application (same UID/GID as the
+# primary Dockerfile and the previous Alpine image).
+RUN groupadd --gid 1000 ferrite \
+    && useradd --uid 1000 --gid ferrite --no-create-home --shell /bin/sh ferrite
 
 # Create data directory with proper permissions
 RUN mkdir -p /var/lib/ferrite/data && \
@@ -87,8 +175,9 @@ WORKDIR /app
 COPY --from=builder /app/target/release/ferrite /usr/local/bin/ferrite
 COPY --from=builder /app/target/release/ferrite-cli /usr/local/bin/ferrite-cli
 
-# Copy default configuration if it exists
-COPY --chown=ferrite:ferrite ferrite.toml /etc/ferrite/ferrite.toml 2>/dev/null || true
+# Copy the generated, verified runtime config (see runtime-config stage
+# above). Never an optional/invalid COPY of a file that may not exist.
+COPY --from=runtime-config --chown=ferrite:ferrite /etc/ferrite/ferrite.toml /etc/ferrite/ferrite.toml
 
 # Switch to non-root user
 USER ferrite
@@ -104,15 +193,15 @@ ENV RUST_LOG=ferrite=info
 ENV FERRITE_DATA_DIR=/var/lib/ferrite/data
 
 # Record which features were compiled in (available at runtime via inspect)
-ARG FERRITE_FEATURES="default"
 ENV FERRITE_COMPILED_FEATURES="${FERRITE_FEATURES}"
 
 # Configure volume for persistent data
 VOLUME ["/var/lib/ferrite/data"]
 
-# Health check
+# Health check (shell form: exec-form CMD arrays cannot use shell operators
+# like `||`, so this must not be written as a JSON array)
 HEALTHCHECK --interval=15s --timeout=3s --start-period=5s --retries=3 \
-    CMD ["/usr/local/bin/ferrite-cli", "PING"] || exit 1
+    CMD ferrite-cli PING || exit 1
 
 # Set entrypoint
 ENTRYPOINT ["/usr/local/bin/ferrite"]

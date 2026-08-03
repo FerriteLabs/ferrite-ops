@@ -1,28 +1,101 @@
+# syntax=docker/dockerfile:1
+#
 # Ferrite Web Playground
 # Serves the interactive playground at play.ferrite.dev
 #
+# ferrite-ops does not vendor the Ferrite source (see the primary
+# Dockerfile). This build fetches the pinned source tarball for
+# FERRITE_VERSION from the public FerriteLabs/ferrite GitHub repository,
+# verified against FERRITE_SOURCE_SHA256, using the exact same defaults as
+# the primary Dockerfile.
+#
 # Build:   docker build -t ferritelabs/playground -f Dockerfile.playground .
-# Run:     docker run -p 8080:8080 ferritelabs/playground
+# Run:     docker run -p 8080:8080 -p 6379:6379 ferritelabs/playground
 # Access:  http://localhost:8080
 
-FROM rust:1.95-slim-bookworm AS builder
+ARG FERRITE_VERSION=0.3.0
+FROM rust:1.95-slim-bookworm AS base
+
+# ca-certificates/curl to fetch the pinned source tarball (tar ships with
+# the base image already); pkg-config/libssl-dev to build it.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    curl \
+    pkg-config \
+    libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
-COPY . .
 
-# Build the playground server binary (uses ferrite-studio)
-RUN apt-get update && apt-get install -y pkg-config libssl-dev && \
-    cargo build --release --features experimental \
-    --bin ferrite 2>/dev/null || \
-    cargo build --release --bin ferrite
+# ---------- Source stage: fetch the pinned, checksum-verified source ----------
+# Same pin and checksum as the primary Dockerfile's `source` stage: any
+# override of FERRITE_VERSION/FERRITE_SOURCE_URL must be paired with a
+# matching --build-arg FERRITE_SOURCE_SHA256, or the build fails here.
+# Split into its own stage (buildable on its own via
+# `docker build --target source`) so the network fetch + checksum
+# verification can be tested quickly without a full Rust compile.
+FROM base AS source
+ARG FERRITE_VERSION
+ARG FERRITE_SOURCE_URL=https://github.com/FerriteLabs/ferrite/archive/refs/tags/v${FERRITE_VERSION}.tar.gz
+ARG FERRITE_SOURCE_SHA256=42cc9cd06b85fac0a09d6e1770d3eda61375324211be168dfb6dc7eab5825979
 
-FROM debian:bookworm-slim
+RUN if [ -z "$FERRITE_SOURCE_SHA256" ]; then \
+        echo "error: FERRITE_SOURCE_SHA256 build-arg is required to verify the fetched Ferrite source tarball; refusing to build without it." >&2; \
+        exit 1; \
+    fi \
+    && curl -fsSL "$FERRITE_SOURCE_URL" -o /tmp/ferrite-src.tar.gz \
+    && echo "${FERRITE_SOURCE_SHA256}  /tmp/ferrite-src.tar.gz" | sha256sum -c - \
+    && mkdir -p /app \
+    && tar -xzf /tmp/ferrite-src.tar.gz -C /app --strip-components=1 \
+    && rm -f /tmp/ferrite-src.tar.gz \
+    && test -f /app/Cargo.toml \
+    && rm -f /app/.cargo/config.toml
 
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends ca-certificates && \
-    rm -rf /var/lib/apt/lists/*
+# Preserve the Dockerfile's explicit Rust toolchain instead of allowing the
+# fetched contributor toolchain file to replace it. Ferrite v0.3.0 also
+# exposes its Linux io_uring implementation when the optional feature is
+# disabled; gate that module consistently with the declared Cargo feature.
+# Identical fix to the primary Dockerfile's `builder` stage, scoped the
+# same way to the v0.3.0 default release.
+RUN rm -f rust-toolchain rust-toolchain.toml \
+    && if [ "$FERRITE_VERSION" = "0.3.0" ]; then \
+        sed -i \
+          -e 's/#\[cfg(target_os = "linux")\]/#[cfg(all(target_os = "linux", feature = "io-uring"))]/g' \
+          -e 's/#\[cfg(not(target_os = "linux"))\]/#[cfg(any(not(target_os = "linux"), not(feature = "io-uring")))]/g' \
+          crates/ferrite-core/src/io/mod.rs; \
+        sed -i 's/let fields = vec!\[/let mut fields = vec![/g' \
+          src/commands/handlers/ebpf.rs; \
+    fi
+
+# ---------- Build stage ----------
+FROM source AS builder
+
+# Build the playground server binary with the optional ferrite-studio
+# dependency enabled directly, plus ferrite-cli for the runtime healthcheck.
+# The upstream aggregate "experimental" feature also enables unrelated,
+# currently non-buildable v0.3.0 enterprise/Kubernetes handlers; enabling
+# only the feature this image actually needs keeps its purpose explicit.
+# Fail loudly rather than silently falling back to a plain build.
+RUN cargo build --release --features ferrite-studio \
+    --bin ferrite --bin ferrite-cli
+
+# Verify both binaries were built
+RUN ls -lh /app/target/release/ferrite /app/target/release/ferrite-cli
+
+# ---------- Runtime stage ----------
+FROM debian:bookworm-slim AS runtime
+
+# Re-declare the global ARG so the OCI version label below receives the
+# pinned/overridden value inside this stage.
+ARG FERRITE_VERSION
+
+# CA roots for outbound TLS connections.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /app/target/release/ferrite /usr/local/bin/ferrite
+COPY --from=builder /app/target/release/ferrite-cli /usr/local/bin/ferrite-cli
 
 # Playground configuration
 ENV FERRITE_STUDIO_ENABLED=true
@@ -31,12 +104,24 @@ ENV FERRITE_STUDIO_HOST=0.0.0.0
 ENV FERRITE_STUDIO_AUTH=false
 ENV FERRITE_STUDIO_CORS=true
 ENV FERRITE_PORT=6379
+ENV FERRITE_BIND=0.0.0.0
 ENV RUST_LOG=ferrite=info
 
 EXPOSE 8080 6379
 
+# Ferrite v0.3.0 exposes the RESP service but does not wire the studio HTTP
+# health endpoint into the executable yet. Probe the real service shipped by
+# this image rather than assuming an unavailable HTTP endpoint or host curl.
 HEALTHCHECK --interval=30s --timeout=3s --retries=3 \
-    CMD curl -f http://localhost:8080/api/v1/health || exit 1
+    CMD ferrite-cli PING || exit 1
 
 ENTRYPOINT ["ferrite"]
 CMD ["--port", "6379"]
+
+# Build information labels
+LABEL org.opencontainers.image.title="Ferrite Playground"
+LABEL org.opencontainers.image.description="Interactive web playground for Ferrite (ferrite-studio)"
+LABEL org.opencontainers.image.version="${FERRITE_VERSION}"
+LABEL org.opencontainers.image.authors="Jose David Baena"
+LABEL org.opencontainers.image.source="https://github.com/ferritelabs/ferrite"
+LABEL org.opencontainers.image.licenses="Apache-2.0"

@@ -19,7 +19,7 @@ listed for completeness and explicitly deferred — no code changes were made fo
 | F-04 | P0 | `Dockerfile` | `HEALTHCHECK ... CMD ["/usr/local/bin/ferrite-cli", "PING"] \|\| exit 1` — exec-form `CMD` arrays do not support shell operators like `\|\|`; this is invalid Dockerfile syntax (only valid in shell form). | Fixed |
 | F-05 | P0 | `.github/workflows/ci.yml` | The `docker` and `helm` jobs only run `docker build` and `helm lint` — there is no functional/behavioral test gate. Given F-01..F-04, CI's Docker job was never actually exercising a working image; it was undetected because nothing else validated repo assumptions. | Fixed (added `tests/run.sh` gate before build/lint) |
 | F-06 | P1 | `Dockerfile` / `.dockerignore` | `.dockerignore` excludes `target/`, `Cargo.lock`, `benches/results/`, etc. — all artifacts of a source build that has no source in this repo. Confirms the Dockerfile/`.dockerignore` pair were copied from the core `ferrite` repo without adaptation. | Documented; `.dockerignore` left as-is (still correct for the new source-fetching build — extraneous rules are harmless) |
-| F-07 | P1 | `Dockerfile.moonshot`, `Dockerfile.playground` | Share the same `COPY src/crates/benches` and invalid `HEALTHCHECK`/optional-`COPY` patterns as the primary `Dockerfile` (F-02..F-04). Not exercised by `docker build -t ferrite:test .` or any CI job today. | Deferred (D-01) |
+| F-07 | P1 | `Dockerfile.moonshot`, `Dockerfile.playground` | Shared the same `COPY src/crates/benches` and invalid `HEALTHCHECK`/optional-`COPY` patterns as the primary `Dockerfile` (F-02..F-04). `Dockerfile.playground` is actually exercised by `.github/workflows/docker-scan.yml`'s `trivy-scan` matrix (context `.`, i.e. this repo root) and was failing there. | Fixed (see "D-01 Resolution" below): both files now fetch the same pinned/checksum-verified source as the primary Dockerfile, use a glibc runtime matching their glibc builder, generate/self-verify their default config with the real freshly built binary (`Dockerfile.moonshot`), or bind to `0.0.0.0` and install `curl` for their own `HEALTHCHECK` (`Dockerfile.playground`), and no longer contain any invalid/optional `COPY`. |
 | F-08 | P2 | `scripts/backup.sh` (177 lines), `scripts/restore.sh` (294 lines), `scripts/cost-estimate.sh` (151 lines) | Only shell scripts over the 150-line threshold. Reviewed for SRP violations — see "Cohesive Long Units" below. No high-confidence SRP violation found; not refactored. | No action (by design) |
 | F-09 | P3 | naming scan | Searched all shell scripts for `Manager`/`Helper`/`Utils`/`Service`/`Handler` symbol names (functions, files). Only prose matches found (e.g. "connection handler" in an issue-template string, "Helper to check a version" comment, "package-manager" GitHub topic) — no actual function/file names follow these patterns; bash scripts here use verb-based function names (`log`, `cleanup`, `usage`). No violation. | No action |
 | F-10 | P0 | Linux-only code in the fetched `FerriteLabs/ferrite` v0.3.0 source | End-to-end image verification exposed two default-release compile defects: the optional `io_uring` module is compiled while its Cargo feature is disabled, and Linux-only eBPF fields are appended to immutable vectors. | Fixed in the isolated Docker build context with version-gated compatibility edits; no sibling or upstream repository is modified |
@@ -121,7 +121,6 @@ high-confidence bar.
 
 | ID | Description | Reason deferred |
 |----|-------------|------------------|
-| D-01 | Apply the same source-fetch / `HEALTHCHECK` / optional-`COPY` fixes to `Dockerfile.moonshot` and `Dockerfile.playground` (F-07) | Not exercised by `docker build -t ferrite:test .` or any current CI job; out of the explicit P0/P1 scope for this pass. Tracked here so it isn't lost. |
 | D-02 | `helm template`/values-schema validation beyond `helm lint` | `helm lint` already passes cleanly for both charts; deeper template rendering checks were added to `tests/run.sh` (`helm template` dry-run) but full values-schema (JSON Schema) validation was out of scope since no `values.schema.json` exists today and adding one would be a new feature, not a bug fix. |
 
 ## Verification Performed Per Commit
@@ -144,33 +143,28 @@ Performed after F-11..F-17 above, with a Docker daemon, `shellcheck`, and `helm`
 - **Binary execution**: `docker run --rm ferrite:test --version` → `ferrite 0.3.0`;
   `docker run --rm --entrypoint /usr/local/bin/ferrite-cli ferrite:test --version` → `ferrite-cli 0.3.0`.
   Both exit 0.
-- **External reachability via a published random port**: `docker run -d -P ferrite:test` (letting Docker
-  assign random host ports for both `EXPOSE`d ports), then a bounded readiness loop (`redis-cli -h 127.0.0.1
-  -p "$HOST_PORT" PING`, up to 40 attempts / 10s) confirmed `PONG` on the first attempt, followed by a real
-  `SET`/`GET` round-trip through the published port (`OK`, then the exact value back). This directly
-  exercises the F-12/F-13 fixes end-to-end with the real compiled binary, not a fake fixture. Cleanup used
-  `docker rm -f "$CONTAINER_ID"` against the exact container ID captured from `docker run`'s own output
-  (never a name- or pattern-based kill); confirmed via `docker ps -a` afterward that no `ferrite:test`
-  container remained.
-  - Note: the image's own baked-in `runtime-config` (verified separately via
-    `tests/test_docker_runtime_config.sh`) already has both `bind = "0.0.0.0"` lines correctly in place.
-    Because the packaged example config cannot actually be parsed by the real v0.3.0 binary (F-17,
-    pre-existing and out of this pass's scope), this specific reachability run substituted a config
-    generated by the real binary's own `ferrite init` (schema-guaranteed-valid) with the identical
-    `127.0.0.1` → `0.0.0.0` substitution the Dockerfile's `runtime-config` stage performs, to isolate and
-    prove the Docker/reachability fix independently of F-17's unrelated config-content bug. The metrics
-    port (`9090`) was confirmed TCP-reachable via its own published random port; its HTTP response body was
-    empty in this test, which appears to be a real-binary/core-repo behavior and is out of this pass's scope
-    (not a regression from any change in this pass — the metrics *bind address* fix itself, i.e. that the
-    port accepts external connections at all, is what F-13 concerns and is confirmed working).
-- **`bash tests/run.sh`**: 11/11 suites passed (10 pre-existing + the new `tests/test_release_workflows.sh`
-  and `tests/test_ops_scripts_static.sh` added in this pass, plus the rewritten
-  `tests/test_smoke_test_cleanup.sh`).
+- **Exact default image reachability**: `docker run -d -P ferrite:test` with the image's unchanged default
+  `ENTRYPOINT`/`CMD`, baked config, and no mounts/config substitution reached `healthy`; PING/SET/GET
+  succeeded through the published random RESP port, and the published random metrics port accepted TCP
+  connections. Cleanup used `docker rm -f "$CONTAINER_ID"` against the exact ID returned by `docker run`.
+  `tests/test_docker_image_defaults.sh` performs the same regression automatically, including exact-ID
+  cleanup and removal of its exact test image tag.
+- **`bash tests/run.sh`**: 15/15 suites passed, including the full primary default-image regression, both
+  auxiliary Dockerfile source-stage builds, generated-config checks, static Dockerfile invariants, Helm
+  lint/template coverage, workflow checks, and script behavior/cleanup tests.
 - **`shellcheck --severity=warning scripts/*.sh tests/*.sh`**: clean (0 findings; previously 3 — see F-11).
 - **`helm lint charts/ferrite charts/ferrite-sidecar`**: both charts, 0 failures (only the pre-existing
   informational `Chart.yaml: icon is recommended` notice, unrelated to this pass).
 - **`helm template` (both charts)**: renders successfully with no changes to public chart values.
-- **`actionlint .github/workflows/release.yml .github/workflows/version-sync.yml`**: clean.
+- **Relevant workflow actionlint**:
+  `actionlint .github/workflows/ci.yml .github/workflows/docker-scan.yml
+  .github/workflows/release.yml .github/workflows/version-sync.yml` is clean. Running unscoped
+  `actionlint` across every workflow also completed and reports two pre-existing ShellCheck SC2129 style
+  findings in `.github/workflows/release-orchestration.yml` (lines 41 and 243), which neither implementation
+  item touched; no syntax, expression, or action-schema findings were reported for the changed image paths.
+- **Auxiliary images**: full `Dockerfile.moonshot` and `Dockerfile.playground` builds succeeded. Each ran
+  with published random ports and returned `PONG`; both image healthchecks reached `healthy`. Playground's
+  OCI version label is populated as `0.3.0`.
 - No stray processes or containers were left behind: `pgrep -fl "sleep 300"` empty after the test suite;
   `docker ps -a --filter ancestor=ferrite:test` empty after the final end-to-end run.
 
@@ -242,3 +236,102 @@ Assumption: this item's scope is the primary image's own baked-in default config
 mounted/substituted config"), not `docker-compose.yml`'s separate volume-mount default, which intentionally
 still points at the unmodified `ferrite.example.toml` and is a distinct, out-of-scope concern noted in the
 F-17 row above.
+
+## D-01 Resolution (Dockerfile.moonshot / Dockerfile.playground)
+
+Both files are now repository-independent and syntactically valid, using the same pinned source, version,
+and checksum as the primary Dockerfile (`FERRITE_VERSION=0.3.0`, the same verified
+`FERRITE_SOURCE_SHA256=42cc9cd0...25979`), while preserving each file's distinct purpose, exposed ports,
+entrypoint, default command, and version default.
+
+`Dockerfile.moonshot`:
+- Replaced the invalid `COPY Cargo.toml/src/crates/benches` (F-02-equivalent) with the primary Dockerfile's
+  `source` stage pattern: fetch the pinned tarball, verify `FERRITE_SOURCE_SHA256` with `sha256sum -c -`,
+  extract, and apply the same v0.3.0 `io-uring`/eBPF compatibility fix (F-10) — without it this file would
+  fetch the identical broken source and fail to compile.
+- Removed the invalid `COPY --chown=ferrite:ferrite ferrite.toml /etc/ferrite/ferrite.toml 2>/dev/null ||
+  true` (F-03-equivalent: `COPY` is not a shell command). Replaced with the same `runtime-config` approach
+  used to resolve F-13/F-17 in the primary Dockerfile: the exact freshly built binary generates its own
+  config via `ferrite init --minimal`, both binds are rewritten to `0.0.0.0`, and `ferrite --test-config`
+  asserts the result loads before the image is exported.
+- Fixed the invalid exec-form `HEALTHCHECK ... CMD [...] || exit 1` (F-04-equivalent) to shell form.
+- Switched the runtime stage from `alpine:3.23.3` (musl) to `debian:bookworm-slim` (glibc), matching the
+  `rust:1.94-slim-bookworm` (glibc) builder — the same ABI fix as F-12.
+- Removed the hardcoded `ARG BUILDPLATFORM=linux/amd64` (forced QEMU emulation on non-amd64 hosts) and the
+  unused `ARG TARGETARCH=amd64`.
+- Verified end to end in this environment: `docker build --target source`, `docker build --target
+  runtime-config` (the generated config passed both build-time assertions, confirmed via `docker run --rm
+  --entrypoint cat ... /etc/ferrite/ferrite.toml`), and a full `docker build -f Dockerfile.moonshot -t
+  <tag> .` followed by `docker run -d -P <tag>`: `PING`/`SET`/`GET` all succeeded through published random
+  host ports. Cleaned up with `docker rm -f`/`docker image rm -f` against the exact container ID/tag.
+
+`Dockerfile.playground`:
+- Replaced `COPY . .` (which assumed the build context is a full Ferrite source checkout — never true for
+  this source-independent ops repo, and the actual reason `.github/workflows/docker-scan.yml`'s
+  `trivy-scan` matrix entry for this file, which passes context `.`, i.e. this repo root, was failing) with
+  the same pinned/checksum-verified `source` stage, split out as its own named stage (`AS source`) so it can
+  be built and tested on its own via `docker build --target source`, and applied the same v0.3.0
+  compatibility fix as the other two Dockerfiles.
+- Fixed both `HEALTHCHECK` assumptions instead of merely making the original command executable. The
+  runtime did not contain `curl`, and the pinned v0.3.0 executable does not wire the assumed
+  `/api/v1/health` studio endpoint into the server. The build now produces and packages `ferrite-cli` from
+  the same verified source, and the healthcheck probes the actual RESP service with `ferrite-cli PING`.
+  The build enables the optional `ferrite-studio` dependency directly: the aggregate upstream
+  `experimental` feature also enables unrelated, non-buildable v0.3.0 enterprise/Kubernetes handlers.
+  It no longer silently falls back to a default-feature build; a missing playground feature now fails the
+  image build rather than producing an image that contradicts its declared purpose.
+- Added `ENV FERRITE_BIND=0.0.0.0` for the Redis-compatible port: this Dockerfile passes no config file at
+  all, so the real binary's built-in default bind (`127.0.0.1`, confirmed in `crates/ferrite-core/src/
+  config.rs`) is loopback-only and unreachable through Docker's published-port mapping — the same defect
+  class as F-13, discovered while verifying this file end to end. `FERRITE_STUDIO_HOST=0.0.0.0` was already
+  correct in the original file.
+- Builder and runtime stages were already both glibc (`rust:1.95-slim-bookworm` / `debian:bookworm-slim`);
+  no ABI change was needed here, only confirmed and asserted in the new static test.
+- Re-declared `ARG FERRITE_VERSION` in the runtime stage so the OCI version label is populated with the
+  preserved `0.3.0` default (or an explicit override), rather than expanding to an empty string.
+- Verified end to end in this environment: `docker build --target source`, and a full `docker build -f
+  Dockerfile.playground -t <tag> .` followed by `docker run -d -P <tag>`: the RESP port responded `PONG` on
+  its published port (confirming the `FERRITE_BIND=0.0.0.0` fix), the image's own `ferrite-cli PING`
+  healthcheck reached `healthy`, the OCI version label was `0.3.0`, and `Server listening on
+  0.0.0.0:6379` appeared in the container's own logs. Cleaned up with `docker rm -f`/`docker image rm -f`
+  against the exact container ID/tag.
+
+**Upstream limitation handled by the image healthcheck:** the real v0.3.0 `ferrite` binary never actually
+starts an HTTP server on port 8080 — `ferrite-studio` (the crate backing
+`FERRITE_STUDIO_ENABLED`/`FERRITE_STUDIO_PORT`/etc.) is a near-empty stub in the pinned release
+(`crates/ferrite-studio/src/lib.rs` is 23 lines; none of the `FERRITE_STUDIO_*` env vars appear anywhere in
+`src/`/`crates/` outside this Dockerfile). The Dockerfile cannot implement that missing upstream UI, but it
+can avoid encoding the nonexistent endpoint as container health. Its healthcheck therefore validates the
+real RESP service the pinned executable provides. Port 8080 and the studio environment remain preserved
+for source versions that wire the studio server in; implementing that upstream application feature remains
+outside this repository.
+
+Regression coverage:
+- `tests/test_dockerfile_moonshot_static.sh` (new): static invariant checks mirroring
+  `tests/test_dockerfile_static.sh` for the primary Dockerfile (no invalid/optional COPY, valid
+  `HEALTHCHECK` syntax, pinned source/version/checksum matching the primary Dockerfile, v0.3.0 compatibility
+  fix present, no forced `BUILDPLATFORM` emulation, glibc runtime/ABI, non-root UID 1000,
+  `runtime-config`/`ferrite init --minimal`/`ferrite --test-config` present, and moonshot's distinct
+  ports/entrypoint/CMD/`FERRITE_FEATURES`/image title preserved).
+- `tests/test_dockerfile_playground_static.sh` (new): equivalent static checks for
+  `Dockerfile.playground` (no `COPY . .`, deterministic experimental build, `ferrite-cli` RESP
+  `HEALTHCHECK`, populated version label, pinned source/version/checksum, v0.3.0 compatibility fix, glibc
+  builder+runtime, `FERRITE_BIND=0.0.0.0`, and playground's distinct ports/entrypoint/CMD/studio env
+  vars/image title preserved).
+- `tests/test_docker_moonshot_playground_source.sh` (new): Docker-daemon-gated, builds only the cheap
+  `source` stage of each file (fast network fetch + checksum verification), mirroring
+  `tests/test_docker_build.sh`'s scope decision for the primary Dockerfile, to keep `tests/run.sh` fast.
+  Full end-to-end builds/runs (above) were performed manually for this pass, not automated in `tests/
+  run.sh`, for the same reason.
+
+Verified locally in this pass: `bash tests/run.sh` (all suites, including the three new ones, pass);
+`shellcheck --severity=warning tests/test_dockerfile_moonshot_static.sh tests/
+test_dockerfile_playground_static.sh tests/test_docker_moonshot_playground_source.sh` (clean). No leftover
+containers or images after every manual build/run in this section (`docker ps -a` / `docker images`
+confirmed empty of test artifacts after each).
+
+Explicitly out of scope for this item, left unchanged: `docker-compose.moonshot.yml`'s `build.context:
+../ferrite` (assumes a sibling `ferrite` checkout — a separate, pre-existing repository-independence gap in
+the compose file, not the Dockerfile, and not part of "Dockerfile.moonshot and Dockerfile.playground" as
+scoped by this item) and its volume-mounted `ferrite.example.toml` default (same out-of-scope note as F-17
+in item 1). Neither compose file was modified in this pass.
