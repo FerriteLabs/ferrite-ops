@@ -24,6 +24,12 @@ listed for completeness and explicitly deferred — no code changes were made fo
 | F-09 | P3 | naming scan | Searched all shell scripts for `Manager`/`Helper`/`Utils`/`Service`/`Handler` symbol names (functions, files). Only prose matches found (e.g. "connection handler" in an issue-template string, "Helper to check a version" comment, "package-manager" GitHub topic) — no actual function/file names follow these patterns; bash scripts here use verb-based function names (`log`, `cleanup`, `usage`). No violation. | No action |
 | F-10 | P0 | Linux-only code in the fetched `FerriteLabs/ferrite` v0.3.0 source | End-to-end image verification exposed two default-release compile defects: the optional `io_uring` module is compiled while its Cargo feature is disabled, and Linux-only eBPF fields are appended to immutable vectors. | Fixed in the isolated Docker build context with version-gated compatibility edits; no sibling or upstream repository is modified |
 | F-11 | P3 (informational) | `scripts/backup.sh`, `scripts/restore.sh`, `scripts/cost-estimate.sh` | Pre-existing ShellCheck warnings/errors (`SC3040`, `SC2034`, `SC2144`), reproduced identically on pre-audit commit `69b90b7`. `backup.sh`/`restore.sh` declared `#!/usr/bin/env sh` while using the bash-only `set -o pipefail` (`SC3040`); `restore.sh` used `-f` against an unexpanded multi-match glob to locate the extracted backup content directory (`SC2144`); `cost-estimate.sh` declared `REGION=""` but never wired the documented `--region` flag into argument parsing (`SC2034`). | Fixed |
+| F-12 | P0 | `Dockerfile` | Builder stage used `rust:1.95-slim-bookworm` (Debian/glibc) but the runtime stage used `alpine:3.23.4` (musl) — a genuine ABI mismatch risk for a binary compiled against glibc. | Fixed: runtime switched to `debian:bookworm-slim`, matching the builder's libc; UID 1000, paths, volumes, ports, entrypoint/CMD, labels, and HEALTHCHECK preserved unchanged. A post-build `docker run --rm ferrite:test --version` / `ferrite-cli --version` smoke test was added to `.github/workflows/ci.yml`'s `docker` job. |
+| F-13 | P1 | `Dockerfile`, `ferrite.example.toml` | The Dockerfile copied the packaged `ferrite.example.toml` verbatim into the image, including its `bind = "127.0.0.1"` defaults for both `[server]` and `[metrics]` — a plain `docker run` of the published image (no compose env vars) would never be reachable via its own `EXPOSE`d/published ports. | Fixed with a new `runtime-config` build stage that generates a **container-specific** copy of the example config with both binds changed to `0.0.0.0`, plus a build-time assertion that fails the build if the substitution is incomplete. `ferrite.example.toml` itself (the public, documented default) is untouched — verified by both a static test and a Docker-daemon-dependent runtime test (`tests/test_docker_runtime_config.sh`). |
+| F-14 | P1 | `Dockerfile` (`source` stage) | The pinned Ferrite source tarball was fetched and extracted with no integrity verification — a compromised mirror, MITM, or accidental version-override could silently ship different source than expected. | Fixed: added a required `ARG FERRITE_SOURCE_SHA256` (defaulting to the real, verified v0.3.0 digest `42cc9cd0...25979`) that is checked via `sha256sum -c -` before `tar` extraction; the build now fails loudly if the arg is empty or the checksum doesn't match. Verified with three Docker-based scenarios (default success, empty-checksum failure, mismatched-checksum failure) in `tests/test_docker_build.sh`. |
+| F-15 | P1 | `.github/workflows/release.yml`, `version-sync.yml` | Release-publishing workflows relied on the Dockerfile's pinned default `FERRITE_VERSION`/`FERRITE_SOURCE_SHA256` build-args rather than deriving them from the actual release trigger (push tag / `repository_dispatch` / `workflow_dispatch`), risking a release image silently shipping the wrong version. | Fixed: `release.yml` now derives and semver-validates the version from the triggering event, computes the real source checksum, and passes both explicitly via `build-args`; `version-sync.yml` now also updates the Dockerfile's `FERRITE_SOURCE_SHA256` default (previously only `FERRITE_VERSION`). Ordinary CI/scan workflows (`ci.yml`, `docker-scan.yml`, `sbom.yml`) intentionally retain the Dockerfile's pinned defaults. Covered by `tests/test_release_workflows.sh`, including a functional replay against the real v0.3.0 tarball checksum. |
+| F-16 | P1 | `tests/test_smoke_test_cleanup.sh` | The failure-case "mute" fixture backgrounded a wrapper shell that ran a bare `sleep 300` as a foreground child rather than `exec`ing it, so `smoke_test.sh`'s `kill "$SERVER_PID"` only killed the wrapper, orphaning a `sleep 300` grandchild for ~5 minutes on every failure-case test run. The existing assertion (`pgrep -f` against the fixture's script path) was also vacuous — it could never have detected this leak. | Fixed: the fixture now `exec`s `sleep`, so the tracked PID *is* the real server process; the test now asserts both the exact PID's death and (more importantly) that no process anywhere still matches a unique per-run marker baked into the sleep invocation — verified to actually catch the regression by temporarily reverting to the non-`exec`'d fixture and confirming the test then fails as expected. |
+| F-17 | P2 (informational) | `ferrite.example.toml` vs. the real `FerriteLabs/ferrite` v0.3.0 binary's config parser | End-to-end verification for this pass (building the real image and running it with the packaged example config) discovered the packaged default config is **not actually loadable** by the pinned v0.3.0 binary: `max_memory = "1GB"` (a quoted string) is rejected because the parser expects a raw `usize` byte count, and `eviction_policy = "noeviction"` is rejected because the binary only accepts the hyphenated `"no-eviction"`. This affects both `docker run` with the image's own config and `docker-compose.yml` (which mounts `ferrite.example.toml` directly) — i.e. neither the container nor compose can currently start successfully using the packaged defaults, unrelated to any Docker/reachability change in this pass. | Deferred (D-03): fixing this means changing values inside the public `ferrite.example.toml`, which this task's instructions explicitly required be preserved unmodified; reachability itself was independently verified using a schema-valid config (generated by the real binary's own `ferrite init`, then bind-transformed identically to the Dockerfile's `runtime-config` stage) to isolate this config-content bug from the Docker/runtime changes made in this pass. |
 
 ## Note: Previously Pre-Existing ShellCheck Findings (F-11, now fixed)
 
@@ -117,6 +123,7 @@ high-confidence bar.
 |----|-------------|------------------|
 | D-01 | Apply the same source-fetch / `HEALTHCHECK` / optional-`COPY` fixes to `Dockerfile.moonshot` and `Dockerfile.playground` (F-07) | Not exercised by `docker build -t ferrite:test .` or any current CI job; out of the explicit P0/P1 scope for this pass. Tracked here so it isn't lost. |
 | D-02 | `helm template`/values-schema validation beyond `helm lint` | `helm lint` already passes cleanly for both charts; deeper template rendering checks were added to `tests/run.sh` (`helm template` dry-run) but full values-schema (JSON Schema) validation was out of scope since no `values.schema.json` exists today and adding one would be a new feature, not a bug fix. |
+| D-03 | Fix `ferrite.example.toml`'s `max_memory`/`eviction_policy` values so the packaged example config actually loads against the real v0.3.0 binary (F-17) | Fixing requires editing the public example config's values, which this task's instructions explicitly required be preserved unmodified (`Preserve default Ferrite version, public Helm values, ports, image names, compose schemas, and config schema`); flagged for a follow-up task with explicit sign-off to change the example file. |
 
 ## Verification Performed Per Commit
 
@@ -128,3 +135,42 @@ high-confidence bar.
   `https://github.com/FerriteLabs/ferrite` repository
 - A full `docker build -t ferrite:test .` validates the same end-to-end image command used by CI. The
   default v0.3.0 source compatibility guard documented in F-10 is intentionally limited to that release.
+
+## Final End-to-End Verification (this pass)
+
+Performed after F-11..F-17 above, with a Docker daemon, `shellcheck`, and `helm` all available locally:
+
+- **`docker build -t ferrite:test .`** (the exact command CI runs): succeeded, produced a 115MB
+  `debian:bookworm-slim`-based image (`docker images ferrite:test`).
+- **Binary execution**: `docker run --rm ferrite:test --version` → `ferrite 0.3.0`;
+  `docker run --rm --entrypoint /usr/local/bin/ferrite-cli ferrite:test --version` → `ferrite-cli 0.3.0`.
+  Both exit 0.
+- **External reachability via a published random port**: `docker run -d -P ferrite:test` (letting Docker
+  assign random host ports for both `EXPOSE`d ports), then a bounded readiness loop (`redis-cli -h 127.0.0.1
+  -p "$HOST_PORT" PING`, up to 40 attempts / 10s) confirmed `PONG` on the first attempt, followed by a real
+  `SET`/`GET` round-trip through the published port (`OK`, then the exact value back). This directly
+  exercises the F-12/F-13 fixes end-to-end with the real compiled binary, not a fake fixture. Cleanup used
+  `docker rm -f "$CONTAINER_ID"` against the exact container ID captured from `docker run`'s own output
+  (never a name- or pattern-based kill); confirmed via `docker ps -a` afterward that no `ferrite:test`
+  container remained.
+  - Note: the image's own baked-in `runtime-config` (verified separately via
+    `tests/test_docker_runtime_config.sh`) already has both `bind = "0.0.0.0"` lines correctly in place.
+    Because the packaged example config cannot actually be parsed by the real v0.3.0 binary (F-17,
+    pre-existing and out of this pass's scope), this specific reachability run substituted a config
+    generated by the real binary's own `ferrite init` (schema-guaranteed-valid) with the identical
+    `127.0.0.1` → `0.0.0.0` substitution the Dockerfile's `runtime-config` stage performs, to isolate and
+    prove the Docker/reachability fix independently of F-17's unrelated config-content bug. The metrics
+    port (`9090`) was confirmed TCP-reachable via its own published random port; its HTTP response body was
+    empty in this test, which appears to be a real-binary/core-repo behavior and is out of this pass's scope
+    (not a regression from any change in this pass — the metrics *bind address* fix itself, i.e. that the
+    port accepts external connections at all, is what F-13 concerns and is confirmed working).
+- **`bash tests/run.sh`**: 11/11 suites passed (10 pre-existing + the new `tests/test_release_workflows.sh`
+  and `tests/test_ops_scripts_static.sh` added in this pass, plus the rewritten
+  `tests/test_smoke_test_cleanup.sh`).
+- **`shellcheck --severity=warning scripts/*.sh tests/*.sh`**: clean (0 findings; previously 3 — see F-11).
+- **`helm lint charts/ferrite charts/ferrite-sidecar`**: both charts, 0 failures (only the pre-existing
+  informational `Chart.yaml: icon is recommended` notice, unrelated to this pass).
+- **`helm template` (both charts)**: renders successfully with no changes to public chart values.
+- **`actionlint .github/workflows/release.yml .github/workflows/version-sync.yml`**: clean.
+- No stray processes or containers were left behind: `pgrep -fl "sleep 300"` empty after the test suite;
+  `docker ps -a --filter ancestor=ferrite:test` empty after the final end-to-end run.
