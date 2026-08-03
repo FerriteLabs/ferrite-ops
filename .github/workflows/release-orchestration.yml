@@ -61,9 +61,11 @@ jobs:
             SHA256=$(curl -sL "$TARBALL_URL" | shasum -a 256 | awk '{print $1}')
           fi
 
-          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
-          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
-          echo "sha256=${SHA256}" >> "$GITHUB_OUTPUT"
+          {
+            echo "version=${VERSION}"
+            echo "tag=${TAG}"
+            echo "sha256=${SHA256}"
+          } >> "$GITHUB_OUTPUT"
 
           echo "::notice::Release v${VERSION} (SHA256: ${SHA256})"
 
@@ -242,15 +244,17 @@ jobs:
       - name: Report orchestration results
         run: |
           VERSION="${{ needs.prepare.outputs.version }}"
-          echo "## Release Orchestration Summary — v${VERSION}" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Repository | Status |" >> "$GITHUB_STEP_SUMMARY"
-          echo "|-----------|--------|" >> "$GITHUB_STEP_SUMMARY"
-          echo "| ferrite-ops (Helm) | ${{ needs.update-ops.result }} |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| homebrew-tap | ${{ needs.update-homebrew.result }} |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| ferrite-docs | ${{ needs.update-docs.result }} |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| SDKs & Extensions | ${{ needs.update-sdks.result }} |" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "**Version:** ${VERSION}" >> "$GITHUB_STEP_SUMMARY"
-          echo "**SHA256:** ${{ needs.prepare.outputs.sha256 }}" >> "$GITHUB_STEP_SUMMARY"
-          echo "**Dry Run:** ${{ env.DRY_RUN }}" >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo "## Release Orchestration Summary — v${VERSION}"
+            echo ""
+            echo "| Repository | Status |"
+            echo "|-----------|--------|"
+            echo "| ferrite-ops (Helm) | ${{ needs.update-ops.result }} |"
+            echo "| homebrew-tap | ${{ needs.update-homebrew.result }} |"
+            echo "| ferrite-docs | ${{ needs.update-docs.result }} |"
+            echo "| SDKs & Extensions | ${{ needs.update-sdks.result }} |"
+            echo ""
+            echo "**Version:** ${VERSION}"
+            echo "**SHA256:** ${{ needs.prepare.outputs.sha256 }}"
+            echo "**Dry Run:** ${{ env.DRY_RUN }}"
+          } >> "$GITHUB_STEP_SUMMARY"
