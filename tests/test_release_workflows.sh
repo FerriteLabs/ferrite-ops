@@ -72,8 +72,10 @@ assert_not_contains "$RELEASE_CONTENT" 'type=raw,value=${{ inputs.tag }}' \
   "workflow_dispatch does not publish an unnormalized raw v-prefixed tag"
 assert_contains "$RELEASE_CONTENT" "latest=false" \
   "release.yml disables docker/metadata-action's implicit latest tag"
-assert_contains "$RELEASE_CONTENT" "charts/ferrite-sidecar/Chart.yaml" \
-  "release.yml updates the sidecar chart appVersion with the released Ferrite image"
+assert_not_contains "$RELEASE_CONTENT" "bump-chart" \
+  "release.yml no longer runs its own competing chart-only bump job"
+assert_not_contains "$RELEASE_CONTENT" "charts/ferrite" \
+  "release.yml does not touch chart files; version-sync.yml is the single workflow that does"
 assert_contains "$ORCHESTRATION_CONTENT" "charts/ferrite-sidecar/Chart.yaml" \
   "release-orchestration.yml updates the sidecar chart appVersion"
 
@@ -100,6 +102,8 @@ assert_contains "$VERSION_SYNC_CONTENT" "shasum -a 256" \
   "version-sync.yml computes the source checksum when not explicitly provided"
 assert_contains "$VERSION_SYNC_CONTENT" "charts/ferrite-sidecar/Chart.yaml" \
   "version-sync.yml keeps the sidecar appVersion synchronized"
+assert_contains "$VERSION_SYNC_CONTENT" "types: [ferrite-release, version-sync]" \
+  "version-sync.yml triggers on the real ferrite-release dispatch core emits, keeping version-sync for backward compatibility"
 for active_target in \
   docker-compose.quickstart.yml \
   docker-compose.yml \
@@ -143,6 +147,43 @@ else
   harness_fail "release workflow run scripts must receive GitHub expressions through step env"
 fi
 
+# version-sync.yml must be the workflow that reacts to the real
+# `ferrite-release` dispatch core emits (kept alongside `version-sync` only
+# for backward compatibility), and release.yml must no longer run a
+# competing job of its own that partially updates chart files.
+if command -v python3 >/dev/null 2>&1 &&
+  python3 -c "import yaml" >/dev/null 2>&1 &&
+  python3 - "$VERSION_SYNC_YML" "$RELEASE_YML" <<'TRIGGERCHECK'
+import sys
+import yaml
+
+version_sync_path, release_path = sys.argv[1:]
+
+with open(version_sync_path) as f:
+    version_sync_doc = yaml.safe_load(f)
+sync_types = version_sync_doc.get(True, {}).get("repository_dispatch", {}).get("types", [])
+if "ferrite-release" not in sync_types:
+    raise SystemExit(
+        "version-sync.yml must trigger on the real ferrite-release dispatch event core emits"
+    )
+if "version-sync" not in sync_types:
+    raise SystemExit(
+        "version-sync.yml should keep version-sync as a backward-compatible trigger"
+    )
+
+with open(release_path) as f:
+    release_doc = yaml.safe_load(f)
+if "bump-chart" in release_doc.get("jobs", {}):
+    raise SystemExit(
+        "release.yml must not define its own competing chart-only bump job"
+    )
+TRIGGERCHECK
+then
+  harness_ok "version-sync.yml is the sole ferrite-release chart/Dockerfile/pin sync workflow"
+else
+  harness_fail "release.yml and version-sync.yml disagree on which workflow owns the ferrite-release sync"
+fi
+
 # --- Static checks: ordinary CI/scan workflows retain pinned defaults -------
 for wf in ci.yml docker-scan.yml sbom.yml; do
   wf_path="${REPO_ROOT}/.github/workflows/${wf}"
@@ -180,7 +221,7 @@ EXTRACT_LOG="${EXTRACT_DIR}/extract.log"
 if ! python3 - "$RELEASE_YML" "$VERSION_SYNC_YML" "$ORCHESTRATION_YML" \
   "$EXTRACT_DIR/release_meta.sh" "$EXTRACT_DIR/version_sync_meta.sh" \
   "$EXTRACT_DIR/orchestration_meta.sh" "$EXTRACT_DIR/update_dockerfiles.sh" \
-  "$EXTRACT_DIR/release_chart.sh" "$EXTRACT_DIR/version_sync_chart.sh" \
+  "$EXTRACT_DIR/version_sync_chart.sh" \
   "$EXTRACT_DIR/orchestration_chart.sh" "$EXTRACT_DIR/metadata_tags.txt" \
   >"${EXTRACT_DIR}/extract.stdout" 2>"${EXTRACT_DIR}/extract.log" << 'PYEOF'
 import sys
@@ -194,7 +235,6 @@ import yaml
     version_sync_meta_out_path,
     orchestration_meta_out_path,
     sync_out_path,
-    release_chart_out_path,
     version_sync_chart_out_path,
     orchestration_chart_out_path,
     metadata_tags_out_path,
@@ -232,13 +272,13 @@ with open(metadata_tags_out_path, "w") as f:
 with open(release_out_path, "w") as f:
     f.write(script)
 
-release_chart_script = next(
-    s["run"]
-    for s in doc["jobs"]["bump-chart"]["steps"]
-    if s.get("name") == "Update Chart.yaml"
-)
-with open(release_chart_out_path, "w") as f:
-    f.write(release_chart_script)
+# release.yml intentionally no longer defines a chart-bumping job of its
+# own; version-sync.yml (extracted below) is the sole place that updates
+# chart files, as part of the same comprehensive active-release transaction.
+if "bump-chart" in doc["jobs"]:
+    raise SystemExit(
+        "release.yml must not reintroduce its own competing chart-only bump job"
+    )
 
 with open(version_sync_yml_path) as f:
     sync_doc = yaml.safe_load(f)
@@ -384,9 +424,16 @@ else
     "structural drift leaves canonical metadata unchanged"
 fi
 
-# Replay every chart release path. The primary package follows the core
-# release, while the sidecar package version remains independently versioned.
-for chart_path in release_chart orchestration_chart; do
+# Replay the remaining chart release path. version-sync.yml's comprehensive
+# active-release transaction (exercised above via SYNC_SCRIPT) is the sole
+# path that bumps the primary chart's package version; release-orchestration.yml
+# separately updates chart appVersions when manually dispatched, and the
+# primary package follows the core release while the sidecar package version
+# remains independently versioned.
+# shellcheck disable=SC2043  # single-element on purpose: release_chart was
+# removed when release.yml's competing chart-only bump job was removed; kept
+# as a loop so a future additional chart-update path is easy to add back.
+for chart_path in orchestration_chart; do
   CHART_DIR="${EXTRACT_DIR}/${chart_path}"
   mkdir -p "${CHART_DIR}/charts/ferrite" "${CHART_DIR}/charts/ferrite-sidecar"
   cp "${REPO_ROOT}/charts/ferrite/Chart.yaml" "${CHART_DIR}/charts/ferrite/Chart.yaml"
@@ -574,6 +621,54 @@ if [[ ! -e "$MALICIOUS_MARKER" ]]; then
   harness_ok "version-sync.yml treats command substitutions as inert input data"
 else
   harness_fail "version-sync.yml executed a command substitution from input data"
+fi
+
+# Functional replay of an actual `ferrite-release` payload end to end. Core's
+# release workflow dispatches event_type "ferrite-release" with
+# client_payload {version, sha256} (see
+# ferrite/.github/workflows/release.yml and release-full.yml). GitHub
+# Actions exposes client_payload the same way regardless of the dispatch's
+# custom event_type name, so this proves version-sync.yml both parses that
+# real payload shape and applies the full active-release transaction from
+# it — the scenario core actually triggers on every release.
+FERRITE_RELEASE_VERSION="9.9.9"
+FERRITE_RELEASE_SHA256="bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+if run_version_sync_meta "$FERRITE_RELEASE_VERSION" "$FERRITE_RELEASE_SHA256" \
+  "${EXTRACT_DIR}/ferrite_release_meta.out" \
+  >"${EXTRACT_DIR}/log_ferrite_release_meta.txt" 2>&1; then
+  META_OUT="$(cat "${EXTRACT_DIR}/ferrite_release_meta.out")"
+  assert_contains "$META_OUT" "version=${FERRITE_RELEASE_VERSION}" \
+    "version-sync.yml extracts the version from a ferrite-release dispatch payload"
+  assert_contains "$META_OUT" "sha256=${FERRITE_RELEASE_SHA256}" \
+    "version-sync.yml extracts the sha256 from a ferrite-release dispatch payload"
+
+  FERRITE_RELEASE_DIR="${EXTRACT_DIR}/ferrite-release-sync"
+  mkdir -p "$FERRITE_RELEASE_DIR"
+  copy_sync_targets "$FERRITE_RELEASE_DIR"
+  if (cd "$FERRITE_RELEASE_DIR" &&
+    VERSION="$FERRITE_RELEASE_VERSION" SHA256="$FERRITE_RELEASE_SHA256" bash -c "$SYNC_SCRIPT"); then
+    assert_contains "$(cat "${FERRITE_RELEASE_DIR}/active-release.env")" \
+      "FERRITE_VERSION=${FERRITE_RELEASE_VERSION}" \
+      "a ferrite-release dispatch payload updates canonical release version end to end"
+    assert_contains "$(cat "${FERRITE_RELEASE_DIR}/active-release.env")" \
+      "FERRITE_SOURCE_SHA256=${FERRITE_RELEASE_SHA256}" \
+      "a ferrite-release dispatch payload updates the canonical release checksum end to end"
+    assert_contains "$(cat "${FERRITE_RELEASE_DIR}/charts/ferrite/Chart.yaml")" \
+      "appVersion: \"${FERRITE_RELEASE_VERSION}\"" \
+      "a ferrite-release dispatch payload updates the primary chart end to end"
+    assert_contains "$(cat "${FERRITE_RELEASE_DIR}/charts/ferrite-sidecar/Chart.yaml")" \
+      "appVersion: \"${FERRITE_RELEASE_VERSION}\"" \
+      "a ferrite-release dispatch payload updates the sidecar chart appVersion end to end"
+    for dockerfile in Dockerfile Dockerfile.moonshot Dockerfile.playground; do
+      assert_contains "$(cat "${FERRITE_RELEASE_DIR}/${dockerfile}")" \
+        "ARG FERRITE_VERSION=${FERRITE_RELEASE_VERSION}" \
+        "a ferrite-release dispatch payload updates ${dockerfile} end to end"
+    done
+  else
+    harness_fail "ferrite-release payload functional replay of the active-release transaction unexpectedly failed"
+  fi
+else
+  harness_fail "version-sync.yml unexpectedly rejected a valid ferrite-release dispatch payload: $(cat "${EXTRACT_DIR}/log_ferrite_release_meta.txt")"
 fi
 
 run_orchestration_meta() {

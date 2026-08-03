@@ -1,11 +1,20 @@
 # Triggered by ferrite core repo after a version bump to sync versions
 # across Dockerfile, Helm chart, RPM spec, and other config files.
+#
+# `ferrite-release` is the real repository_dispatch event core's release
+# workflow emits (see ferrite/.github/workflows/release.yml and
+# release-full.yml). `version-sync` is kept as an additional trigger only for
+# backward compatibility with any external caller still using it directly;
+# this workflow is the single, comprehensive place that keeps
+# active-release.env, every Dockerfile, both Helm charts, Compose, GitOps,
+# Terraform, packaging, and the release workflow's own default in sync,
+# rather than any other workflow performing a partial, competing update.
 
 name: Version Sync
 
 on:
   repository_dispatch:
-    types: [version-sync]
+    types: [ferrite-release, version-sync]
   workflow_dispatch:
     inputs:
       version:

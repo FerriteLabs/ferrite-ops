@@ -50,6 +50,7 @@
 | F-39 | P1 | HTTP binary JSON | Invalid UTF-8 bulk replies expanded into a JSON number per byte and only hit the HTTP output cap after allocating the body. | Fixed; conversion reserves the output budget first and returns compact typed base64 data |
 | F-40 | P0 | Proxy session state | A timeout, oversized reply, parse error, or upstream I/O error dropped a stateful child connection and silently reconnected the public client on default SELECT/HELLO state. | Fixed; one bounded state-loss error is returned and the public client connection closes |
 | F-41 | P0 | Request memory | Declared bulk/array request sizes were only bounded per connection (up to 8 MiB) across as many as 64 simultaneous connections, and the 300-second idle timeout let a slow client hold a fully allocated buffer almost indefinitely, so worst-case unauthenticated request memory was hundreds of MiB. | Fixed; one global in-flight request-byte budget (4 MiB) is reserved from every declared bulk/array size before its payload buffer is allocated and held through backend execution and response delivery, per-client bulk/command size limits are reduced (256 KiB / 1 MiB), the idle wait for a new command is reduced to 20 seconds, and a new 5-second read deadline bounds completing an already-declared command so a slow/partial client cannot hold its reservation open indefinitely |
+| F-42 | P0 | Release integration | The canonical `version-sync.yml` only triggered on a `version-sync` repository_dispatch type that core never sends; core's actual release workflow dispatches `ferrite-release`, so the comprehensive sync never ran for a real release, while `release.yml` and `release-orchestration.yml` each independently opened a competing, chart-only version bump PR on that same real event. | Fixed; `version-sync.yml` now triggers on `ferrite-release` (keeping `version-sync` only for backward compatibility) and `release.yml`'s competing chart-only `bump-chart` job is removed, so one workflow updates `active-release.env`, all three Dockerfiles, both charts, Compose, GitOps, Terraform, packaging, and the release workflow's own dispatch default from the real release trigger |
 
 ## D-01 Resolution
 
@@ -87,16 +88,33 @@ Active operational defaults now agree on Ferrite v0.4.0:
 - release workflow dispatch default;
 - Moonshot Compose build arguments and source checksums.
 
-`version-sync.yml` prevalidates the canonical file and every active release pin, stages all replacements,
-validates the staged result, and only then replaces the working-tree targets. It updates all three
-Dockerfiles, both chart appVersions, Compose, production GitOps, Terraform defaults/examples, and the
-release workflow dispatch default together. `tests/test_release_workflows.sh` functionally replays both the
-successful full transaction and a structural-drift failure that leaves canonical metadata unchanged. Release
-metadata is normalized before Docker tag generation, so a stable `v0.4.0` dispatch publishes `0.4.0`, `0.4`, `0`, and
-`latest`; prereleases publish only their exact normalized tag.
+`version-sync.yml` triggers on the real `ferrite-release` repository_dispatch event core's release
+workflow emits (`ferrite/.github/workflows/release.yml` and `release-full.yml`), keeping `version-sync`
+only as a backward-compatible trigger for any external caller still using it directly. It prevalidates
+the canonical file and every active release pin, stages all replacements, validates the staged result,
+and only then replaces the working-tree targets. It updates all three Dockerfiles, both chart
+appVersions, Compose, production GitOps, Terraform defaults/examples, and the release workflow dispatch
+default together, as the single workflow responsible for that comprehensive transaction.
+`release.yml`'s previously competing `bump-chart` job — which partially updated only the two chart
+files on the same dispatch — is removed; `tests/test_release_workflows.sh` asserts release.yml no
+longer touches chart files and structurally guards against that job being reintroduced, and
+functionally replays a realistic `ferrite-release` `{version, sha256}` payload end to end through
+version-sync.yml's extraction and full active-release transaction. `tests/test_release_workflows.sh`
+also functionally replays both the successful full transaction and a structural-drift failure that
+leaves canonical metadata unchanged. Release metadata is normalized before Docker tag generation, so a
+stable `v0.4.0` dispatch publishes `0.4.0`, `0.4`, `0`, and `latest`; prereleases publish only their
+exact normalized tag.
 
-All chart-update release paths update the primary chart's package version/appVersion and the sidecar
+All remaining chart-update release paths — `version-sync.yml` and, when separately/manually dispatched,
+`release-orchestration.yml` — update the primary chart's package version/appVersion and the sidecar
 chart's appVersion. The sidecar chart package remains independently versioned.
+
+`release-orchestration.yml`'s own chart-update step still runs on the same `ferrite-release` dispatch
+as a broader cross-repo release-coordination workflow (it also notifies `homebrew-tap`, `ferrite-docs`,
+and SDK/IDE-extension repositories); it was intentionally left as-is for this fix, which scoped the
+"remove the competing chart-only bump job" requirement to `release.yml`. Eliminating that overlap too
+so `version-sync.yml` is the *only* place that ever touches chart files is recommended follow-up work
+(see the final report for this change).
 
 Release tag derivation additionally disables `docker/metadata-action`'s implicit `latest` flavor, and
 `tests/test_release_workflows.sh` resolves the tag template against each trigger's real derived
