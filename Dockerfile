@@ -109,32 +109,71 @@ RUN cargo build --release --bin ferrite --bin ferrite-cli
 # Verify the binaries were built
 RUN ls -lh /app/target/release/ferrite /app/target/release/ferrite-cli
 
-# Build stage: generate the container-specific runtime config from the
-# repository's packaged example (ferrite.example.toml) instead of copying
-# it verbatim. Containers only ever get reached through Docker's
-# published-port mapping into the container's network namespace; the
-# example's documented default of a loopback-only bind (127.0.0.1, correct
-# for local/native installs) never accepts that forwarded traffic, so a
-# container started from the unmodified example is unreachable on its
-# published ports. This stage is deliberately based on a minimal image with
-# no dependency on the (expensive) Rust build above, so it can be verified
-# quickly on its own via `docker build --target runtime-config`.
+# Build stage: generate the container-specific runtime config with the
+# exact freshly built `ferrite` binary from the `builder` stage above,
+# instead of packaging the repository's documented example
+# (ferrite.example.toml) into the image. Two independent problems this
+# fixes at once:
+#
+#   1. Reachability: containers are only ever reached through Docker's
+#      published-port mapping into the container's network namespace; a
+#      loopback-only bind (127.0.0.1, correct for local/native installs)
+#      never accepts that forwarded traffic.
+#   2. Loadability (F-17): the packaged ferrite.example.toml documents
+#      `max_memory = "1GB"` (a quoted string) and
+#      `eviction_policy = "noeviction"` — neither of which the real
+#      v0.3.0 binary's config parser actually accepts (it wants a raw
+#      byte count and the hyphenated "no-eviction"/omitted-default,
+#      respectively). Rather than special-case those values by hand
+#      (fragile, and drifts the moment the example or parser changes
+#      again), this stage asks the exact binary that will ship in the
+#      image to generate its own config via `ferrite init --minimal`,
+#      then only rewrites the bind addresses. The generated config is
+#      then verified by asking that same binary to load it
+#      (`ferrite --test-config`), so the build fails loudly rather than
+#      shipping a config the packaged binary can't actually start with.
 #
 # The public ferrite.example.toml file itself — its schema, defaults, and
-# documentation — is never modified; only this derived, container-local
-# copy is.
+# documentation — is never read or modified by this stage.
 FROM debian:bookworm-slim AS runtime-config
-COPY ferrite.example.toml /tmp/ferrite.example.toml
+
+# Only the runtime shared libraries the compiled binary needs to execute
+# at all (matches the final `runtime` stage below); no compilers or
+# headers. `ferrite init`/`--test-config` do not open a network connection
+# but the binary still dynamically links against these at process start.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    libssl3 \
+    && rm -rf /var/lib/apt/lists/*
+
+# The exact freshly built binary from this same build — not a separately
+# downloaded or previously published binary — so the generated/verified
+# config is guaranteed to match what actually ships in the final image.
+COPY --from=builder /app/target/release/ferrite /usr/local/bin/ferrite
+
 RUN mkdir -p /etc/ferrite \
-    && sed 's/^bind = "127\.0\.0\.1"$/bind = "0.0.0.0"/' \
-        /tmp/ferrite.example.toml > /etc/ferrite/ferrite.toml \
-    && rm -f /tmp/ferrite.example.toml \
-    # Build-time assertion: fail the build rather than ship an
+    # Generate a fresh config with the real binary's own generator
+    # (schema-guaranteed to match this exact binary's parser) instead of
+    # packaging the public example's values.
+    && /usr/local/bin/ferrite init --minimal --force \
+        -o /etc/ferrite/ferrite.toml -d /var/lib/ferrite/data \
+    # Rewrite both the [server] and [metrics] loopback-only binds to
+    # 0.0.0.0 so the container is reachable through Docker's
+    # published-port mapping.
+    && sed -i 's/^bind = "127\.0\.0\.1"$/bind = "0.0.0.0"/' \
+        /etc/ferrite/ferrite.toml \
+    # Build-time assertion #1: fail the build rather than ship an
     # unreachable container if the substitution above didn't take effect
-    # (e.g. the example's bind directive format changes upstream) or if
-    # both the [server] and [metrics] binds weren't both rewritten.
+    # (e.g. `ferrite init`'s output format changes) or if both the
+    # [server] and [metrics] binds weren't both rewritten.
     && test "$(grep -c '^bind = "0\.0\.0\.0"$' /etc/ferrite/ferrite.toml)" -eq 2 \
-    && ! grep -q '127\.0\.0\.1' /etc/ferrite/ferrite.toml
+    && ! grep -q '127\.0\.0\.1' /etc/ferrite/ferrite.toml \
+    # Build-time assertion #2 (resolves F-17): fail the build rather than
+    # ship a config the packaged binary can't actually load. This runs the
+    # exact binary that will be copied into the final image against the
+    # exact config that will be copied into the final image.
+    && /usr/local/bin/ferrite --test-config --config /etc/ferrite/ferrite.toml \
+        --data-dir /var/lib/ferrite/data
 
 # Runtime stage: Minimal image
 #
@@ -179,9 +218,14 @@ WORKDIR /app
 COPY --from=builder /app/target/release/ferrite /usr/local/bin/ferrite
 COPY --from=builder /app/target/release/ferrite-cli /usr/local/bin/ferrite-cli
 
-# Copy the container-specific runtime config generated above (see the
-# runtime-config stage comment). This is derived from, but distinct from,
-# the repository's own ferrite.example.toml, which is never modified.
+# Copy the container-specific runtime config generated and verified above
+# (see the runtime-config stage comment) with the exact freshly built
+# binary via `ferrite init --minimal`, then bind-transformed and
+# `--test-config`-checked with that same binary. This is baked into the
+# image as its default CMD config below — no volume mount or config
+# substitution is required for the image to start successfully. The
+# repository's own ferrite.example.toml is never read or modified by this
+# stage.
 COPY --from=runtime-config --chown=ferrite:ferrite /etc/ferrite/ferrite.toml /etc/ferrite/ferrite.toml
 
 # Switch to non-root user

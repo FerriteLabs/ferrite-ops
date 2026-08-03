@@ -115,6 +115,21 @@ assert_contains "$CONTENT" "COPY --from=runtime-config" \
 assert_not_contains "$CONTENT" 'COPY --chown=ferrite:ferrite ferrite.example.toml /etc/ferrite/ferrite.toml' \
   "final runtime stage no longer copies the public example verbatim as the container default"
 
+# 10b. F-17/D-03: the runtime config must be generated and self-verified by
+#      the exact freshly built binary (never read from ferrite.example.toml,
+#      whose max_memory/eviction_policy values the real v0.3.0 parser
+#      rejects), so the image starts successfully with zero mounted or
+#      substituted config.
+RUNTIME_CONFIG_STAGE_BODY="$(sed -n '/^FROM debian:bookworm-slim AS runtime-config$/,/^FROM debian:bookworm-slim AS runtime$/p' "$DOCKERFILE")"
+assert_contains "$RUNTIME_CONFIG_STAGE_BODY" "COPY --from=builder" \
+  "runtime-config stage copies the exact freshly built binary from the builder stage (not a separately fetched/published binary)"
+assert_contains "$RUNTIME_CONFIG_STAGE_BODY" "ferrite init --minimal" \
+  "runtime-config stage generates the baked-in config with the real binary's own \`ferrite init --minimal\`"
+assert_contains "$RUNTIME_CONFIG_STAGE_BODY" "ferrite --test-config" \
+  "runtime-config stage asserts the resulting config actually loads, using the exact freshly built binary (resolves F-17)"
+assert_not_contains "$RUNTIME_CONFIG_STAGE_BODY" "ferrite.example.toml" \
+  "runtime-config stage does not read the public ferrite.example.toml at all (F-17/D-03 resolved without editing it)"
+
 # The public example file's own default (127.0.0.1, correct for local/native
 # installs) must remain unmodified by this audit's container-reachability fix.
 EXAMPLE_TOML="${REPO_ROOT}/ferrite.example.toml"
