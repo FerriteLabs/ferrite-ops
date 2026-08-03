@@ -116,6 +116,31 @@ assert_contains "$HTTP_SET" '"data":"OK"' "HTTP execute returns Ferrite's real R
 RESP_GET="$(resp_cmd 127.0.0.1 "$RESP_PORT" GET from-http 2>/dev/null || true)"
 assert_eq "visible-over-resp" "$RESP_GET" "data written through HTTP is visible through public RESP"
 
+# --- RESP3 compatibility ------------------------------------------------------
+# Clients may negotiate RESP3 with HELLO 3 on the public port; the launcher's
+# proxy must decode and forward RESP3 replies unchanged rather than breaking
+# the connection.
+resp3_session() {
+  local host="$1" port="$2" fd line output=""
+  exec {fd}<>"/dev/tcp/${host}/${port}" || return 1
+  {
+    printf '*2\r\n$5\r\nHELLO\r\n$1\r\n3\r\n'
+    printf '*3\r\n$3\r\nSET\r\n$9\r\nresp3-key\r\n$10\r\nresp3-val!\r\n'
+    printf '*2\r\n$3\r\nGET\r\n$9\r\nresp3-key\r\n'
+  } >&"${fd}"
+  while IFS= read -r -t 5 line <&"${fd}"; do
+    output+="${line}"$'\n'
+    [[ "$line" == *"resp3-val!"* ]] && break
+  done
+  exec {fd}<&-
+  printf '%s' "$output"
+}
+
+RESP3_OUTPUT="$(resp3_session 127.0.0.1 "$RESP_PORT" 2>/dev/null | tr -d '\r' || true)"
+assert_contains "$RESP3_OUTPUT" "proto" "HELLO 3 is forwarded and its RESP3 map reply reaches the client"
+assert_contains "$RESP3_OUTPUT" "resp3-val!" "ordinary commands still work after a RESP3 handshake"
+assert_not_contains "$RESP3_OUTPUT" "playground backend error" "RESP3 replies do not break the proxy"
+
 # --- Bounded key detail ------------------------------------------------------
 # A list far larger than one page must return a bounded page plus honest
 # total/truncation metadata rather than the whole collection.

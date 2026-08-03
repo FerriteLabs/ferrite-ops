@@ -37,6 +37,7 @@
 | F-26 | P1 | Response bounds | Replies were bounded per bulk string and per array element only, so many individually small elements could still be buffered without limit. | Fixed; one cumulative `ResponseBudget` bounds each whole reply and the unbudgeted decode path was removed |
 | F-27 | P1 | Key inspection bounds | Key detail issued `LRANGE 0 -1`, `SMEMBERS`, `HGETALL`, `ZRANGE 0 -1`, and a whole-value `GET`. | Fixed; every type is read as a bounded range, bounded `COUNT`, or validated cursor scan that reports total/returned/limit/truncated/cursor |
 | F-28 | P2 | Release tags | `docker/metadata-action` could still add its implicit `latest` tag outside the explicit stable gate. | Fixed; `latest=false` plus functional per-trigger assertions on the effective published tag set |
+| F-30 | P1 | Playground RESP3 | The launcher's decoder understood RESP2 only, so a client that negotiated RESP3 with `HELLO 3` on the public port broke on the first map/set/double reply. | Fixed; every RESP3 type is decoded, re-encoded byte-for-byte, and converted to JSON |
 | F-29 | P2 | Sidecar image | `sidecar.image.tag` defaulted to the floating `latest`, so a synchronized chart appVersion did not move the injected Ferrite image. | Fixed; the default is empty and the helper falls back to `.Chart.AppVersion` |
 
 ## D-01 Resolution
@@ -117,7 +118,9 @@ Lifecycle and administrative safety:
 - `/api/execute` applies the identical policy and answers `403` for refused commands;
 - any Ferrite child exit that the launcher did not initiate is an error, including `exit(0)`;
 - the proxy bounds request line length, per-argument and total request size, argument count,
-  concurrent connections, and client idle time.
+  concurrent connections, and client idle time;
+- RESP2 and RESP3 are both preserved: `HELLO 3` and every RESP3 reply type (`_`, `#`, `,`, `(`,
+  `!`, `=`, `%`, `~`, `>`) are decoded, charged to the response budget, and re-encoded unchanged.
 
 Response and resource bounds:
 
@@ -133,13 +136,17 @@ Response and resource bounds:
 
 ## Runtime Verification Completed
 
-- 45 `playground-launcher` unit tests pass (`cargo test`), run from `tests/run.sh` via
+- 49 `playground-launcher` unit tests pass (`cargo test`), run from `tests/run.sh` via
   `tests/test_playground_launcher_unit.sh` and from a dedicated CI job.
 - The exact Playground image build, start, and probe suite passes: `SHUTDOWN` is refused with `403`
   over HTTP and with a policy error on the public RESP port, the container stays up, `SET`/`GET`
   keep working on both paths, the child is confirmed to run with `--bind 127.0.0.1 --port 6380`,
   bounded key detail returns honest totals/truncation/cursors, an invalid cursor returns `400`, and
-  `docker stop` still exits `0` with no leaked process.
+  `docker stop` still exits `0` with no leaked process. A `HELLO 3` session on the public port
+  returns the real RESP3 map and keeps serving ordinary commands.
+- The exact primary image builds and reports `ferrite 0.4.0` / `ferrite-cli 0.4.0`; the exact
+  Moonshot image builds with `FERRITE_COMPILED_FEATURES=forge-runtime`, answers `PONG`, and serves
+  `FN.HELP`.
 - Moonshot default Compose build produced `ferrite:moonshot`; the service became healthy, reported
   `ferrite 0.4.0`, exposed `FERRITE_COMPILED_FEATURES=forge-runtime`, returned `PONG`, and served `FN.HELP`.
 - Playground default image produced `ferritelabs/playground:test`; `/api/health` verified RESP with `PING`

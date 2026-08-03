@@ -68,6 +68,11 @@ impl Default for ResponseBudget {
     }
 }
 
+/// A decoded RESP2 or RESP3 value.
+///
+/// Clients may negotiate RESP3 with `HELLO 3` on the public port, so every
+/// RESP3 reply type is decoded and re-encoded byte-for-byte. Numeric types
+/// keep their original text so re-encoding never reformats a value.
 #[derive(Debug, PartialEq, Clone)]
 pub enum RespValue {
     Simple(String),
@@ -75,6 +80,24 @@ pub enum RespValue {
     Integer(i64),
     Bulk(Option<Vec<u8>>),
     Array(Option<Vec<RespValue>>),
+    /// RESP3 `_` null.
+    Null,
+    /// RESP3 `#` boolean.
+    Boolean(bool),
+    /// RESP3 `,` double, kept as its original text.
+    Double(String),
+    /// RESP3 `(` big number, kept as its original text.
+    BigNumber(String),
+    /// RESP3 `!` blob error.
+    BlobError(Vec<u8>),
+    /// RESP3 `=` verbatim string, including its `txt:`/`mkd:` prefix.
+    Verbatim(Vec<u8>),
+    /// RESP3 `%` map.
+    Map(Vec<(RespValue, RespValue)>),
+    /// RESP3 `~` set.
+    Set(Vec<RespValue>),
+    /// RESP3 `>` out-of-band push.
+    Push(Vec<RespValue>),
 }
 
 /// Encode an argv-style command as a RESP array of bulk strings.
@@ -115,6 +138,45 @@ pub fn encode_value(value: &RespValue, out: &mut Vec<u8>) {
         RespValue::Array(None) => out.extend_from_slice(b"*-1\r\n"),
         RespValue::Array(Some(values)) => {
             out.extend_from_slice(format!("*{}\r\n", values.len()).as_bytes());
+            for value in values {
+                encode_value(value, out);
+            }
+        }
+        RespValue::Null => out.extend_from_slice(b"_\r\n"),
+        RespValue::Boolean(value) => {
+            out.extend_from_slice(if *value { b"#t\r\n" } else { b"#f\r\n" })
+        }
+        RespValue::Double(value) => {
+            out.extend_from_slice(format!(",{value}\r\n").as_bytes());
+        }
+        RespValue::BigNumber(value) => {
+            out.extend_from_slice(format!("({value}\r\n").as_bytes());
+        }
+        RespValue::BlobError(data) => {
+            out.extend_from_slice(format!("!{}\r\n", data.len()).as_bytes());
+            out.extend_from_slice(data);
+            out.extend_from_slice(b"\r\n");
+        }
+        RespValue::Verbatim(data) => {
+            out.extend_from_slice(format!("={}\r\n", data.len()).as_bytes());
+            out.extend_from_slice(data);
+            out.extend_from_slice(b"\r\n");
+        }
+        RespValue::Map(entries) => {
+            out.extend_from_slice(format!("%{}\r\n", entries.len()).as_bytes());
+            for (key, value) in entries {
+                encode_value(key, out);
+                encode_value(value, out);
+            }
+        }
+        RespValue::Set(values) => {
+            out.extend_from_slice(format!("~{}\r\n", values.len()).as_bytes());
+            for value in values {
+                encode_value(value, out);
+            }
+        }
+        RespValue::Push(values) => {
+            out.extend_from_slice(format!(">{}\r\n", values.len()).as_bytes());
             for value in values {
                 encode_value(value, out);
             }
@@ -205,9 +267,72 @@ where
                 }
                 Ok(RespValue::Array(Some(values)))
             }
+            b'_' => Ok(RespValue::Null),
+            b'#' => match payload {
+                b"t" => Ok(RespValue::Boolean(true)),
+                b"f" => Ok(RespValue::Boolean(false)),
+                _ => Err("invalid RESP boolean value".to_string()),
+            },
+            b',' => Ok(RespValue::Double(parse_text(payload, "double")?)),
+            b'(' => Ok(RespValue::BigNumber(parse_text(payload, "big number")?)),
+            b'!' | b'=' => {
+                let length = parse_number(payload, "blob length")?;
+                if length < 0 || length as usize > MAX_RESP_BULK_LENGTH {
+                    return Err(format!("invalid RESP blob length: {length}"));
+                }
+                budget.consume(length as usize + 2)?;
+                let mut data = vec![0; length as usize + 2];
+                reader
+                    .read_exact(&mut data)
+                    .await
+                    .map_err(|error| format!("failed to read RESP blob data: {error}"))?;
+                if !data.ends_with(b"\r\n") {
+                    return Err("RESP blob data did not end with CRLF".to_string());
+                }
+                data.truncate(length as usize);
+                if prefix == b'!' {
+                    Ok(RespValue::BlobError(data))
+                } else {
+                    Ok(RespValue::Verbatim(data))
+                }
+            }
+            b'%' => {
+                let length = parse_number(payload, "map length")?;
+                if length < 0 || length as usize > MAX_RESP_ARRAY_LENGTH {
+                    return Err(format!("invalid RESP map length: {length}"));
+                }
+                let mut entries = Vec::with_capacity(std::cmp::min(length as usize, 1024));
+                for _ in 0..length {
+                    let key = read_value_budgeted(reader, depth + 1, budget).await?;
+                    let value = read_value_budgeted(reader, depth + 1, budget).await?;
+                    entries.push((key, value));
+                }
+                Ok(RespValue::Map(entries))
+            }
+            b'~' | b'>' => {
+                let length = parse_number(payload, "aggregate length")?;
+                if length < 0 || length as usize > MAX_RESP_ARRAY_LENGTH {
+                    return Err(format!("invalid RESP aggregate length: {length}"));
+                }
+                let mut values = Vec::with_capacity(std::cmp::min(length as usize, 1024));
+                for _ in 0..length {
+                    values.push(read_value_budgeted(reader, depth + 1, budget).await?);
+                }
+                if prefix == b'~' {
+                    Ok(RespValue::Set(values))
+                } else {
+                    Ok(RespValue::Push(values))
+                }
+            }
             _ => Err(format!("unsupported RESP response prefix: {prefix:#x}")),
         }
     })
+}
+
+fn parse_text(payload: &[u8], field: &str) -> Result<String, String> {
+    std::str::from_utf8(payload)
+        .map(|value| value.to_string())
+        .map_err(|_| format!("RESP {field} was not valid UTF-8"))
 }
 
 fn parse_number(payload: &[u8], field: &str) -> Result<i64, String> {
@@ -282,17 +407,48 @@ pub fn to_json(value: RespValue) -> Result<Value, String> {
                     .collect(),
             )),
         },
-        RespValue::Array(Some(values)) => values
+        RespValue::Array(Some(values)) | RespValue::Set(values) | RespValue::Push(values) => values
             .into_iter()
             .map(to_json)
             .collect::<Result<Vec<_>, _>>()
             .map(Value::Array),
+        RespValue::Null => Ok(Value::Null),
+        RespValue::Boolean(value) => Ok(json!(value)),
+        RespValue::Double(value) => Ok(match value.parse::<f64>() {
+            Ok(parsed) if parsed.is_finite() => json!(parsed),
+            // inf/-inf/nan have no JSON number representation.
+            _ => Value::String(value),
+        }),
+        RespValue::BigNumber(value) => Ok(Value::String(value)),
+        RespValue::BlobError(error) => Err(String::from_utf8_lossy(&error).into_owned()),
+        RespValue::Verbatim(data) => {
+            let text = String::from_utf8_lossy(&data).into_owned();
+            // Verbatim strings are `<3-char format>:<content>`.
+            Ok(Value::String(match text.get(3..4) {
+                Some(":") => text[4..].to_string(),
+                _ => text,
+            }))
+        }
+        RespValue::Map(entries) => {
+            let mut object = serde_json::Map::with_capacity(entries.len());
+            for (key, value) in entries {
+                let key = match to_json(key)? {
+                    Value::String(key) => key,
+                    other => other.to_string(),
+                };
+                object.insert(key, to_json(value)?);
+            }
+            Ok(Value::Object(object))
+        }
     }
 }
 
 pub fn as_string(value: RespValue, command: &str) -> Result<String, String> {
     match value {
         RespValue::Simple(value) => Ok(value),
+        RespValue::Verbatim(value) => {
+            String::from_utf8(value).map_err(|_| format!("{command} returned a non-UTF-8 string"))
+        }
         RespValue::Bulk(Some(value)) => {
             String::from_utf8(value).map_err(|_| format!("{command} returned a non-UTF-8 string"))
         }
@@ -433,6 +589,67 @@ mod tests {
         .await
         .unwrap();
         assert!(matches!(value, RespValue::Bulk(Some(ref data)) if data.len() == 512));
+    }
+
+    #[tokio::test]
+    async fn decodes_and_re_encodes_resp3_replies_byte_for_byte() {
+        // A HELLO 3 style map reply plus the remaining RESP3 types.
+        let input: &[u8] =
+            b"%3\r\n$5\r\nproto\r\n:3\r\n$4\r\nbool\r\n#t\r\n$3\r\nagg\r\n~2\r\n,3.25\r\n_\r\n";
+        let mut reader = BufReader::new(input);
+        let value = read_value_budgeted(&mut reader, 0, &mut ResponseBudget::default())
+            .await
+            .unwrap();
+
+        let mut out = Vec::new();
+        encode_value(&value, &mut out);
+        assert_eq!(out, input, "RESP3 replies must be forwarded unchanged");
+
+        assert_eq!(
+            to_json(value).unwrap(),
+            json!({ "proto": 3, "bool": true, "agg": [3.25, null] })
+        );
+    }
+
+    #[tokio::test]
+    async fn decodes_resp3_verbatim_big_number_and_push_types() {
+        let input: &[u8] = b">2\r\n=8\r\ntxt:done\r\n(12345678901234567890\r\n";
+        let mut reader = BufReader::new(input);
+        let value = read_value_budgeted(&mut reader, 0, &mut ResponseBudget::default())
+            .await
+            .unwrap();
+
+        let mut out = Vec::new();
+        encode_value(&value, &mut out);
+        assert_eq!(out, input);
+        assert_eq!(
+            to_json(value).unwrap(),
+            json!(["done", "12345678901234567890"])
+        );
+    }
+
+    #[tokio::test]
+    async fn resp3_blob_errors_surface_as_errors() {
+        let input: &[u8] = b"!11\r\nERR failure\r\n";
+        let mut reader = BufReader::new(input);
+        let value = read_value_budgeted(&mut reader, 0, &mut ResponseBudget::default())
+            .await
+            .unwrap();
+        assert_eq!(to_json(value).unwrap_err(), "ERR failure");
+    }
+
+    #[tokio::test]
+    async fn resp3_replies_are_charged_to_the_response_budget() {
+        let mut input = b"~40\r\n".to_vec();
+        for _ in 0..40 {
+            input.extend_from_slice(b"$8\r\nabcdefgh\r\n");
+        }
+        let mut reader = BufReader::new(&input[..]);
+        let mut budget = ResponseBudget::new(150);
+        assert!(read_value_budgeted(&mut reader, 0, &mut budget)
+            .await
+            .unwrap_err()
+            .contains("response budget"));
     }
 
     #[test]

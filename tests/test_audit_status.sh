@@ -10,7 +10,7 @@ source "${HERE}/lib/harness.sh"
 
 assert_contains "$AUDIT_CONTENT" "| F-18 |" "AUDIT.md records the Moonshot finding"
 assert_contains "$AUDIT_CONTENT" "| F-19 |" "AUDIT.md records the Playground finding"
-for finding in F-20 F-21 F-22 F-23 F-24 F-25 F-26 F-27 F-28 F-29; do
+for finding in F-20 F-21 F-22 F-23 F-24 F-25 F-26 F-27 F-28 F-29 F-30; do
   assert_contains "$AUDIT_CONTENT" "| ${finding} |" \
     "AUDIT.md records final-review finding ${finding} as fixed"
 done
