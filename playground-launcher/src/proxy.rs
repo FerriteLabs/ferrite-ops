@@ -13,7 +13,7 @@ use std::time::Duration;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{oneshot, OwnedSemaphorePermit, Semaphore};
-use tokio::time::{sleep, timeout};
+use tokio::time::timeout;
 
 use crate::policy;
 use crate::resp::{self, RespValue, MAX_ARGUMENTS};
@@ -386,6 +386,7 @@ mod tests {
     use super::*;
     use crate::testing::MockFerrite;
     use tokio::io::{duplex, BufReader as IoBufReader};
+    use tokio::time::sleep;
 
     async fn decode(input: &[u8]) -> Result<Request, String> {
         let mut reader = IoBufReader::new(input);

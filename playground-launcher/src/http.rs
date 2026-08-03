@@ -695,7 +695,7 @@ mod tests {
         assert!(body["data"]["data"].is_string());
         assert_eq!(
             body["data"]["data"].as_str().unwrap().len(),
-            ((binary.len() + 2) / 3) * 4
+            binary.len().div_ceil(3) * 4
         );
         assert!(
             body["data"].as_array().is_none(),
@@ -741,7 +741,7 @@ mod tests {
             version: "test".into(),
             backend_permits: Arc::new(Semaphore::new(32)),
         };
-        let expected_base64_length = ((binary.len() + 2) / 3) * 4;
+        let expected_base64_length = binary.len().div_ceil(3) * 4;
         let mut requests = tokio::task::JoinSet::new();
 
         for _ in 0..16 {

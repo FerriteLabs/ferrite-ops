@@ -489,6 +489,7 @@ pub fn to_json_with_budget(value: RespValue, byte_limit: usize) -> Result<Value,
 /// HTTP handlers must use [`to_json_with_budget`] with their smaller response
 /// budget. Keeping this convenience API bounded prevents other callers from
 /// accidentally expanding a binary bulk string into an unbounded JSON value.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn to_json(value: RespValue) -> Result<Value, String> {
     to_json_with_budget(value, MAX_RESPONSE_BYTES)
 }
