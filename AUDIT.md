@@ -28,8 +28,8 @@
 | F-17 | P2 | Runtime config | The documented example was not guaranteed to load in the packaged binary. | Fixed; images generate and validate their own runtime config with the exact built binary |
 | F-18 | P0 | Moonshot Compose | Default Compose depended on `../ferrite`, omitted explicit release metadata, and could silently build ordinary default features. | Fixed; context is this repository, v0.4.0 version/checksum are explicit, and `forge-runtime` is the Dockerfile and Compose default |
 | F-19 | P0 | Playground | The image exposed port 8080 but only started RESP; Studio environment variables were unused and health checked the wrong service. | Fixed; the repository-owned launcher serves an interactive HTTP playground backed by the spawned Ferrite RESP server |
-| F-20 | P0 | Playground API | The launcher depended on placeholder `ferrite-studio::StudioApi` responses rather than the running Ferrite server. | Fixed; `/api/health`, `/api/execute`, and `/api/keys/detail/{key}` use a real internal RESP client against `127.0.0.1:6379` |
-| F-21 | P1 | Playground shutdown | Shutdown used Tokio's immediate child kill instead of forwarding SIGTERM and escalating only after a grace period. | Fixed; SIGINT/SIGTERM forwards SIGTERM, waits up to 10 seconds, then uses SIGKILL only as escalation and reaps the child |
+| F-20 | P0 | Playground API | The launcher depended on placeholder `ferrite-studio::StudioApi` responses rather than the running Ferrite server. | Fixed; `/api/health`, `/api/execute`, and `/api/keys/detail/{key}` use a real internal RESP client against `127.0.0.1:6380` |
+| F-21 | P1 | Playground shutdown | Shutdown used Tokio's immediate child kill instead of forwarding SIGTERM and escalating only after a grace period. | Fixed; SIGINT/SIGTERM forwards SIGTERM, allows five seconds of child grace, bounds SIGKILL/task reaping, and joins HTTP/RESP services in parallel within a seven-second total internal budget |
 | F-22 | P1 | Release tags | Dispatch releases could publish only the raw `v`-prefixed input because Docker metadata ran before normalized release metadata. | Fixed; normalized metadata is derived first and stable releases publish exact, major.minor, major, and latest tags |
 | F-23 | P1 | Version sync | Release workflows updated the primary chart but could leave the sidecar chart on an old Ferrite image appVersion. | Fixed; every release path updates the sidecar appVersion without changing its independently versioned chart package |
 | F-24 | P0 | Playground lifecycle | The Ferrite child owned the public `0.0.0.0:6379` port, so any unauthenticated client could `SHUTDOWN`, `CONFIG`, `DEBUG`, `MODULE`, `ACL`, `SAVE`, `BGSAVE`, `BGREWRITEAOF`, or `REPLICAOF` the shared instance, and its clean `exit(0)` was treated as success. | Fixed; the child binds `127.0.0.1:6380` only, the launcher owns the public RESP port behind one shared command policy, and any unsolicited child exit is an error |
@@ -39,7 +39,7 @@
 | F-28 | P2 | Release tags | `docker/metadata-action` could still add its implicit `latest` tag outside the explicit stable gate. | Fixed; `latest=false` plus functional per-trigger assertions on the effective published tag set |
 | F-30 | P1 | Playground RESP3 | The launcher's decoder understood RESP2 only, so a client that negotiated RESP3 with `HELLO 3` on the public port broke on the first map/set/double reply. | Fixed; every RESP3 type is decoded, re-encoded byte-for-byte, and converted to JSON |
 | F-29 | P2 | Sidecar image | `sidecar.image.tag` defaulted to the floating `latest`, so a synchronized chart appVersion did not move the injected Ferrite image. | Fixed; the default is empty and the helper falls back to `.Chart.AppVersion` |
-| F-31 | P0 | Playground command policy | Ferrite v0.4.0 dotted and root/subcommand forms such as `MIGRATE.START` could bypass an exact-name-only denylist, and outward/topology/code-execution families were incomplete. | Fixed; one delimiter-aware argv policy covers exact roots and dotted descendants consistently over HTTP and RESP |
+| F-31 | P0 | Playground command policy | Ferrite v0.4.0 dotted and root/subcommand forms such as `MIGRATE.START` could bypass an exact-name-only denylist, and outward/topology/code-execution families were incomplete. | Fixed; one explicit allowlist defaults every unknown command to rejection and applies identical normalized, argument-aware bounds over HTTP and RESP |
 | F-32 | P1 | Playground decoded memory | Wire bytes bounded payload data but did not bound decoded RESP node/element overhead, and aggregate declarations allowed up to one million elements. | Fixed; independent decoded-node/element budgets are charged before allocation, aggregate size is 4,096, and re-encoding has a hard output ceiling |
 | F-33 | P1 | Playground concurrency | HTTP and RESP could independently create backend work without one total operation limit. | Fixed; one launcher-owned 32-permit semaphore is shared by public RESP and HTTP execute/key-detail/health, with non-blocking overload responses |
 | F-34 | P1 | Playground task lifecycle | A service `JoinHandle` selected after completion was polled again during common cleanup, which can panic and hide the original exit error. | Fixed; optional handles are taken exactly once, timeout aborts are reaped, and selected errors are preserved |
@@ -63,7 +63,8 @@ Playground additionally:
 - serves a minimal interactive page and JSON API on `0.0.0.0:8080`;
 - runs the Ferrite child on the internal loopback address `127.0.0.1:6380` only and serves the
   public Redis-compatible `0.0.0.0:6379` port from the launcher's own policy-enforcing RESP proxy;
-- forwards SIGTERM and waits up to ten seconds before SIGKILL escalation, then reaps the child;
+- forwards SIGTERM, allows five seconds of child grace, bounds post-SIGKILL reaping, and joins the
+  HTTP/RESP services concurrently so the total internal shutdown budget remains seven seconds;
 - removes reliance on unused `FERRITE_STUDIO_*` variables;
 - probes the real RESP-backed endpoint at `/api/health`.
 
@@ -110,16 +111,16 @@ Lifecycle and administrative safety:
 - the Ferrite child is spawned with `--bind 127.0.0.1 --port 6380` and is never publicly reachable;
 - the launcher owns `0.0.0.0:6379`, decodes RESP array and inline commands, classifies each one, and
   forwards only approved commands to the child, re-encoding the real reply byte-for-byte;
-- `policy` rejects at minimum `SHUTDOWN`, `DEBUG`, `MODULE`, `ACL`, `CONFIG`, `SAVE`, `BGSAVE`,
-  `BGREWRITEAOF`, `REPLICAOF`, and `SLAVEOF`, plus the Ferrite v0.4.0 privileged, outward-facing,
-  topology-changing, and arbitrary-code families. Matching is case-insensitive and delimiter-aware:
-  a family blocks both `FAMILY SUBCOMMAND` and exact `FAMILY.*` descendants without loosely blocking
-  names such as `FAMILYX`. This includes `MIGRATE.*`, `MULTICLOUD.*`, `S3.*`, `CLOUD.*`,
-  `FEDERATION.*`, `REPLICATE.*`, cluster/replication lifecycle, WASM/Forge/FAAS/function execution,
-  triggers, pipelines, marketplace installs, chaos/scaling/edge/proxy/protocol management, and
-  configuration/admin mutation. Commands that cannot return one bounded reply (`SUBSCRIBE` family,
-  blocking `B*` commands, `WAIT`/`WAITAOF`, or `XREAD* ... BLOCK`) and whole-dataset enumeration/sort
-  commands are refused with a distinct, non-security message;
+- `policy` is an explicit public allowlist rather than a denylist. It permits health/introspection and
+  bounded Redis-compatible string, hash, list, set, sorted-set, stream, bit, HyperLogLog, key, and
+  expiry operations; every other command is rejected before forwarding. This default rejection covers
+  `PLUGIN`, `AUDIT`, every Ferrite-native external/admin/execution family, and both root/subcommand and
+  dotted spellings such as `MIGRATE START` and `MIGRATE.START`;
+- argument-aware policy validation requires list/sorted-set windows of at most 100 elements,
+  `XRANGE`/`XREVRANGE` and every scan form to carry `COUNT 1..100`, rejects blocking stream reads and
+  duplicate `COUNT` bypasses, limits multi-key/field/member operations to 32 items, and refuses
+  whole-dataset forms including `HGETALL`, `HKEYS`, `HVALS`, and `SMEMBERS`. Redis keys and values
+  remain binary-safe because only policy-relevant views are normalized;
 - ordinary Redis-compatible commands and the public port are preserved: a rejection does not close
   the connection and subsequent `SET`/`GET` succeed;
 - `/api/execute` applies the identical policy and answers `403` for refused commands;
@@ -152,14 +153,14 @@ Response and resource bounds:
 
 ## Runtime Verification Completed
 
-- 61 `playground-launcher` unit tests pass (`cargo test`), run from `tests/run.sh` via
+- 63 `playground-launcher` unit tests pass (`cargo test`), run from `tests/run.sh` via
   `tests/test_playground_launcher_unit.sh` and from a dedicated CI job.
-- The exact Playground image build, start, and probe suite passes: `SHUTDOWN` is refused with `403`
-  over HTTP and with a policy error on the public RESP port, the container stays up, `SET`/`GET`
-  keep working on both paths, the child is confirmed to run with `--bind 127.0.0.1 --port 6380`,
-  bounded key detail returns honest totals/truncation/cursors, an invalid cursor returns `400`, and
-  `docker stop` still exits `0` with no leaked process. A `HELLO 3` session on the public port
-  returns the real RESP3 map and keeps serving ordinary commands.
+- The exact Playground image build, start, and probe suite passes: `SHUTDOWN`, `PLUGIN`, `AUDIT`,
+  `MIGRATE.START`, unbounded `LRANGE`, and `XRANGE` without `COUNT` are refused over both HTTP and
+  RESP before forwarding; bounded basics continue to work; the child is confirmed to run with
+  `--bind 127.0.0.1 --port 6380`; bounded key detail returns honest totals/truncation/cursors; and an
+  invalid cursor returns `400`. A `HELLO 3` session returns the real RESP3 map and keeps serving
+  ordinary commands.
 - The exact primary image builds and reports `ferrite 0.4.0` / `ferrite-cli 0.4.0`; the exact
   Moonshot image builds with `FERRITE_COMPILED_FEATURES=forge-runtime`, answers `PONG`, and serves
   `FN.HELP`.
@@ -169,8 +170,9 @@ Response and resource bounds:
   and returned v0.4.0 over a random published 8080 port.
 - Bidirectional runtime tests proved RESP writes are visible through HTTP key detail and HTTP command writes
   are visible through the public RESP port.
-- Playground process inspection showed the launcher supervising the Ferrite child; `docker stop` completed
-  within the timeout, the container exited with code 0, and no child/container process leaked.
+- Playground process inspection showed the launcher supervising the Ferrite child; plain `docker stop`
+  (without a timeout override) completed before Docker's default SIGKILL deadline, the container exited
+  with code 0, and no child/container process leaked.
 - The v0.4.0 source-stage checksum verification succeeded against the authoritative tarball.
 
 ## Deferred Items
