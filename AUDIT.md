@@ -589,6 +589,24 @@ which would incorrectly skip a legitimate backport to an older series.
   exact 1.9.1-after-2.0.0 backport scenario, proving `latest` is skipped while `1` and `1.9` still advance.
   `tests/test_release_workflows.sh` is updated throughout for the candidate-tag build target.
 
+## Final Verification Pass (trusted supersession, exact-image immutability, strict SemVer, independent floating tags)
+
+- `bash tests/run.sh` passes all 29/29 discovered suites, including the new `test_exact_image_immutability.sh`
+  and the rewritten `test_release_promotion.sh`, `test_release_workflows.sh`, `test_version_sync_ordering.sh`,
+  `test_ops_release_tag_workflow.sh`, `test_version_supersession.sh`, and `test_release_ordering.sh`.
+- `actionlint .github/workflows/*.yml` passes with no findings, including the rewritten `release.yml`,
+  `version-sync.yml`, `version-supersession.yml`, and `tag-ops-release.yml`.
+- `shellcheck --severity=warning scripts/*.sh tests/*.sh` passes with no findings.
+- `helm lint charts/ferrite charts/ferrite-sidecar` both pass (unchanged by this change; re-verified since
+  D-02 remains the only deferred chart-related item).
+- A full, uncached `docker build` of the default image (zero `--build-arg` overrides) was exercised via
+  `tests/test_docker_image_defaults.sh`, confirming the `FERRITE_SOURCE_SHA256` global-ARG/bare-redeclare
+  restructuring still produces a working, PING/SET/GET-responsive, health-checked container from the
+  Dockerfile's own pinned defaults.
+- No production behavior outside the release/version-sync/supersession workflows, the shared ordering
+  script, and the Dockerfile's ARG/LABEL scoping was changed; existing Helm, Compose, GitOps, Terraform,
+  and playground coverage is unchanged and still green.
+
 ## Deferred Items
 
 | ID | Description | Reason deferred |

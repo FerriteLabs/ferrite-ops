@@ -100,5 +100,7 @@ assert_contains "$AUDIT_CONTENT" "the exact tag is the last" \
   "AUDIT.md records that the exact tag is the last thing the release workflow writes"
 assert_contains "$AUDIT_CONTENT" "1.9.1\` published after \`2.0.0" \
   "AUDIT.md records the independent floating-tag backport scenario"
+assert_contains "$AUDIT_CONTENT" "29/29 discovered suites" \
+  "AUDIT.md records the final 29-suite verification pass"
 
 harness_summary
