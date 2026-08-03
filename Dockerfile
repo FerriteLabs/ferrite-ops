@@ -8,11 +8,9 @@
 # GitHub repository and builds from it. Override the tarball location with
 # --build-arg FERRITE_SOURCE_URL=... (e.g. to build from a fork or a local
 # mirror) without changing the FERRITE_VERSION default.
-ARG BUILDPLATFORM=linux/amd64
 # Override at build time: docker build --build-arg FERRITE_VERSION=0.4.0
 ARG FERRITE_VERSION=0.3.0
-FROM --platform=$BUILDPLATFORM rust:1.95-slim-bookworm AS chef
-ARG TARGETARCH=amd64
+FROM rust:1.95-slim-bookworm AS chef
 
 # Install cargo-chef for caching dependencies, plus curl/ca-certificates to
 # fetch the Ferrite source tarball (tar ships with the base image already).
@@ -70,9 +68,22 @@ RUN cargo chef cook --release --recipe-path recipe.json
 # Copy the fetched source code
 COPY --from=source /app /app
 
+# Preserve the Dockerfile's explicit Rust toolchain instead of allowing the
+# fetched contributor toolchain file to replace it. Ferrite v0.3.0 also
+# exposes its Linux io_uring implementation when the optional feature is
+# disabled; gate that module consistently with the declared Cargo feature.
+ARG FERRITE_VERSION
+RUN rm -f rust-toolchain rust-toolchain.toml \
+    && if [ "$FERRITE_VERSION" = "0.3.0" ]; then \
+        sed -i \
+          -e 's/#\[cfg(target_os = "linux")\]/#[cfg(all(target_os = "linux", feature = "io-uring"))]/g' \
+          -e 's/#\[cfg(not(target_os = "linux"))\]/#[cfg(any(not(target_os = "linux"), not(feature = "io-uring")))]/g' \
+          crates/ferrite-core/src/io/mod.rs; \
+        sed -i 's/let fields = vec!\[/let mut fields = vec![/g' \
+          src/commands/handlers/ebpf.rs; \
+    fi
+
 # Build the application
-# Note: io-uring feature is Linux-only and requires kernel 5.11+
-# We enable it here, but it will gracefully fall back on other platforms
 RUN cargo build --release --bin ferrite --bin ferrite-cli
 
 # Verify the binaries were built

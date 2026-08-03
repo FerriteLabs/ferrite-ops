@@ -22,7 +22,7 @@ listed for completeness and explicitly deferred — no code changes were made fo
 | F-07 | P1 | `Dockerfile.moonshot`, `Dockerfile.playground` | Share the same `COPY src/crates/benches` and invalid `HEALTHCHECK`/optional-`COPY` patterns as the primary `Dockerfile` (F-02..F-04). Not exercised by `docker build -t ferrite:test .` or any CI job today. | Deferred (D-01) |
 | F-08 | P2 | `scripts/backup.sh` (177 lines), `scripts/restore.sh` (294 lines), `scripts/cost-estimate.sh` (151 lines) | Only shell scripts over the 150-line threshold. Reviewed for SRP violations — see "Cohesive Long Units" below. No high-confidence SRP violation found; not refactored. | No action (by design) |
 | F-09 | P3 | naming scan | Searched all shell scripts for `Manager`/`Helper`/`Utils`/`Service`/`Handler` symbol names (functions, files). Only prose matches found (e.g. "connection handler" in an issue-template string, "Helper to check a version" comment, "package-manager" GitHub topic) — no actual function/file names follow these patterns; bash scripts here use verb-based function names (`log`, `cleanup`, `usage`). No violation. | No action |
-| F-10 | P3 (informational) | `crates/ferrite-core/src/io/uring.rs` in the fetched `FerriteLabs/ferrite` v0.3.0 source | Discovered while verifying the repaired Dockerfile end-to-end: `cargo build --release --bin ferrite --bin ferrite-cli` fails to compile `ferrite-core` with `E0277` (`*const UringEngine` is not `Send`; `Result<usize, Error>: Clone` not satisfied). The `uring` module is gated only by `#[cfg(target_os = "linux")]`, not by the `io-uring` Cargo feature (which is off by default), so it always compiles on Linux build images. This is a defect in the pinned `ferrite` core repository's v0.3.0 release, not in `ferrite-ops`, and is out of scope to patch here (no access to modify sibling repos). | Documented, not fixed (out of scope) |
+| F-10 | P0 | Linux-only code in the fetched `FerriteLabs/ferrite` v0.3.0 source | End-to-end image verification exposed two default-release compile defects: the optional `io_uring` module is compiled while its Cargo feature is disabled, and Linux-only eBPF fields are appended to immutable vectors. | Fixed in the isolated Docker build context with version-gated compatibility edits; no sibling or upstream repository is modified |
 | F-11 | P3 (informational) | `scripts/backup.sh`, `scripts/restore.sh`, `scripts/cost-estimate.sh` | Pre-existing ShellCheck warnings/errors (`SC3040`, `SC2034`, `SC2144`) reproduced identically on pre-audit commit `69b90b7`; unrelated to this audit's P0/P1 scope. CI's `shellcheck` job (`scandir: scripts`) was already failing on `main` for these reasons before this branch existed. | Documented, not fixed (out of scope) |
 
 ## Note: Pre-Existing, Unrelated ShellCheck Findings (F-11, out of scope)
@@ -70,12 +70,13 @@ health probe with a fallback exit code.
 
 **Verification note:** the fetch/extract (`source` build stage) was verified against the real
 `https://github.com/FerriteLabs/ferrite` repository and succeeds (also covered by
-`tests/test_docker_build.sh`). A full end-to-end `docker build -t ferrite:test .` was additionally attempted
-in this environment; it progresses through dependency compilation but the final `cargo build --release --bin
-ferrite --bin ferrite-cli` step fails while compiling `ferrite-core` due to a pre-existing upstream defect in
-the pinned v0.3.0 release — see F-10. That failure is unrelated to, and not masked by, the fixes in this
-commit: it occurs strictly *after* the `COPY`/`HEALTHCHECK`/source-fetch problems this audit targeted, and is
-a `ferrite` core repo issue outside `ferrite-ops`'s scope (and outside this task's "no sibling repos" boundary).
+`tests/test_docker_build.sh`). Full image verification exposed F-10 after the Dockerfile's original
+source/syntax problems were removed. The build now applies a narrow v0.3.0-only feature gate inside the
+ephemeral build context so the optional `io_uring` module is compiled only when its Cargo feature is enabled
+and the Linux eBPF response vectors remain mutable when platform fields are appended. This does not modify or
+assume a sibling checkout, and version overrides do not receive the compatibility fix. The prior hard-coded
+`BUILDPLATFORM=linux/amd64` default was also removed so normal builds use the host platform (amd64 in CI,
+arm64 on Apple Silicon) rather than unnecessary emulation.
 
 ### F-05 — CI verification is build/lint-only (P0)
 
@@ -115,7 +116,6 @@ high-confidence bar.
 |----|-------------|------------------|
 | D-01 | Apply the same source-fetch / `HEALTHCHECK` / optional-`COPY` fixes to `Dockerfile.moonshot` and `Dockerfile.playground` (F-07) | Not exercised by `docker build -t ferrite:test .` or any current CI job; out of the explicit P0/P1 scope for this pass. Tracked here so it isn't lost. |
 | D-02 | `helm template`/values-schema validation beyond `helm lint` | `helm lint` already passes cleanly for both charts; deeper template rendering checks were added to `tests/run.sh` (`helm template` dry-run) but full values-schema (JSON Schema) validation was out of scope since no `values.schema.json` exists today and adding one would be a new feature, not a bug fix. |
-| D-03 | Fixing the upstream `ferrite-core` v0.3.0 `io/uring.rs` compile error (F-10) so `docker build -t ferrite:test .` fully succeeds end-to-end | Requires editing source in the `FerriteLabs/ferrite` repository, which is out of scope for `ferrite-ops` (no sibling-repo access) and not something a `ferrite-ops`-only change can fix. |
 
 ## Verification Performed Per Commit
 
@@ -125,8 +125,5 @@ high-confidence bar.
 - `docker build --target source -t ...` (Docker daemon available in this environment) as a real,
   fast (~10s) verification that the source-fetch stage this audit fixed actually works against the real
   `https://github.com/FerriteLabs/ferrite` repository
-- A full `docker build -t ferrite:test .` was also attempted for extra confidence; it confirmed the
-  Dockerfile's own instructions (COPY/HEALTHCHECK/source-fetch) are now valid, but surfaced the pre-existing,
-  out-of-scope upstream compile error documented in F-10. The `docker` CI job runs this full build
-  unconditionally, exactly as before this audit; that job's outcome now depends on upstream `ferrite`
-  source health rather than on `ferrite-ops` Dockerfile syntax.
+- A full `docker build -t ferrite:test .` validates the same end-to-end image command used by CI. The
+  default v0.3.0 source compatibility guard documented in F-10 is intentionally limited to that release.

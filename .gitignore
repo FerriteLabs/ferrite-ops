@@ -8,6 +8,11 @@
 # Coverage
 coverage/
 
+# Keep the repository's Bash test harness even when a user-level ignore file
+# excludes generic lib/ directories.
+!tests/lib/
+!tests/lib/harness.sh
+
 # IDE / Editor
 .idea/
 .vscode/

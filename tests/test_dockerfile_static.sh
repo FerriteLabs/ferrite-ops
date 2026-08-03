@@ -68,6 +68,16 @@ assert_contains "$CONTENT" "github.com/FerriteLabs/ferrite" "Dockerfile's defaul
 # 6. FERRITE_VERSION default must not be silently bumped by future edits.
 ACTUAL_DEFAULT="$(grep -oE '^ARG FERRITE_VERSION=[0-9A-Za-z.+-]+' "$DOCKERFILE" | head -1 | cut -d= -f2)"
 assert_eq "0.3.0" "${ACTUAL_DEFAULT:-}" "ARG FERRITE_VERSION default is preserved at 0.3.0"
+assert_contains "$CONTENT" "rm -f rust-toolchain rust-toolchain.toml" \
+  "fetched contributor toolchain cannot override the Docker build toolchain"
+assert_contains "$CONTENT" 'if [ "$FERRITE_VERSION" = "0.3.0" ]' \
+  "v0.3.0 source compatibility fix is scoped to the default release"
+assert_contains "$CONTENT" 'feature = "io-uring"' \
+  "v0.3.0 Linux io_uring module follows its optional Cargo feature"
+assert_contains "$CONTENT" 'let mut fields = vec!' \
+  "v0.3.0 Linux eBPF fields remain mutable when platform fields are appended"
+assert_not_contains "$CONTENT" 'BUILDPLATFORM=linux/amd64' \
+  "Docker build does not force host builds through amd64 emulation"
 
 # 7. Preserve required public ports and image entrypoint contract.
 assert_contains "$CONTENT" "EXPOSE 6379" "Dockerfile still exposes the Redis-compatible port 6379"
