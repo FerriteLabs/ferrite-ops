@@ -1,4 +1,4 @@
-#!/usr/bin/env sh
+#!/usr/bin/env bash
 # Generate self-signed TLS certificates for Ferrite development/testing.
 #
 # Usage:
