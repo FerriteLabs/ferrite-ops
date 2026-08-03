@@ -120,9 +120,23 @@ assert_not_contains "$SUPERVISOR_CONTENT" '"0.0.0.0"' "Ferrite child is never bo
 assert_contains "$PROXY_CONTENT" 'PUBLIC_RESP_ADDR: &str = "0.0.0.0:6379"' "launcher owns the public Redis-compatible port 6379"
 assert_contains "$PROXY_CONTENT" "policy::classify_bytes" "public RESP proxy classifies every command before forwarding"
 assert_contains "$HTTP_CONTENT" "policy::classify_arguments" "HTTP /api/execute classifies every command with the same policy"
-for admin_command in SHUTDOWN DEBUG MODULE ACL CONFIG SAVE BGSAVE BGREWRITEAOF REPLICAOF SLAVEOF; do
-  assert_contains "$POLICY_CONTENT" "\"${admin_command}\"" "shared command policy rejects ${admin_command}"
+assert_contains "$POLICY_CONTENT" "const POLICIES:" "shared command policy is an explicit allowlist"
+assert_contains "$POLICY_CONTENT" "the command is not on the explicit safe-command allowlist" \
+  "commands outside the explicit allowlist are rejected by default"
+assert_not_contains "$POLICY_CONTENT" "ADMINISTRATIVE_COMMANDS" \
+  "the shared policy no longer relies on an administrative-command denylist"
+assert_not_contains "$POLICY_CONTENT" "ADMINISTRATIVE_FAMILIES" \
+  "the shared policy no longer relies on a privileged-family denylist"
+for allowed_command in PING ECHO GET SET LRANGE HSCAN SSCAN ZRANGE XRANGE; do
+  assert_contains "$POLICY_CONTENT" "\"${allowed_command}\"" \
+    "shared command policy explicitly allows bounded/basic ${allowed_command}"
 done
+assert_contains "$POLICY_CONTENT" "MAX_COLLECTION_PAGE: usize = 100" \
+  "collection and stream pages are capped at 100"
+assert_contains "$POLICY_CONTENT" "MAX_MULTI_ITEMS: usize = 32" \
+  "multi-key/field/member commands use a conservative item cap"
+assert_contains "$POLICY_CONTENT" "duplicate_count_options_cannot_bypass_bounds" \
+  "policy tests cover duplicate COUNT bypass attempts"
 assert_contains "$LAUNCHER_CONTENT" "unexpected_exit_error" "any unsolicited Ferrite child exit is treated as a launcher error"
 
 # 7c. Response and resource bounds: replies are bounded by one cumulative
