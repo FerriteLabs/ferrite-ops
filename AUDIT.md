@@ -90,8 +90,9 @@ before the `docker` and `helm` jobs in CI. It statically validates the Dockerfil
 non-existent paths, valid `HEALTHCHECK` syntax, source-fetch present) and exercises `smoke_test.sh`
 end-to-end against fake `ferrite`/`ferrite-cli` binaries — all without a real server, real cargo build, or
 Docker daemon. When a Docker daemon is available (confirmed present in this environment), an additional
-`docker build -t ferrite:test .` sanity check runs; it is skipped with a clear message when no daemon is
-reachable, per the "policy-neutral" requirement.
+fast `docker build --target source` check validates the real source fetch; it is skipped with a clear message
+when no daemon is reachable. The separate Docker CI job runs the exact full `docker build -t ferrite:test .`
+gate, which was also run successfully in this environment.
 
 ## Cohesive Long Units Left Intact
 
