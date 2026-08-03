@@ -96,11 +96,13 @@ jobs:
       - name: Update Helm chart
         run: |
           VERSION="${{ steps.version.outputs.version }}"
-          CHART="charts/ferrite/Chart.yaml"
-          if [ -f "$CHART" ]; then
-            sed -i "s/^version:.*/version: ${VERSION}/" "$CHART"
-            sed -i "s/^appVersion:.*/appVersion: ${VERSION}/" "$CHART"
-          fi
+          PRIMARY_CHART="charts/ferrite/Chart.yaml"
+          SIDECAR_CHART="charts/ferrite-sidecar/Chart.yaml"
+          test -f "$PRIMARY_CHART"
+          test -f "$SIDECAR_CHART"
+          perl -pi -e "s/^version:.*/version: ${VERSION}/" "$PRIMARY_CHART"
+          perl -pi -e "s/^appVersion:.*/appVersion: \"${VERSION}\"/" "$PRIMARY_CHART"
+          perl -pi -e "s/^appVersion:.*/appVersion: \"${VERSION}\"/" "$SIDECAR_CHART"
 
       - name: Update RPM spec
         run: |
@@ -123,6 +125,7 @@ jobs:
             Updates:
             - All three Dockerfiles' `FERRITE_VERSION` and `FERRITE_SOURCE_SHA256` args
             - Helm chart `version` and `appVersion`
+            - Sidecar chart `appVersion` (package version remains independent)
             - RPM spec `Version`
           branch: version-sync/${{ steps.version.outputs.version }}
           commit-message: "chore: sync version to v${{ steps.version.outputs.version }}"

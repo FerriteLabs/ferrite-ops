@@ -84,9 +84,10 @@ jobs:
         if: env.DRY_RUN != 'true'
         run: |
           VERSION="${{ needs.prepare.outputs.version }}"
-          sed -i "s/^version:.*/version: ${VERSION}/" charts/ferrite/Chart.yaml
-          sed -i "s/^appVersion:.*/appVersion: \"${VERSION}\"/" charts/ferrite/Chart.yaml
-          echo "Updated Chart.yaml to ${VERSION}"
+          perl -pi -e "s/^version:.*/version: ${VERSION}/" charts/ferrite/Chart.yaml
+          perl -pi -e "s/^appVersion:.*/appVersion: \"${VERSION}\"/" charts/ferrite/Chart.yaml
+          perl -pi -e "s/^appVersion:.*/appVersion: \"${VERSION}\"/" charts/ferrite-sidecar/Chart.yaml
+          echo "Updated primary chart version/appVersion and sidecar appVersion to ${VERSION}"
 
       - name: Create version bump PR
         if: env.DRY_RUN != 'true'
@@ -98,6 +99,7 @@ jobs:
 
             ## Changes
             - Updated Helm chart version and appVersion to ${{ needs.prepare.outputs.version }}
+            - Updated sidecar chart appVersion to ${{ needs.prepare.outputs.version }} (package version unchanged)
 
             _Triggered by [release orchestration](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})._
           branch: "release/${{ needs.prepare.outputs.version }}"
@@ -107,7 +109,7 @@ jobs:
       - name: Dry run log
         if: env.DRY_RUN == 'true'
         run: |
-          echo "::notice::[DRY RUN] Would update Chart.yaml to v${{ needs.prepare.outputs.version }}"
+          echo "::notice::[DRY RUN] Would update primary chart version/appVersion and sidecar appVersion to v${{ needs.prepare.outputs.version }}"
 
   # ── Step 3: Trigger Homebrew formula update ──────────────────────────────────
   update-homebrew:

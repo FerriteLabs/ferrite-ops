@@ -22,8 +22,9 @@ source "${HERE}/lib/harness.sh"
 
 RELEASE_YML="${REPO_ROOT}/.github/workflows/release.yml"
 VERSION_SYNC_YML="${REPO_ROOT}/.github/workflows/version-sync.yml"
+ORCHESTRATION_YML="${REPO_ROOT}/.github/workflows/release-orchestration.yml"
 
-for f in "$RELEASE_YML" "$VERSION_SYNC_YML"; do
+for f in "$RELEASE_YML" "$VERSION_SYNC_YML" "$ORCHESTRATION_YML"; do
   if [[ ! -f "$f" ]]; then
     echo "  FAIL: ${f} not found" >&2
     exit 1
@@ -32,6 +33,7 @@ done
 
 RELEASE_CONTENT="$(cat "$RELEASE_YML")"
 VERSION_SYNC_CONTENT="$(cat "$VERSION_SYNC_YML")"
+ORCHESTRATION_CONTENT="$(cat "$ORCHESTRATION_YML")"
 
 # --- Static checks: release.yml ---------------------------------------------
 assert_contains "$RELEASE_CONTENT" "FERRITE_SOURCE_SHA256" \
@@ -60,6 +62,10 @@ assert_contains "$RELEASE_CONTENT" 'type=raw,value=latest,enable=${{ steps.relea
   "release.yml publishes latest only for stable semver releases"
 assert_not_contains "$RELEASE_CONTENT" 'type=raw,value=${{ inputs.tag }}' \
   "workflow_dispatch does not publish an unnormalized raw v-prefixed tag"
+assert_contains "$RELEASE_CONTENT" "charts/ferrite-sidecar/Chart.yaml" \
+  "release.yml updates the sidecar chart appVersion with the released Ferrite image"
+assert_contains "$ORCHESTRATION_CONTENT" "charts/ferrite-sidecar/Chart.yaml" \
+  "release-orchestration.yml updates the sidecar chart appVersion"
 
 # --- Static checks: version-sync.yml ----------------------------------------
 for dockerfile in Dockerfile Dockerfile.moonshot Dockerfile.playground; do
@@ -76,6 +82,8 @@ assert_contains "$VERSION_SYNC_CONTENT" 'grep -qE' \
   "version-sync.yml validates the version against a semver pattern"
 assert_contains "$VERSION_SYNC_CONTENT" "shasum -a 256" \
   "version-sync.yml computes the source checksum when not explicitly provided"
+assert_contains "$VERSION_SYNC_CONTENT" "charts/ferrite-sidecar/Chart.yaml" \
+  "version-sync.yml keeps the sidecar appVersion synchronized"
 
 # --- Static checks: ordinary CI/scan workflows retain pinned defaults -------
 for wf in ci.yml docker-scan.yml sbom.yml; do
@@ -110,12 +118,23 @@ fi
 EXTRACT_DIR="$(mktemp -d)"
 trap 'rm -rf "$EXTRACT_DIR"' EXIT
 
-python3 - "$RELEASE_YML" "$VERSION_SYNC_YML" \
-  "$EXTRACT_DIR/release_meta.sh" "$EXTRACT_DIR/update_dockerfiles.sh" << 'PYEOF'
+python3 - "$RELEASE_YML" "$VERSION_SYNC_YML" "$ORCHESTRATION_YML" \
+  "$EXTRACT_DIR/release_meta.sh" "$EXTRACT_DIR/update_dockerfiles.sh" \
+  "$EXTRACT_DIR/release_chart.sh" "$EXTRACT_DIR/version_sync_chart.sh" \
+  "$EXTRACT_DIR/orchestration_chart.sh" << 'PYEOF'
 import sys
 import yaml
 
-release_yml_path, version_sync_yml_path, release_out_path, sync_out_path = sys.argv[1:]
+(
+    release_yml_path,
+    version_sync_yml_path,
+    orchestration_yml_path,
+    release_out_path,
+    sync_out_path,
+    release_chart_out_path,
+    version_sync_chart_out_path,
+    orchestration_chart_out_path,
+) = sys.argv[1:]
 with open(release_yml_path) as f:
     doc = yaml.safe_load(f)
 
@@ -140,6 +159,14 @@ if missing_tags:
 with open(release_out_path, "w") as f:
     f.write(script)
 
+release_chart_script = next(
+    s["run"]
+    for s in doc["jobs"]["bump-chart"]["steps"]
+    if s.get("name") == "Update Chart.yaml"
+)
+with open(release_chart_out_path, "w") as f:
+    f.write(release_chart_script)
+
 with open(version_sync_yml_path) as f:
     sync_doc = yaml.safe_load(f)
 
@@ -147,6 +174,22 @@ sync_steps = sync_doc["jobs"]["sync"]["steps"]
 sync_script = next(s["run"] for s in sync_steps if s.get("name") == "Update Dockerfiles")
 with open(sync_out_path, "w") as f:
     f.write(sync_script)
+
+version_sync_chart_script = next(
+    s["run"] for s in sync_steps if s.get("name") == "Update Helm chart"
+)
+with open(version_sync_chart_out_path, "w") as f:
+    f.write(version_sync_chart_script)
+
+with open(orchestration_yml_path) as f:
+    orchestration_doc = yaml.safe_load(f)
+orchestration_chart_script = next(
+    s["run"]
+    for s in orchestration_doc["jobs"]["update-ops"]["steps"]
+    if s.get("name") == "Update Helm Chart version"
+)
+with open(orchestration_chart_out_path, "w") as f:
+    f.write(orchestration_chart_script)
 PYEOF
 
 # Exercise the version-sync Dockerfile step against isolated copies. All three
@@ -188,6 +231,34 @@ else
   assert_eq "3" "$UNCHANGED_COUNT" \
     "version-sync validates every Dockerfile before making any release-default edit"
 fi
+
+# Replay every chart release path. The primary package follows the core
+# release, while the sidecar package version remains independently versioned.
+for chart_path in release_chart version_sync_chart orchestration_chart; do
+  CHART_DIR="${EXTRACT_DIR}/${chart_path}"
+  mkdir -p "${CHART_DIR}/charts/ferrite" "${CHART_DIR}/charts/ferrite-sidecar"
+  cp "${REPO_ROOT}/charts/ferrite/Chart.yaml" "${CHART_DIR}/charts/ferrite/Chart.yaml"
+  cp "${REPO_ROOT}/charts/ferrite-sidecar/Chart.yaml" \
+    "${CHART_DIR}/charts/ferrite-sidecar/Chart.yaml"
+
+  CHART_SCRIPT="$(cat "${EXTRACT_DIR}/${chart_path}.sh")"
+  CHART_SCRIPT="${CHART_SCRIPT//\$\{\{ github.event.client_payload.version \}\}/v9.8.7}"
+  CHART_SCRIPT="${CHART_SCRIPT//\$\{\{ steps.version.outputs.version \}\}/9.8.7}"
+  CHART_SCRIPT="${CHART_SCRIPT//\$\{\{ needs.prepare.outputs.version \}\}/9.8.7}"
+
+  if (cd "$CHART_DIR" && bash -c "$CHART_SCRIPT"); then
+    assert_contains "$(cat "${CHART_DIR}/charts/ferrite/Chart.yaml")" "version: 9.8.7" \
+      "${chart_path} updates the primary chart package version"
+    assert_contains "$(cat "${CHART_DIR}/charts/ferrite/Chart.yaml")" 'appVersion: "9.8.7"' \
+      "${chart_path} updates the primary chart appVersion"
+    assert_contains "$(cat "${CHART_DIR}/charts/ferrite-sidecar/Chart.yaml")" 'appVersion: "9.8.7"' \
+      "${chart_path} updates the sidecar chart appVersion"
+    assert_contains "$(cat "${CHART_DIR}/charts/ferrite-sidecar/Chart.yaml")" "version: 0.2.0" \
+      "${chart_path} preserves the sidecar chart's independent package version"
+  else
+    harness_fail "${chart_path} chart update functional replay unexpectedly failed"
+  fi
+done
 
 run_case() {
   local name="$1" event_name="$2" client_payload_version="$3" input_tag="$4" ref_name="${5:-}"

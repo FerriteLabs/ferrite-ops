@@ -263,9 +263,10 @@ jobs:
           VERSION="${{ github.event.client_payload.version }}"
           VERSION="${VERSION#v}"
           if [ -n "$VERSION" ]; then
-            sed -i "s/^version:.*/version: ${VERSION}/" charts/ferrite/Chart.yaml
-            sed -i "s/^appVersion:.*/appVersion: \"${VERSION}\"/" charts/ferrite/Chart.yaml
-            echo "Updated Chart.yaml to version ${VERSION}"
+            perl -pi -e "s/^version:.*/version: ${VERSION}/" charts/ferrite/Chart.yaml
+            perl -pi -e "s/^appVersion:.*/appVersion: \"${VERSION}\"/" charts/ferrite/Chart.yaml
+            perl -pi -e "s/^appVersion:.*/appVersion: \"${VERSION}\"/" charts/ferrite-sidecar/Chart.yaml
+            echo "Updated primary chart version/appVersion and sidecar appVersion to ${VERSION}"
           fi
       - name: Create PR for version bump
         uses: peter-evans/create-pull-request@v6
