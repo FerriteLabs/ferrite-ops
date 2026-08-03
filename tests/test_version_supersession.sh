@@ -2,7 +2,7 @@
 # Static and functional coverage for version-supersession.yml, the merge-time
 # guard that prevents a stale version-sync PR from regressing the canonical
 # active-release.env once main has advanced. The functional replay uses only
-# temporary local Git repositories.
+# temporary local Git repositories and plain directories (no network).
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -40,6 +40,40 @@ assert_contains "$CONTENT" 'startswith("version-sync/")' \
 assert_contains "$CONTENT" 'repos/${REPOSITORY}/check-runs' \
   "reconciliation writes the supersession result to each PR head"
 
+# --- Trust boundary: candidate vs trusted checkout --------------------------
+assert_contains "$CONTENT" "path: candidate" \
+  "the untrusted PR/merge-queue candidate is checked out into its own directory"
+assert_contains "$CONTENT" "path: trusted" \
+  "the trusted base branch is checked out into its own directory"
+assert_contains "$CONTENT" "ORDER_SCRIPT: trusted/scripts/release-ordering.sh" \
+  "the supersession check only ever invokes the trusted checkout's ordering script"
+assert_contains "$CONTENT" "candidate/active-release.env" \
+  "the candidate's active-release.env is read as data, from its own directory"
+assert_contains "$CONTENT" "Checkout candidate (untrusted, data only)" \
+  "the candidate checkout step is explicitly documented as data-only"
+
+# Scope-check: the supersession job's own YAML text must never reference the
+# ordering script from the untrusted checkout root (only trusted/scripts/...).
+SUPERSESSION_JOB_YAML="$(python3 - "$WORKFLOW" <<'PYEOF'
+import sys, yaml
+with open(sys.argv[1]) as f:
+    doc = yaml.safe_load(f)
+print(yaml.safe_dump(doc["jobs"]["supersession"]))
+PYEOF
+)"
+assert_not_contains "$SUPERSESSION_JOB_YAML" "ORDER_SCRIPT: scripts/release-ordering.sh" \
+  "the supersession job's own definition never wires the ordering script from the untrusted checkout root"
+
+# --- Reconciliation concurrency and freshness -------------------------------
+assert_contains "$CONTENT" "group: version-supersession-reconcile" \
+  "reconciliation is serialized by a fixed concurrency group"
+assert_contains "$CONTENT" "cancel-in-progress: true" \
+  "an overlapping reconciliation run cancels a stale in-flight one"
+assert_contains "$CONTENT" "Read current main tip immediately before classification" \
+  "reconciliation re-reads main's tip immediately before classifying/posting"
+assert_contains "$CONTENT" "git fetch --no-tags --depth=1 origin main" \
+  "reconciliation fetches a fresh main tip rather than reusing the initial checkout"
+
 if ! command -v python3 >/dev/null 2>&1 || ! python3 -c "import yaml" >/dev/null 2>&1; then
   echo "  skip: python3/PyYAML unavailable; skipping supersession functional replay."
   harness_summary
@@ -49,72 +83,60 @@ fi
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 CHECK_SCRIPT="${TMP}/check.sh"
+MAIN_TIP_SCRIPT="${TMP}/main_tip.sh"
 RECONCILE_SCRIPT="${TMP}/reconcile.sh"
-if ! python3 - "$WORKFLOW" "$CHECK_SCRIPT" <<'PYEOF'
+
+extract_step() {
+  local job="$1" step_name="$2" out="$3"
+  python3 - "$WORKFLOW" "$job" "$step_name" "$out" <<'PYEOF'
 import sys, yaml
-wf_path, out_path = sys.argv[1:]
+wf_path, job, step_name, out_path = sys.argv[1:]
 with open(wf_path) as f:
     doc = yaml.safe_load(f)
-steps = doc["jobs"]["supersession"]["steps"]
-run = next(s["run"] for s in steps if s.get("name") == "Reject a superseded active-release change")
+steps = doc["jobs"][job]["steps"]
+run = next(s["run"] for s in steps if s.get("name") == step_name)
 with open(out_path, "w") as f:
     f.write(run)
 PYEOF
-then
+}
+
+if ! extract_step "supersession" "Reject a superseded active-release change" "$CHECK_SCRIPT"; then
   harness_fail "could not extract the supersession check step"
   harness_summary
   exit $?
 fi
 harness_ok "extracted the supersession check step from the workflow"
 
-if ! python3 - "$WORKFLOW" "$RECONCILE_SCRIPT" <<'PYEOF'
-import sys, yaml
-wf_path, out_path = sys.argv[1:]
-with open(wf_path) as f:
-    doc = yaml.safe_load(f)
-steps = doc["jobs"]["reconcile-automated-prs"]["steps"]
-run = next(s["run"] for s in steps if s.get("name") == "Check every open automated version-sync PR")
-with open(out_path, "w") as f:
-    f.write(run)
-PYEOF
-then
+if ! extract_step "reconcile-automated-prs" "Read current main tip immediately before classification" "$MAIN_TIP_SCRIPT"; then
+  harness_fail "could not extract the main-tip reconciliation step"
+  harness_summary
+  exit $?
+fi
+harness_ok "extracted the main-tip freshness step from the workflow"
+
+if ! extract_step "reconcile-automated-prs" "Check every open automated version-sync PR" "$RECONCILE_SCRIPT"; then
   harness_fail "could not extract the automated PR reconciliation step"
   harness_summary
   exit $?
 fi
 harness_ok "extracted the automated PR reconciliation step from the workflow"
 
-REMOTE="${TMP}/origin.git"
-git init -q --bare "$REMOTE"
-
-# Seed origin/main with a canonical release, then advance it so main is ahead.
-SEED="${TMP}/seed"
-git init -q -b main "$SEED"
-git -C "$SEED" config user.name "Test User"
-git -C "$SEED" config user.email "test@example.invalid"
 write_env() { printf 'FERRITE_VERSION=%s\nFERRITE_SOURCE_SHA256=%s\n' "$1" "$2" > "${3}/active-release.env"; }
 
-write_env "0.4.0" "$ZERO" "$SEED"
-git -C "$SEED" add .
-git -C "$SEED" commit -q -m "release 0.4.0"
-git -C "$SEED" remote add origin "$REMOTE"
-git -C "$SEED" push -q -u origin main
-# main advances to 0.4.2 (this is what supersedes stale PRs branched from 0.4.0).
-write_env "0.4.2" "$ONES" "$SEED"
-git -C "$SEED" commit -q -am "release 0.4.2"
-git -C "$SEED" push -q origin main
-
-# Build a PR-head working clone whose active-release.env is $1/$2, run the
-# extracted check with origin pointed at the shared bare remote.
+# Build a plain candidate/trusted directory pair (no git needed for basic
+# classification replay) and run the extracted check step against them.
 run_supersession() {
-  local pr_version="$1" pr_sha="$2" out="$3"
-  local work="${TMP}/pr-$$-${RANDOM}"
-  git clone -q "$REMOTE" "$work"
-  write_env "$pr_version" "$pr_sha" "$work"
+  local pr_version="$1" pr_sha="$2" base_version="$3" base_sha="$4" out="$5"
+  local work="${TMP}/case-$$-${RANDOM}"
+  mkdir -p "${work}/candidate" "${work}/trusted/scripts"
+  write_env "$pr_version" "$pr_sha" "${work}/candidate"
+  write_env "$base_version" "$base_sha" "${work}/trusted"
+  cp "$ORDER" "${work}/trusted/scripts/release-ordering.sh"
+  chmod +x "${work}/trusted/scripts/release-ordering.sh"
   : > "$out"
   (
     cd "$work" &&
-      BASE_REF="main" ORDER_SCRIPT="$ORDER" \
+      BASE_REF="main" ORDER_SCRIPT="trusted/scripts/release-ordering.sh" \
       bash "$CHECK_SCRIPT" >"$out" 2>&1
   )
   local rc=$?
@@ -123,7 +145,7 @@ run_supersession() {
 }
 
 # A genuinely newer PR (0.4.3) over current main (0.4.2): passes.
-if run_supersession "0.4.3" "$ONES" "${TMP}/newer.out"; then
+if run_supersession "0.4.3" "$ONES" "0.4.2" "$ONES" "${TMP}/newer.out"; then
   assert_contains "$(cat "${TMP}/newer.out")" "does not regress" \
     "a newer PR than current main passes the supersession check"
 else
@@ -131,7 +153,7 @@ else
 fi
 
 # A stale PR (0.4.1) branched before main advanced to 0.4.2: rejected.
-if run_supersession "0.4.1" "$ONES" "${TMP}/stale.out"; then
+if run_supersession "0.4.1" "$ONES" "0.4.2" "$ONES" "${TMP}/stale.out"; then
   harness_fail "a superseded PR unexpectedly passed the supersession check"
 else
   assert_contains "$(cat "${TMP}/stale.out")" "has been superseded" \
@@ -139,7 +161,7 @@ else
 fi
 
 # A PR that keeps main's version with the same checksum: no regression, passes.
-if run_supersession "0.4.2" "$ONES" "${TMP}/equal_same.out"; then
+if run_supersession "0.4.2" "$ONES" "0.4.2" "$ONES" "${TMP}/equal_same.out"; then
   assert_contains "$(cat "${TMP}/equal_same.out")" "does not regress" \
     "a PR matching current main with the same checksum passes"
 else
@@ -147,21 +169,111 @@ else
 fi
 
 # A PR that keeps main's version but changes the checksum: rejected loudly.
-if run_supersession "0.4.2" "$ZERO" "${TMP}/equal_diff.out"; then
+if run_supersession "0.4.2" "$ZERO" "0.4.2" "$ONES" "${TMP}/equal_diff.out"; then
   harness_fail "a same-version checksum-conflict PR unexpectedly passed"
 else
   assert_contains "$(cat "${TMP}/equal_diff.out")" "source must not be rewritten" \
     "a same-version checksum-conflict PR is rejected"
 fi
 
-# Reconciliation must process every PR even when an earlier PR contains
-# malformed metadata. Mock the GitHub API with one malformed PR followed by a
-# stale PR and verify both receive failure checks before the job reports error.
+# --- Malicious PR: candidate replaces scripts/release-ordering.sh ----------
+# A malicious PR ships its own scripts/release-ordering.sh that always claims
+# NEWER (to bypass the guard) and leaves a marker proving it ran. Even though
+# the candidate proposes an older version than main, the check must still
+# reject it — because it must classify using ONLY the trusted checkout's
+# script, never the candidate's.
+MALICIOUS_MARKER="${TMP}/malicious-ran.marker"
+rm -f "$MALICIOUS_MARKER"
+MALICIOUS_WORK="${TMP}/malicious-case"
+mkdir -p "${MALICIOUS_WORK}/candidate/scripts" "${MALICIOUS_WORK}/trusted/scripts"
+write_env "0.3.0" "$ONES" "${MALICIOUS_WORK}/candidate"
+write_env "0.4.2" "$ONES" "${MALICIOUS_WORK}/trusted"
+cp "$ORDER" "${MALICIOUS_WORK}/trusted/scripts/release-ordering.sh"
+chmod +x "${MALICIOUS_WORK}/trusted/scripts/release-ordering.sh"
+python3 - "$MALICIOUS_WORK" "$MALICIOUS_MARKER" <<'PYEOF'
+import sys, os, stat
+work, marker = sys.argv[1:]
+path = os.path.join(work, "candidate", "scripts", "release-ordering.sh")
+script = "#!/usr/bin/env bash\ntouch " + marker + "\necho NEWER\nexit 0\n"
+with open(path, "w") as f:
+    f.write(script)
+os.chmod(path, os.stat(path).st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+PYEOF
+MALICIOUS_OUT="${TMP}/malicious.out"
+: > "$MALICIOUS_OUT"
+(
+  cd "$MALICIOUS_WORK" &&
+    BASE_REF="main" ORDER_SCRIPT="trusted/scripts/release-ordering.sh" \
+    bash "$CHECK_SCRIPT" >"$MALICIOUS_OUT" 2>&1
+)
+if [[ $? -eq 0 ]]; then
+  harness_fail "a malicious PR's replaced release-ordering.sh unexpectedly bypassed the guard"
+else
+  assert_contains "$(cat "$MALICIOUS_OUT")" "has been superseded" \
+    "a malicious PR is still correctly classified using the trusted script (real OLDER result)"
+fi
+if [[ -e "$MALICIOUS_MARKER" ]]; then
+  harness_fail "the candidate's malicious release-ordering.sh was executed"
+else
+  harness_ok "the candidate's malicious release-ordering.sh was never executed"
+fi
+rm -rf "$MALICIOUS_WORK"
+
+# --- Overlapping/stale reconciliation: main-tip freshness -------------------
+# Simulate main advancing between two reconciliation reads. Each read must
+# fetch and report the CURRENT tip, not a value cached from an earlier,
+# now-stale checkout — this is what the concurrency+re-fetch design prevents.
+REMOTE="${TMP}/origin.git"
+git init -q --bare "$REMOTE"
+SEED="${TMP}/seed"
+git init -q -b main "$SEED"
+git -C "$SEED" config user.name "Test User"
+git -C "$SEED" config user.email "test@example.invalid"
+write_env "0.4.0" "$ZERO" "$SEED"
+git -C "$SEED" add .
+git -C "$SEED" commit -q -m "release 0.4.0"
+git -C "$SEED" remote add origin "$REMOTE"
+git -C "$SEED" push -q -u origin main
+
+RECON_WORK="${TMP}/recon-checkout"
+git clone -q "$REMOTE" "$RECON_WORK"
+
+read_main_tip() {
+  local out="$1"
+  : > "$out"
+  ( cd "$RECON_WORK" && GITHUB_OUTPUT="$out" bash "$MAIN_TIP_SCRIPT" >"${out}.log" 2>&1 )
+}
+
+# First reconciliation read: main is still at 0.4.0.
+if read_main_tip "${TMP}/tip1.out"; then
+  assert_contains "$(cat "${TMP}/tip1.out")" "version=0.4.0" \
+    "the first reconciliation read reports main's current tip (0.4.0)"
+else
+  harness_fail "first main-tip read unexpectedly failed: $(cat "${TMP}/tip1.out.log")"
+fi
+
+# main advances to 0.4.2 — simulating a second, newer push/Version Sync
+# completion racing an earlier, now-stale reconciliation attempt.
+write_env "0.4.2" "$ONES" "$SEED"
+git -C "$SEED" commit -q -am "release 0.4.2"
+git -C "$SEED" push -q origin main
+
+# A second reconciliation read from the SAME checkout must observe the
+# fresh tip (0.4.2), not the value cached at clone time (0.4.0) — proving
+# the guard re-fetches immediately before classification rather than
+# trusting a possibly-stale earlier checkout.
+if read_main_tip "${TMP}/tip2.out"; then
+  assert_contains "$(cat "${TMP}/tip2.out")" "version=0.4.2" \
+    "a later reconciliation read observes main's advanced tip (0.4.2), not a stale cached value"
+else
+  harness_fail "second main-tip read unexpectedly failed: $(cat "${TMP}/tip2.out.log")"
+fi
+
+# --- Reconciliation loop: malformed metadata does not block later PRs ------
 RECONCILE_FIXTURE="${TMP}/reconcile-repo"
 MOCK_BIN="${TMP}/mock-bin"
 MOCK_CHECKS="${TMP}/checks.jsonl"
 mkdir -p "$RECONCILE_FIXTURE" "$MOCK_BIN"
-write_env "0.4.2" "$ONES" "$RECONCILE_FIXTURE"
 : > "$MOCK_CHECKS"
 cat > "${MOCK_BIN}/gh" <<'MOCKEOF'
 #!/usr/bin/env bash
@@ -199,6 +311,8 @@ if (
     GH_TOKEN="test-token" \
     REPOSITORY="ferritelabs/ferrite-ops" \
     ORDER_SCRIPT="$ORDER" \
+    BASE_VERSION="0.4.2" \
+    BASE_SHA256="$ONES" \
     bash "$RECONCILE_SCRIPT" >"${TMP}/reconcile.out" 2>&1
 ); then
   harness_fail "reconciliation unexpectedly succeeded despite malformed metadata"

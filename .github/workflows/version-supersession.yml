@@ -8,6 +8,15 @@
 #   - push reconciliation whenever main advances active-release.env.
 # Reconciliation writes the same required check directly onto each automated
 # version-sync PR head, so GITHUB_TOKEN event suppression cannot bypass it.
+#
+# Trust boundary: a PR/merge-queue candidate is untrusted code. This workflow
+# NEVER executes anything from the candidate checkout. The candidate ref is
+# checked out only to read active-release.env as inert data (sed/grep), into
+# its own `candidate/` directory. The trusted base branch (the PR/merge-queue
+# base ref, i.e. main) is checked out separately into `trusted/`, and only
+# `trusted/scripts/release-ordering.sh` is ever invoked. A malicious PR that
+# replaces scripts/release-ordering.sh cannot influence this check, because
+# that file is never read from the candidate checkout at all.
 
 name: Version Supersession Check
 
@@ -34,32 +43,49 @@ jobs:
     if: github.event_name == 'pull_request' || github.event_name == 'merge_group'
     runs-on: ubuntu-latest
     steps:
-      # For pull_request, check the proposed head itself. For merge_group,
-      # github.sha is the merge-queue candidate containing the proposed file.
-      - uses: actions/checkout@v4
+      # Untrusted candidate checkout: for pull_request, the proposed PR head;
+      # for merge_group, github.sha is the merge-queue candidate. This copy
+      # is read as inert data only (sed/grep in the step below) and its
+      # scripts are never executed.
+      - name: Checkout candidate (untrusted, data only)
+        uses: actions/checkout@v4
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
-          fetch-depth: 0
+          path: candidate
+          persist-credentials: false
+
+      # Trusted checkout of the PR/merge-queue base branch (main). Only this
+      # checkout's scripts/release-ordering.sh is ever invoked, so a
+      # candidate that replaces that script cannot affect the outcome.
+      - name: Checkout trusted base branch (scripts + canonical data)
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.ref || github.event.merge_group.base_ref }}
+          path: trusted
+          persist-credentials: false
 
       - name: Reject a superseded active-release change
         env:
           BASE_REF: ${{ github.event.pull_request.base.ref || github.event.merge_group.base_ref }}
-          ORDER_SCRIPT: scripts/release-ordering.sh
+          ORDER_SCRIPT: trusted/scripts/release-ordering.sh
         run: |
           set -euo pipefail
 
-          ACTIVE_RELEASE="active-release.env"
           BASE_REF="${BASE_REF#refs/heads/}"
 
-          # Proposed values from the PR head working tree.
-          PR_VERSION="$(sed -n 's/^FERRITE_VERSION=//p' "$ACTIVE_RELEASE")"
-          PR_SHA256="$(sed -n 's/^FERRITE_SOURCE_SHA256=//p' "$ACTIVE_RELEASE")"
+          if [ ! -x "$ORDER_SCRIPT" ] && [ ! -f "$ORDER_SCRIPT" ]; then
+            echo "::error::Trusted ordering script not found at ${ORDER_SCRIPT}"
+            exit 1
+          fi
 
-          # Canonical values from the current tip of the base branch (main).
-          git fetch --no-tags --depth=1 origin "$BASE_REF"
-          BASE_ENV="$(git show "FETCH_HEAD:${ACTIVE_RELEASE}")"
-          BASE_VERSION="$(printf '%s\n' "$BASE_ENV" | sed -n 's/^FERRITE_VERSION=//p')"
-          BASE_SHA256="$(printf '%s\n' "$BASE_ENV" | sed -n 's/^FERRITE_SOURCE_SHA256=//p')"
+          # Proposed values from the untrusted candidate checkout, read as
+          # inert data (sed) — never executed.
+          PR_VERSION="$(sed -n 's/^FERRITE_VERSION=//p' candidate/active-release.env)"
+          PR_SHA256="$(sed -n 's/^FERRITE_SOURCE_SHA256=//p' candidate/active-release.env)"
+
+          # Canonical values from the trusted base-branch checkout.
+          BASE_VERSION="$(sed -n 's/^FERRITE_VERSION=//p' trusted/active-release.env)"
+          BASE_SHA256="$(sed -n 's/^FERRITE_SOURCE_SHA256=//p' trusted/active-release.env)"
 
           CLASS="$(bash "$ORDER_SCRIPT" classify \
             "$PR_VERSION" "$PR_SHA256" "$BASE_VERSION" "$BASE_SHA256")"
@@ -87,6 +113,15 @@ jobs:
   # pull_request event for the generated PR. Reconcile after every Version
   # Sync run and whenever main's canonical release advances, attaching this
   # workflow's required check directly to every open version-sync PR head.
+  #
+  # The concurrency group with cancel-in-progress serializes reconciliation:
+  # workflow_run and push reconciliation can both fire in quick succession
+  # (e.g. Version Sync completing right as main advances again), and without
+  # this, an older run finishing after a newer one could overwrite a fresh,
+  # correct check result with a stale one. Cancelling superseded in-flight
+  # runs, combined with re-reading main's tip immediately before
+  # classification/posting below, ensures the last check written always
+  # reflects the current canonical release.
   reconcile-automated-prs:
     name: Reconcile automated release checks
     if: github.event_name == 'workflow_run' || github.event_name == 'push'
@@ -95,20 +130,56 @@ jobs:
       checks: write
       contents: read
       pull-requests: read
+    concurrency:
+      group: version-supersession-reconcile
+      cancel-in-progress: true
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # Re-fetch and re-read main's tip immediately before classification and
+      # posting, rather than trusting the initial checkout above. This job can
+      # queue behind the concurrency group or take time paginating PRs, and
+      # main may advance again in the meantime; reading the tip as the last
+      # step before use keeps every posted check aligned with the current
+      # canonical release instead of whatever main looked like when this run
+      # started.
+      - name: Read current main tip immediately before classification
+        id: main_tip
+        run: |
+          set -euo pipefail
+
+          git fetch --no-tags --depth=1 origin main
+          BASE_ENV="$(git show origin/main:active-release.env)"
+          BASE_VERSION="$(printf '%s\n' "$BASE_ENV" | sed -n 's/^FERRITE_VERSION=//p')"
+          BASE_SHA256="$(printf '%s\n' "$BASE_ENV" | sed -n 's/^FERRITE_SOURCE_SHA256=//p')"
+
+          if ! printf '%s\n' "$BASE_VERSION" |
+            grep -qE '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?$'; then
+            echo "::error::origin/main contains an invalid canonical version"
+            exit 1
+          fi
+          if ! printf '%s\n' "$BASE_SHA256" | grep -qE '^[0-9a-f]{64}$'; then
+            echo "::error::origin/main contains an invalid canonical checksum"
+            exit 1
+          fi
+
+          echo "version=${BASE_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "sha256=${BASE_SHA256}" >> "$GITHUB_OUTPUT"
+          echo "::notice::Reconciling against main tip ${BASE_VERSION} (read immediately before classification)."
 
       - name: Check every open automated version-sync PR
         env:
           GH_TOKEN: ${{ github.token }}
           REPOSITORY: ${{ github.repository }}
           ORDER_SCRIPT: scripts/release-ordering.sh
+          BASE_VERSION: ${{ steps.main_tip.outputs.version }}
+          BASE_SHA256: ${{ steps.main_tip.outputs.sha256 }}
         run: |
           set -euo pipefail
 
           ACTIVE_RELEASE="active-release.env"
-          BASE_VERSION="$(sed -n 's/^FERRITE_VERSION=//p' "$ACTIVE_RELEASE")"
-          BASE_SHA256="$(sed -n 's/^FERRITE_SOURCE_SHA256=//p' "$ACTIVE_RELEASE")"
           TMP_DIR="$(mktemp -d)"
           trap 'rm -rf "$TMP_DIR"' EXIT
 
