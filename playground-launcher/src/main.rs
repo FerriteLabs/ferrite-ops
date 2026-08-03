@@ -20,14 +20,16 @@ mod supervisor;
 mod testing;
 
 use std::process::ExitCode;
+use std::sync::Arc;
 
 use tokio::net::TcpListener;
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, Semaphore};
 use tokio::task::JoinHandle;
 use tokio::time::{timeout, Duration};
 
 const HTTP_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 const PROXY_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
+const MAX_BACKEND_OPERATIONS: usize = 32;
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -69,9 +71,11 @@ async fn run() -> Result<(), String> {
         }
     };
 
+    let backend_permits = Arc::new(Semaphore::new(MAX_BACKEND_OPERATIONS));
     let state = http::AppState {
         resp_addr: supervisor::INTERNAL_RESP_ADDR.to_string(),
         version: std::env::var("FERRITE_VERSION").unwrap_or_else(|_| "unknown".to_string()),
+        backend_permits: Arc::clone(&backend_permits),
     };
 
     let (http_shutdown_tx, http_shutdown_rx) = oneshot::channel::<()>();
@@ -89,6 +93,7 @@ async fn run() -> Result<(), String> {
         proxy::serve(
             proxy_listener,
             supervisor::INTERNAL_RESP_ADDR,
+            backend_permits,
             proxy_shutdown_rx,
         )
         .await

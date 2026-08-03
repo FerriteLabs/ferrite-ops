@@ -41,6 +41,7 @@ pub enum Request {
 pub async fn serve(
     listener: TcpListener,
     upstream_addr: &'static str,
+    backend_permits: Arc<Semaphore>,
     shutdown: oneshot::Receiver<()>,
 ) -> Result<(), String> {
     let permits = Arc::new(Semaphore::new(MAX_CONNECTIONS));
@@ -72,9 +73,12 @@ pub async fn serve(
                     }
                 };
 
+                let backend_permits = Arc::clone(&backend_permits);
                 tokio::spawn(async move {
                     let _permit = permit;
-                    if let Err(error) = handle_connection(stream, upstream_addr).await {
+                    if let Err(error) =
+                        handle_connection(stream, upstream_addr, backend_permits).await
+                    {
                         eprintln!("warning: public RESP client {peer} failed: {error}");
                     }
                 });
@@ -84,7 +88,11 @@ pub async fn serve(
 }
 
 /// Serve one public client until it disconnects or violates the protocol.
-pub async fn handle_connection(client: TcpStream, upstream_addr: &str) -> Result<(), String> {
+pub async fn handle_connection(
+    client: TcpStream,
+    upstream_addr: &str,
+    backend_permits: Arc<Semaphore>,
+) -> Result<(), String> {
     let (client_read, mut client_write) = client.into_split();
     let mut client_read = BufReader::new(client_read);
     // One upstream connection per client keeps connection-scoped state (such
@@ -125,7 +133,21 @@ pub async fn handle_connection(client: TcpStream, upstream_addr: &str) -> Result
             continue;
         }
 
+        let permit = match Arc::clone(&backend_permits).try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                client_write
+                    .write_all(&resp::encode_error(
+                        "ERR the Ferrite playground backend is busy; try again shortly",
+                    ))
+                    .await
+                    .map_err(|error| format!("failed to write saturation rejection: {error}"))?;
+                continue;
+            }
+        };
+
         let reply = forward(&mut upstream, upstream_addr, &arguments).await;
+        drop(permit);
         let encoded = match reply {
             Ok(value) => {
                 let mut encoded = Vec::new();
@@ -355,14 +377,21 @@ mod tests {
             .contains("exceeds"));
     }
 
-    async fn start_proxy(upstream: &'static str) -> String {
+    async fn start_proxy_with_permits(
+        upstream: &'static str,
+        backend_permits: Arc<Semaphore>,
+    ) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap().to_string();
         tokio::spawn(async move {
             let (client, _) = listener.accept().await.unwrap();
-            let _ = handle_connection(client, upstream).await;
+            let _ = handle_connection(client, upstream, backend_permits).await;
         });
         addr
+    }
+
+    async fn start_proxy(upstream: &'static str) -> String {
+        start_proxy_with_permits(upstream, Arc::new(Semaphore::new(4))).await
     }
 
     #[tokio::test]
@@ -502,5 +531,26 @@ mod tests {
             .unwrap();
         assert!(matches!(reply, RespValue::Error(_)));
         assert!(!upstream.was_shutdown().await);
+    }
+
+    #[tokio::test]
+    async fn returns_an_error_without_forwarding_when_backend_pool_is_saturated() {
+        let upstream = MockFerrite::start().await;
+        let permits = Arc::new(Semaphore::new(1));
+        let held = Arc::clone(&permits).acquire_owned().await.unwrap();
+        let addr = start_proxy_with_permits(upstream.leaked_addr(), permits).await;
+        let mut client = crate::testing::RespClient::connect(&addr).await;
+
+        match client.command(&["PING"]).await {
+            RespValue::Error(message) => assert!(message.contains("backend is busy")),
+            other => panic!("saturated proxy should return an error, got {other:?}"),
+        }
+        assert!(upstream.received_commands().await.is_empty());
+
+        drop(held);
+        assert_eq!(
+            client.command(&["PING"]).await,
+            RespValue::Simple("PONG".into())
+        );
     }
 }

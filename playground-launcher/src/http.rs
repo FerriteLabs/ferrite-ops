@@ -4,6 +4,8 @@
 //! that guards the public RESP port, so neither entry point can administer the
 //! shared Ferrite instance.
 
+use std::sync::Arc;
+
 use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{Html, IntoResponse, Response};
@@ -11,6 +13,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::resp::{self, RespValue};
 use crate::{command, keys, policy};
@@ -22,6 +25,7 @@ pub const MAX_BODY_BYTES: usize = 64 * 1024;
 pub struct AppState {
     pub resp_addr: String,
     pub version: String,
+    pub backend_permits: Arc<Semaphore>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -79,6 +83,15 @@ async fn index() -> Html<&'static str> {
 }
 
 async fn health(State(state): State<AppState>) -> Response {
+    // Health uses the same backend-operation pool as user traffic, but it
+    // never waits for a permit. Returning 429 under saturation avoids a probe
+    // deadlock and lets the orchestrator distinguish overload from a dead
+    // Ferrite child.
+    let _permit = match try_backend_permit(&state) {
+        Some(permit) => permit,
+        None => return backend_busy_response(),
+    };
+
     match resp::execute(&state.resp_addr, &["PING".to_string()]).await {
         Ok(RespValue::Simple(reply)) if reply == "PONG" => api_response(
             StatusCode::OK,
@@ -115,6 +128,11 @@ async fn execute(State(state): State<AppState>, Json(request): Json<ExecuteReque
         );
     }
 
+    let _permit = match try_backend_permit(&state) {
+        Some(permit) => permit,
+        None => return backend_busy_response(),
+    };
+
     match resp::execute(&state.resp_addr, &arguments).await {
         Ok(value) => match resp::to_json(value) {
             Ok(value) => api_response(StatusCode::OK, ApiResponse::ok(value)),
@@ -146,6 +164,11 @@ async fn key_detail(
         return api_response(StatusCode::BAD_REQUEST, ApiResponse::error(error));
     }
 
+    let _permit = match try_backend_permit(&state) {
+        Some(permit) => permit,
+        None => return backend_busy_response(),
+    };
+
     match keys::detail(&state.resp_addr, &key, &cursor).await {
         Ok(Some(detail)) => api_response(StatusCode::OK, ApiResponse::ok(detail)),
         Ok(None) => api_response(StatusCode::NOT_FOUND, ApiResponse::error("Key not found")),
@@ -158,6 +181,19 @@ async fn key_detail(
 
 fn api_response(status: StatusCode, body: ApiResponse) -> Response {
     (status, Json(body)).into_response()
+}
+
+fn try_backend_permit(state: &AppState) -> Option<OwnedSemaphorePermit> {
+    Arc::clone(&state.backend_permits).try_acquire_owned().ok()
+}
+
+fn backend_busy_response() -> Response {
+    api_response(
+        StatusCode::TOO_MANY_REQUESTS,
+        ApiResponse::error(
+            "Ferrite playground backend is busy; retry after an in-flight operation completes",
+        ),
+    )
 }
 
 pub const INDEX_HTML: &str = r##"<!doctype html>
@@ -235,6 +271,7 @@ mod tests {
     use crate::testing::MockFerrite;
     use axum::body::{to_bytes, Body};
     use axum::http::Request;
+    use tokio::sync::Semaphore;
     use tower::ServiceExt;
 
     async fn call(state: AppState, request: Request<Body>) -> (StatusCode, Value) {
@@ -253,13 +290,18 @@ mod tests {
             .unwrap()
     }
 
+    fn state(upstream: &MockFerrite, version: &str) -> AppState {
+        AppState {
+            resp_addr: upstream.addr(),
+            version: version.into(),
+            backend_permits: Arc::new(Semaphore::new(4)),
+        }
+    }
+
     #[tokio::test]
     async fn rejects_administrative_commands_over_http() {
         let upstream = MockFerrite::start().await;
-        let state = AppState {
-            resp_addr: upstream.addr(),
-            version: "test".into(),
-        };
+        let state = state(&upstream, "test");
 
         for command in [
             "SHUTDOWN",
@@ -296,10 +338,7 @@ mod tests {
     #[tokio::test]
     async fn executes_ordinary_commands_over_http() {
         let upstream = MockFerrite::start().await;
-        let state = AppState {
-            resp_addr: upstream.addr(),
-            version: "test".into(),
-        };
+        let state = state(&upstream, "test");
 
         let (status, body) = call(state.clone(), execute_request("SET http-key http-value")).await;
         assert_eq!(status, StatusCode::OK);
@@ -318,10 +357,7 @@ mod tests {
             .map(|index| (format!("field-{index:03}"), format!("value-{index}")))
             .collect();
         upstream.seed_hash("big-hash", values).await;
-        let state = AppState {
-            resp_addr: upstream.addr(),
-            version: "test".into(),
-        };
+        let state = state(&upstream, "test");
 
         let request = Request::builder()
             .uri("/api/keys/detail/big-hash")
@@ -355,10 +391,7 @@ mod tests {
     #[tokio::test]
     async fn missing_keys_return_not_found() {
         let upstream = MockFerrite::start().await;
-        let state = AppState {
-            resp_addr: upstream.addr(),
-            version: "test".into(),
-        };
+        let state = state(&upstream, "test");
         let request = Request::builder()
             .uri("/api/keys/detail/absent")
             .body(Body::empty())
@@ -371,10 +404,7 @@ mod tests {
     #[tokio::test]
     async fn reports_health_from_the_real_resp_server() {
         let upstream = MockFerrite::start().await;
-        let state = AppState {
-            resp_addr: upstream.addr(),
-            version: "9.9.9".into(),
-        };
+        let state = state(&upstream, "9.9.9");
         let request = Request::builder()
             .uri("/api/health")
             .body(Body::empty())
@@ -383,5 +413,46 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["data"]["resp"], json!("PONG"));
         assert_eq!(body["data"]["version"], json!("9.9.9"));
+    }
+
+    #[tokio::test]
+    async fn all_http_backend_paths_fail_fast_when_the_shared_pool_is_saturated() {
+        let upstream = MockFerrite::start().await;
+        upstream.seed_string("key", "value").await;
+        let permits = Arc::new(Semaphore::new(1));
+        let held = Arc::clone(&permits).acquire_owned().await.unwrap();
+        let state = AppState {
+            resp_addr: upstream.addr(),
+            version: "test".into(),
+            backend_permits: permits,
+        };
+
+        let requests = [
+            execute_request("PING"),
+            Request::builder()
+                .uri("/api/keys/detail/key")
+                .body(Body::empty())
+                .unwrap(),
+            Request::builder()
+                .uri("/api/health")
+                .body(Body::empty())
+                .unwrap(),
+        ];
+        for request in requests {
+            let (status, body) = call(state.clone(), request).await;
+            assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+            assert_eq!(body["success"], json!(false));
+            assert!(body["error"].as_str().unwrap().contains("busy"));
+        }
+        assert!(upstream.received_commands().await.is_empty());
+
+        drop(held);
+        let request = Request::builder()
+            .uri("/api/health")
+            .body(Body::empty())
+            .unwrap();
+        let (status, body) = call(state, request).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["data"]["resp"], json!("PONG"));
     }
 }
