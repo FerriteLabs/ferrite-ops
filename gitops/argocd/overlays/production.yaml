@@ -20,7 +20,7 @@ spec:
   source:
     repoURL: https://github.com/ferritelabs/ferrite-ops.git
     # Pin to a release tag in production — never use HEAD.
-    targetRevision: v0.4.0
+    targetRevision: ferrite-ops-v0.4.0
     path: charts/ferrite
     helm:
       releaseName: ferrite

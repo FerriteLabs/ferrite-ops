@@ -33,7 +33,7 @@ kubectl apply -f argocd/overlays/production.yaml
 ```
 
 Key differences in production:
-- `targetRevision` pinned to a release tag (not HEAD)
+- `targetRevision` pinned to an immutable `ferrite-ops-v*` release tag (not HEAD)
 - `prune: false` — requires manual approval for resource deletion
 - HA values file included (`values-ha.yaml`)
 - Pod Disruption Budget enabled (`minAvailable: 2`)
@@ -58,7 +58,7 @@ kubectl apply -f flux/overlays/production.yaml
 ```
 
 Key differences in production:
-- Git source pinned to a release tag
+- Git source pinned to an immutable `ferrite-ops-v*` release tag
 - Longer reconciliation interval (30m vs 10m)
 - Rollback remediation strategy on upgrade failure
 - Pod Disruption Budget enabled

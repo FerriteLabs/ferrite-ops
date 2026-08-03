@@ -131,6 +131,14 @@ assert_contains "$VERSION_SYNC_CONTENT" "shasum -a 256" \
   "version-sync.yml computes the source checksum when not explicitly provided"
 assert_contains "$VERSION_SYNC_CONTENT" "charts/ferrite-sidecar/Chart.yaml" \
   "version-sync.yml keeps the sidecar appVersion synchronized"
+assert_contains "$VERSION_SYNC_CONTENT" "ferrite-ops-v\${VERSION}" \
+  "version-sync.yml advances production GitOps sources to the immutable ops tag"
+assert_contains "$VERSION_SYNC_CONTENT" "repository: ghcr.io/ferritelabs/ferrite" \
+  "version-sync.yml validates the Flux production GHCR repository"
+assert_contains "$VERSION_SYNC_CONTENT" "Skipping RPM spec update for prerelease" \
+  "version-sync.yml explicitly skips RPM spec edits for prereleases"
+assert_contains "$VERSION_SYNC_CONTENT" "Release:        1%{?dist}" \
+  "version-sync.yml resets RPM Release for stable releases"
 assert_contains "$VERSION_SYNC_CONTENT" "types: [ferrite-release, version-sync]" \
   "version-sync.yml triggers on the real ferrite-release dispatch core emits, keeping version-sync for backward compatibility"
 for active_target in \
@@ -265,6 +273,7 @@ if ! python3 - "$RELEASE_YML" "$VERSION_SYNC_YML" "$ORCHESTRATION_YML" \
   "$EXTRACT_DIR/orchestration_meta.sh" "$EXTRACT_DIR/update_dockerfiles.sh" \
   "$EXTRACT_DIR/version_sync_chart.sh" "$EXTRACT_DIR/metadata_tags.txt" \
   "$EXTRACT_DIR/combine_tags.sh" "$EXTRACT_DIR/dockerhub_eligibility.sh" \
+  "$EXTRACT_DIR/update_rpm.sh" \
   >"${EXTRACT_DIR}/extract.stdout" 2>"${EXTRACT_DIR}/extract.log" << 'PYEOF'
 import sys
 import yaml
@@ -281,6 +290,7 @@ import yaml
     metadata_tags_out_path,
     combine_tags_out_path,
     dockerhub_eligibility_out_path,
+    update_rpm_out_path,
 ) = sys.argv[1:]
 with open(release_yml_path) as f:
     doc = yaml.safe_load(f)
@@ -379,6 +389,12 @@ version_sync_chart_script = sync_script
 with open(version_sync_chart_out_path, "w") as f:
     f.write(version_sync_chart_script)
 
+rpm_script = next(
+    s["run"] for s in sync_steps if s.get("name") == "Update RPM spec"
+)
+with open(update_rpm_out_path, "w") as f:
+    f.write(rpm_script)
+
 with open(orchestration_yml_path) as f:
     orchestration_doc = yaml.safe_load(f)
 orchestration_meta_script = next(
@@ -455,9 +471,14 @@ if (cd "$SYNC_DIR" && VERSION="$SYNC_VERSION" SHA256="$SYNC_SHA256" bash -c "$SY
   assert_eq "2" "$(grep -c "FERRITE_SOURCE_SHA256:-${SYNC_SHA256}" "${SYNC_DIR}/docker-compose.moonshot.yml")" \
     "version-sync functional replay updates both Moonshot checksum defaults"
   assert_contains "$(cat "${SYNC_DIR}/gitops/argocd/overlays/production.yaml")" \
-    "targetRevision: v${SYNC_VERSION}" "version-sync functional replay updates Argo CD"
+    "targetRevision: ferrite-ops-v${SYNC_VERSION}" \
+    "version-sync functional replay updates Argo CD to the immutable ops tag"
   assert_contains "$(cat "${SYNC_DIR}/gitops/flux/overlays/production.yaml")" \
-    "tag: v${SYNC_VERSION}" "version-sync functional replay updates Flux"
+    "tag: ferrite-ops-v${SYNC_VERSION}" \
+    "version-sync functional replay updates Flux to the immutable ops tag"
+  assert_contains "$(cat "${SYNC_DIR}/gitops/flux/overlays/production.yaml")" \
+    "repository: ghcr.io/ferritelabs/ferrite" \
+    "version-sync functional replay preserves the Flux production GHCR repository"
   assert_contains "$(cat "${SYNC_DIR}/gitops/kustomize/base/statefulset.yaml")" \
     "image: ghcr.io/ferritelabs/ferrite:${SYNC_VERSION}" \
     "version-sync functional replay updates the Kustomize base StatefulSet image tag while preserving its GHCR repository"
@@ -474,6 +495,47 @@ if (cd "$SYNC_DIR" && VERSION="$SYNC_VERSION" SHA256="$SYNC_SHA256" bash -c "$SY
     "version-sync functional replay updates the release workflow dispatch default"
 else
   harness_fail "version-sync functional replay unexpectedly failed"
+fi
+
+# Stable releases update both RPM Version and Release. Prereleases leave the
+# entire spec byte-for-byte unchanged so a hyphenated SemVer is never written
+# into RPM Version.
+RPM_SCRIPT="$(cat "${EXTRACT_DIR}/update_rpm.sh")"
+RPM_STABLE_DIR="${EXTRACT_DIR}/rpm-stable"
+mkdir -p "${RPM_STABLE_DIR}/packaging/rpm"
+cp "${REPO_ROOT}/packaging/rpm/ferrite.spec" "${RPM_STABLE_DIR}/packaging/rpm/ferrite.spec"
+sed -i.bak 's/^Release:.*/Release:        7%{?dist}/' \
+  "${RPM_STABLE_DIR}/packaging/rpm/ferrite.spec"
+rm -f "${RPM_STABLE_DIR}/packaging/rpm/ferrite.spec.bak"
+if (cd "$RPM_STABLE_DIR" && VERSION="$SYNC_VERSION" bash -c "$RPM_SCRIPT"); then
+  assert_contains "$(cat "${RPM_STABLE_DIR}/packaging/rpm/ferrite.spec")" \
+    "Version:        ${SYNC_VERSION}" \
+    "stable version-sync replay updates RPM Version"
+  assert_contains "$(cat "${RPM_STABLE_DIR}/packaging/rpm/ferrite.spec")" \
+    'Release:        1%{?dist}' \
+    "stable version-sync replay resets RPM Release"
+else
+  harness_fail "stable RPM version-sync replay unexpectedly failed"
+fi
+
+RPM_PRERELEASE_DIR="${EXTRACT_DIR}/rpm-prerelease"
+mkdir -p "${RPM_PRERELEASE_DIR}/packaging/rpm"
+cp "${REPO_ROOT}/packaging/rpm/ferrite.spec" \
+  "${RPM_PRERELEASE_DIR}/packaging/rpm/ferrite.spec"
+RPM_BEFORE="$(shasum -a 256 "${RPM_PRERELEASE_DIR}/packaging/rpm/ferrite.spec" | awk '{print $1}')"
+if (cd "$RPM_PRERELEASE_DIR" && VERSION="0.5.0-rc.1" bash -c "$RPM_SCRIPT" \
+  >"${EXTRACT_DIR}/rpm-prerelease.log" 2>&1); then
+  RPM_AFTER="$(shasum -a 256 "${RPM_PRERELEASE_DIR}/packaging/rpm/ferrite.spec" | awk '{print $1}')"
+  assert_eq "$RPM_BEFORE" "$RPM_AFTER" \
+    "0.5.0-rc.1 version-sync replay leaves the RPM spec unchanged"
+  assert_contains "$(cat "${EXTRACT_DIR}/rpm-prerelease.log")" \
+    "Skipping RPM spec update for prerelease 0.5.0-rc.1" \
+    "prerelease RPM skip is explicit"
+  assert_not_contains "$(cat "${RPM_PRERELEASE_DIR}/packaging/rpm/ferrite.spec")" \
+    "Version:        0.5.0-rc.1" \
+    "prerelease SemVer is never written into RPM Version"
+else
+  harness_fail "prerelease RPM version-sync replay unexpectedly failed"
 fi
 
 DRIFT_DIR="${EXTRACT_DIR}/sync-drift"

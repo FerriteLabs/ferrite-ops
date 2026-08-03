@@ -1,7 +1,7 @@
 # Ferrite RPM Spec File
 
 Name:           ferrite
-Version:        0.3.0
+Version:        0.4.0
 Release:        1%{?dist}
 Summary:        High-performance, tiered-storage key-value store
 

@@ -162,9 +162,10 @@ jobs:
           test "$(grep -c "image: ferrite:\${FERRITE_VERSION:-" "$DEFAULT_COMPOSE")" -eq 1
           test "$(grep -c "FERRITE_VERSION: \"\${FERRITE_VERSION:-" "$MOONSHOT_COMPOSE")" -eq 2
           test "$(grep -c "FERRITE_SOURCE_SHA256: \"\${FERRITE_SOURCE_SHA256:-" "$MOONSHOT_COMPOSE")" -eq 2
-          test "$(grep -c '^    targetRevision: v' "$ARGOCD_PRODUCTION")" -eq 1
+          test "$(grep -c '^    targetRevision: ferrite-ops-v' "$ARGOCD_PRODUCTION")" -eq 1
           test "$(grep -c '^        - name: image.tag$' "$ARGOCD_PRODUCTION")" -eq 1
-          test "$(grep -c '^    tag: v' "$FLUX_PRODUCTION")" -eq 1
+          test "$(grep -c '^    tag: ferrite-ops-v' "$FLUX_PRODUCTION")" -eq 1
+          test "$(grep -c '^      repository: ghcr.io/ferritelabs/ferrite$' "$FLUX_PRODUCTION")" -eq 1
           test "$(grep -c '^      tag: "' "$FLUX_PRODUCTION")" -eq 1
           test "$(grep -c '^          image: ghcr.io/ferritelabs/ferrite:' "$KUSTOMIZE_STATEFULSET")" -eq 1
           for terraform_file in "${TERRAFORM_FILES[@]}"; do
@@ -193,12 +194,12 @@ jobs:
           perl -pi -e "s#(image: ferrite:\\\${FERRITE_VERSION:-)[^}]+(})#\${1}${VERSION}\${2}#" "$STAGING_DIR/$DEFAULT_COMPOSE"
           perl -pi -e "s#(FERRITE_VERSION: \"\\\${FERRITE_VERSION:-)[^}]+(}\")#\${1}${VERSION}\${2}#" "$STAGING_DIR/$MOONSHOT_COMPOSE"
           perl -pi -e "s#(FERRITE_SOURCE_SHA256: \"\\\${FERRITE_SOURCE_SHA256:-)[^}]+(}\")#\${1}${SHA256}\${2}#" "$STAGING_DIR/$MOONSHOT_COMPOSE"
-          perl -pi -e "s/^    targetRevision: v.*/    targetRevision: v${VERSION}/" "$STAGING_DIR/$ARGOCD_PRODUCTION"
+          perl -pi -e "s/^    targetRevision: ferrite-ops-v.*/    targetRevision: ferrite-ops-v${VERSION}/" "$STAGING_DIR/$ARGOCD_PRODUCTION"
           # shellcheck disable=SC2016
           VERSION="$VERSION" perl -0pi -e \
             's/(- name: image\.tag\s*\n\s*value: ")[^"]*(")/$1 . $ENV{VERSION} . $2/se' \
             "$STAGING_DIR/$ARGOCD_PRODUCTION"
-          perl -pi -e "s/^    tag: v.*/    tag: v${VERSION}/" "$STAGING_DIR/$FLUX_PRODUCTION"
+          perl -pi -e "s/^    tag: ferrite-ops-v.*/    tag: ferrite-ops-v${VERSION}/" "$STAGING_DIR/$FLUX_PRODUCTION"
           perl -pi -e "s/^      tag: \".*\"/      tag: \"${VERSION}\"/" "$STAGING_DIR/$FLUX_PRODUCTION"
           perl -pi -e "s#^(          image: ghcr\\.io/ferritelabs/ferrite:).*#\${1}${VERSION}#" "$STAGING_DIR/$KUSTOMIZE_STATEFULSET"
           # shellcheck disable=SC2016
@@ -223,10 +224,11 @@ jobs:
           grep -qx "    image: ferrite:\${FERRITE_VERSION:-${VERSION}}" "$STAGING_DIR/$DEFAULT_COMPOSE"
           test "$(grep -c "FERRITE_VERSION:-${VERSION}" "$STAGING_DIR/$MOONSHOT_COMPOSE")" -eq 2
           test "$(grep -c "FERRITE_SOURCE_SHA256:-${SHA256}" "$STAGING_DIR/$MOONSHOT_COMPOSE")" -eq 2
-          grep -qx "    targetRevision: v${VERSION}" "$STAGING_DIR/$ARGOCD_PRODUCTION"
+          grep -qx "    targetRevision: ferrite-ops-v${VERSION}" "$STAGING_DIR/$ARGOCD_PRODUCTION"
           grep -A1 '^        - name: image.tag$' "$STAGING_DIR/$ARGOCD_PRODUCTION" |
             grep -qx "          value: \"${VERSION}\""
-          grep -qx "    tag: v${VERSION}" "$STAGING_DIR/$FLUX_PRODUCTION"
+          grep -qx "    tag: ferrite-ops-v${VERSION}" "$STAGING_DIR/$FLUX_PRODUCTION"
+          grep -qx "      repository: ghcr.io/ferritelabs/ferrite" "$STAGING_DIR/$FLUX_PRODUCTION"
           grep -qx "      tag: \"${VERSION}\"" "$STAGING_DIR/$FLUX_PRODUCTION"
           grep -qx "          image: ghcr.io/ferritelabs/ferrite:${VERSION}" "$STAGING_DIR/$KUSTOMIZE_STATEFULSET"
           for terraform_file in "${TERRAFORM_FILES[@]}"; do
@@ -251,8 +253,19 @@ jobs:
             exit 1
           fi
           SPEC="packaging/rpm/ferrite.spec"
-          if [ -f "$SPEC" ]; then
-            sed -i "s/^Version:.*/Version:        ${VERSION}/" "$SPEC"
+          if [ ! -f "$SPEC" ]; then
+            echo "::error::RPM spec not found: ${SPEC}"
+            exit 1
+          fi
+          if printf '%s\n' "$VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            test "$(grep -c '^Version:' "$SPEC")" -eq 1
+            test "$(grep -c '^Release:' "$SPEC")" -eq 1
+            perl -pi -e "s/^Version:.*/Version:        ${VERSION}/" "$SPEC"
+            perl -pi -e 's/^Release:.*/Release:        1%{?dist}/' "$SPEC"
+            grep -qx "Version:        ${VERSION}" "$SPEC"
+            grep -Fqx 'Release:        1%{?dist}' "$SPEC"
+          else
+            echo "Skipping RPM spec update for prerelease ${VERSION}; RPM Version remains on the latest stable release."
           fi
 
       - name: Create version sync PR
@@ -269,7 +282,7 @@ jobs:
             - Canonical `active-release.env` metadata and every active release pin
             - All three Dockerfiles' `FERRITE_VERSION` and `FERRITE_SOURCE_SHA256` args
             - Helm, Compose, GitOps, Terraform, and release-dispatch defaults
-            - RPM spec `Version`
+            - RPM spec `Version`/`Release` for stable releases only
           branch: version-sync/${{ steps.version.outputs.version }}
           commit-message: "chore: sync version to v${{ steps.version.outputs.version }}"
           labels: automated,version-sync

@@ -65,12 +65,15 @@ assert_eq "2" \
 
 ARGOCD="${REPO_ROOT}/gitops/argocd/overlays/production.yaml"
 FLUX="${REPO_ROOT}/gitops/flux/overlays/production.yaml"
-assert_contains "$(cat "$ARGOCD")" "targetRevision: v${EXPECTED_VERSION}" \
-  "Argo CD production tracks the active release tag"
+EXPECTED_OPS_TAG="ferrite-ops-v${EXPECTED_VERSION}"
+assert_contains "$(cat "$ARGOCD")" "targetRevision: ${EXPECTED_OPS_TAG}" \
+  "Argo CD production tracks the immutable active ops release tag"
 assert_contains "$(cat "$ARGOCD")" "value: \"${EXPECTED_VERSION}\"" \
   "Argo CD production pins the active image version"
-assert_contains "$(cat "$FLUX")" "tag: v${EXPECTED_VERSION}" \
-  "Flux production tracks the active release tag"
+assert_contains "$(cat "$FLUX")" "tag: ${EXPECTED_OPS_TAG}" \
+  "Flux production tracks the immutable active ops release tag"
+assert_contains "$(cat "$FLUX")" "repository: ghcr.io/ferritelabs/ferrite" \
+  "Flux production uses the canonical GHCR image repository"
 assert_contains "$(cat "$FLUX")" "tag: \"${EXPECTED_VERSION}\"" \
   "Flux production pins the active image version"
 
@@ -95,5 +98,20 @@ assert_eq "2" \
 RELEASE_WORKFLOW="${REPO_ROOT}/.github/workflows/release.yml"
 assert_contains "$(cat "$RELEASE_WORKFLOW")" "default: 'v${EXPECTED_VERSION}'" \
   "release workflow dispatch defaults to the active release"
+
+RPM_SPEC="${REPO_ROOT}/packaging/rpm/ferrite.spec"
+RPM_VERSION="$(sed -n 's/^Version:[[:space:]]*//p' "$RPM_SPEC")"
+if printf '%s\n' "$EXPECTED_VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+  assert_eq "$EXPECTED_VERSION" "$RPM_VERSION" \
+    "stable active releases synchronize the RPM Version"
+else
+  if printf '%s\n' "$RPM_VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+    harness_ok "prerelease active releases leave RPM Version on a non-hyphenated stable release"
+  else
+    harness_fail "prerelease active releases must not write prerelease text into RPM Version"
+  fi
+fi
+assert_contains "$(cat "$RPM_SPEC")" 'Release:        1%{?dist}' \
+  "RPM Release retains the canonical stable release value"
 
 harness_summary
