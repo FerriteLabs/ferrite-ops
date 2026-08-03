@@ -46,7 +46,9 @@
 | F-35 | P0 | Release workflow injection | Dispatch/workflow payloads were interpolated directly into privileged shell scripts and checksums were not uniformly validated before use/output. | Fixed; GitHub expressions enter through step environments, semver is normalized/validated, every checksum is exactly 64 hex characters, and malicious substitutions are inert in functional tests |
 | F-36 | P1 | Playground unbounded reads | `SCAN` variants and `XREAD` appeared bounded by syntax but are not effectively bounded in Ferrite v0.4.0; reordered arguments could bypass the validator. | Fixed; `SCAN`/`SSCAN`/`HSCAN`/`ZSCAN`, `XREAD`, and `XREADGROUP` are absent from the public allowlist over HTTP and RESP |
 | F-37 | P1 | Slow clients and resources | Backend permits ended before RESP writes, HTTP limited handlers rather than accepted connections, and writes/connections lacked strict deadlines. | Fixed; RESP permits cover timed writes, public RESP and HTTP connections are lifetime-capped, HTTP connections expire, and HTTP/RESP output budgets are reduced and tested under saturation |
-| F-38 | P1 | Inline RESP parsing | Inline commands split on whitespace and silently truncated beyond `MAX_ARGUMENTS`, so quoting/escaping semantics differed from HTTP. | Fixed; inline RESP reuses the tested quoted/escaped parser and rejects invalid UTF-8, unterminated input, and oversized argument lists |
+| F-38 | P1 | Inline RESP parsing | Inline commands used text quoting/escaping semantics that are incompatible with binary-safe Redis wire arguments. | Fixed; public RESP accepts arrays only, rejects inline input with one bounded protocol error, and closes the connection |
+| F-39 | P1 | HTTP binary JSON | Invalid UTF-8 bulk replies expanded into a JSON number per byte and only hit the HTTP output cap after allocating the body. | Fixed; conversion reserves the output budget first and returns compact typed base64 data |
+| F-40 | P0 | Proxy session state | A timeout, oversized reply, parse error, or upstream I/O error dropped a stateful child connection and silently reconnected the public client on default SELECT/HELLO state. | Fixed; one bounded state-loss error is returned and the public client connection closes |
 
 ## D-01 Resolution
 
@@ -76,16 +78,20 @@ Playground additionally:
 
 Active operational defaults now agree on Ferrite v0.4.0:
 
+- `active-release.env` is the machine-readable source of truth for the active
+  version and verified source SHA256;
 - primary, Moonshot, and Playground Dockerfiles and source checksums;
 - primary Helm chart version/appVersion and the Ferrite-tracking sidecar appVersion;
-- quickstart Compose, production Argo CD/Flux overlays, and Terraform defaults;
+- default/quickstart/Moonshot Compose, production Argo CD/Flux overlays, and Terraform defaults;
 - release workflow dispatch default;
-- Moonshot Compose build arguments.
+- Moonshot Compose build arguments and source checksums.
 
-`version-sync.yml` prevalidates all three Dockerfiles before editing any file, updates both version and
-checksum in one step, and validates the resulting lines. `tests/test_release_workflows.sh` functionally
-replays both the successful three-file update and the structural-drift failure path. Release metadata is
-normalized before Docker tag generation, so a stable `v0.4.0` dispatch publishes `0.4.0`, `0.4`, `0`, and
+`version-sync.yml` prevalidates the canonical file and every active release pin, stages all replacements,
+validates the staged result, and only then replaces the working-tree targets. It updates all three
+Dockerfiles, both chart appVersions, Compose, production GitOps, Terraform defaults/examples, and the
+release workflow dispatch default together. `tests/test_release_workflows.sh` functionally replays both the
+successful full transaction and a structural-drift failure that leaves canonical metadata unchanged. Release
+metadata is normalized before Docker tag generation, so a stable `v0.4.0` dispatch publishes `0.4.0`, `0.4`, `0`, and
 `latest`; prereleases publish only their exact normalized tag.
 
 All chart-update release paths update the primary chart's package version/appVersion and the sidecar
@@ -118,9 +124,10 @@ points be tested end to end without a Ferrite build.
 Lifecycle and administrative safety:
 
 - the Ferrite child is spawned with `--bind 127.0.0.1 --port 6380` and is never publicly reachable;
-- the launcher owns `0.0.0.0:6379`, decodes RESP array and inline commands, classifies each one, and
-  forwards only approved commands to the child, re-encoding the real reply byte-for-byte. Inline
-  commands share the HTTP parser's quoted/escaped syntax and reject malformed or oversized argv;
+- the launcher owns `0.0.0.0:6379`, accepts only RESP array commands, classifies each one, and forwards
+  only approved commands to the child, re-encoding the real reply byte-for-byte. Inline wire commands
+  receive one bounded protocol error and the public connection closes; HTTP retains its separate,
+  quoted/escaped command-line parser;
 - `policy` is an explicit public allowlist rather than a denylist. It permits health/introspection and
   bounded Redis-compatible string, hash, list, set, sorted-set, stream, bit, HyperLogLog, key, and
   expiry operations; every other command is rejected before forwarding. This default rejection covers
@@ -164,15 +171,15 @@ Response and resource bounds:
   decoded reply cannot grow an unbounded forwarding buffer;
 - JSON API bodies have an independent 64 KiB ceiling and oversized results are replaced with a
   bounded error response;
-- an over-budget reply drops the desynchronized upstream connection, returns an error, and the
-  client's next command is served normally;
+- a timeout, over-budget reply, parse failure, or upstream I/O error returns one bounded state-loss error
+  and closes the public client rather than reconnecting it with default SELECT/HELLO state;
 - key detail is bounded per type — `GETRANGE` with `STRLEN` for strings and 100-element `LRANGE`,
   `ZRANGE ... WITHSCORES`, and `XRANGE ... COUNT` pages. Hashes and sets return type, TTL, length,
   `value_omitted: true`, and a clear v0.4.0 scan-omission reason without invoking `HSCAN`/`SSCAN`.
 
 ## Runtime Verification Completed
 
-- 67 `playground-launcher` unit tests pass (`cargo test`), run from `tests/run.sh` via
+- 72 `playground-launcher` unit tests pass (`cargo test`), run from `tests/run.sh` via
   `tests/test_playground_launcher_unit.sh` and from a dedicated CI job.
 - The exact Playground image build, start, and probe suite passes: `SHUTDOWN`, `PLUGIN`, `AUDIT`,
   `MIGRATE.START`, unbounded `LRANGE`, and `XRANGE` without `COUNT` are refused over both HTTP and
@@ -193,6 +200,9 @@ Response and resource bounds:
   (without a timeout override) completed before Docker's default SIGKILL deadline, the container exited
   with code 0, and no child/container process leaked.
 - The v0.4.0 source-stage checksum verification succeeded against the authoritative tarball.
+- HTTP binary replies are emitted as compact base64 objects, reject conversion before their output budget
+  is exceeded, and remain bounded under concurrent requests. SELECT and RESP3/HELLO state-loss regression
+  tests prove a public client is closed rather than silently reconnected on database 0 or RESP2.
 
 ## Deferred Items
 
