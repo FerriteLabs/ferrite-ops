@@ -4,22 +4,148 @@
 //! that guards the public RESP port, so neither entry point can administer the
 //! shared Ferrite instance.
 
+use std::future::Future;
+use std::io;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
+use std::time::Duration;
 
+use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, Path, State};
-use axum::http::StatusCode;
-use axum::response::{Html, IntoResponse, Response};
+use axum::http::{header, StatusCode};
+use axum::response::{Html, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::time::{sleep, Sleep};
 
 use crate::resp::{self, RespValue};
 use crate::{command, keys, policy};
 
 pub const HTTP_ADDR: &str = "0.0.0.0:8080";
 pub const MAX_BODY_BYTES: usize = 64 * 1024;
+pub const MAX_RESPONSE_BODY_BYTES: usize = 64 * 1024;
+pub const MAX_HTTP_CONNECTIONS: usize = 32;
+pub const HTTP_CONNECTION_LIFETIME: Duration = Duration::from_secs(30);
+
+pub struct LimitedListener {
+    listener: TcpListener,
+    permits: Arc<Semaphore>,
+    connection_lifetime: Duration,
+}
+
+impl LimitedListener {
+    pub fn new(listener: TcpListener) -> Self {
+        Self::with_limits(listener, MAX_HTTP_CONNECTIONS, HTTP_CONNECTION_LIFETIME)
+    }
+
+    fn with_limits(listener: TcpListener, max_connections: usize, lifetime: Duration) -> Self {
+        Self {
+            listener,
+            permits: Arc::new(Semaphore::new(max_connections)),
+            connection_lifetime: lifetime,
+        }
+    }
+}
+
+pub struct LimitedIo {
+    stream: TcpStream,
+    _permit: OwnedSemaphorePermit,
+    deadline: Pin<Box<Sleep>>,
+}
+
+impl LimitedIo {
+    fn poll_expired(&mut self, cx: &mut Context<'_>) -> io::Result<()> {
+        if self.deadline.as_mut().poll(cx).is_ready() {
+            Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "HTTP connection lifetime exceeded",
+            ))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+impl AsyncRead for LimitedIo {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buffer: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        if let Err(error) = self.poll_expired(cx) {
+            return Poll::Ready(Err(error));
+        }
+        Pin::new(&mut self.stream).poll_read(cx, buffer)
+    }
+}
+
+impl AsyncWrite for LimitedIo {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buffer: &[u8],
+    ) -> Poll<Result<usize, io::Error>> {
+        if let Err(error) = self.poll_expired(cx) {
+            return Poll::Ready(Err(error));
+        }
+        Pin::new(&mut self.stream).poll_write(cx, buffer)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
+        if let Err(error) = self.poll_expired(cx) {
+            return Poll::Ready(Err(error));
+        }
+        Pin::new(&mut self.stream).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<(), io::Error>> {
+        Pin::new(&mut self.stream).poll_shutdown(cx)
+    }
+}
+
+impl axum::serve::Listener for LimitedListener {
+    type Io = LimitedIo;
+    type Addr = std::net::SocketAddr;
+
+    async fn accept(&mut self) -> (Self::Io, Self::Addr) {
+        let permit = Arc::clone(&self.permits)
+            .acquire_owned()
+            .await
+            .expect("HTTP connection semaphore is never closed");
+        loop {
+            match self.listener.accept().await {
+                Ok((stream, address)) => {
+                    let _ = stream.set_nodelay(true);
+                    return (
+                        LimitedIo {
+                            stream,
+                            _permit: permit,
+                            deadline: Box::pin(sleep(self.connection_lifetime)),
+                        },
+                        address,
+                    );
+                }
+                Err(error) => {
+                    eprintln!("warning: HTTP playground accept failed: {error}");
+                    sleep(Duration::from_millis(100)).await;
+                }
+            }
+        }
+    }
+
+    fn local_addr(&self) -> io::Result<Self::Addr> {
+        self.listener.local_addr()
+    }
+}
 
 #[derive(Clone)]
 pub struct AppState {
@@ -162,7 +288,20 @@ async fn key_detail(State(state): State<AppState>, Path(key): Path<String>) -> R
 }
 
 fn api_response(status: StatusCode, body: ApiResponse) -> Response {
-    (status, Json(body)).into_response()
+    let mut status = status;
+    let mut encoded = serde_json::to_vec(&body).unwrap_or_else(|_| {
+        br#"{"success":false,"error":"failed to serialize API response"}"#.to_vec()
+    });
+    if encoded.len() > MAX_RESPONSE_BODY_BYTES {
+        status = StatusCode::PAYLOAD_TOO_LARGE;
+        encoded =
+            br#"{"success":false,"error":"response exceeds the playground output limit"}"#.to_vec();
+    }
+    Response::builder()
+        .status(status)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(encoded))
+        .expect("static API response headers are valid")
 }
 
 fn try_backend_permit(state: &AppState) -> Option<OwnedSemaphorePermit> {
@@ -253,7 +392,10 @@ mod tests {
     use crate::testing::MockFerrite;
     use axum::body::{to_bytes, Body};
     use axum::http::Request;
+    use axum::serve::Listener;
+    use tokio::io::AsyncWriteExt;
     use tokio::sync::Semaphore;
+    use tokio::time::timeout;
     use tower::ServiceExt;
 
     async fn call(state: AppState, request: Request<Body>) -> (StatusCode, Value) {
@@ -463,5 +605,74 @@ mod tests {
         let (status, body) = call(state, request).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["data"]["resp"], json!("PONG"));
+    }
+
+    #[tokio::test]
+    async fn oversized_http_results_are_replaced_with_a_bounded_error_body() {
+        let upstream = MockFerrite::start().await;
+        upstream
+            .seed_string("large", &"x".repeat(MAX_RESPONSE_BODY_BYTES + 1))
+            .await;
+        let state = state(&upstream, "test");
+
+        let response = router(state)
+            .oneshot(execute_request("GET large"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let bytes = to_bytes(response.into_body(), MAX_RESPONSE_BODY_BYTES)
+            .await
+            .unwrap();
+        assert!(bytes.len() <= MAX_RESPONSE_BODY_BYTES);
+    }
+
+    #[tokio::test]
+    async fn accepted_http_connections_are_limited_for_their_full_lifetime() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let listener = LimitedListener::with_limits(listener, 1, Duration::from_secs(1));
+        let first_accept = tokio::spawn(async move {
+            let mut listener = listener;
+            let accepted = listener.accept().await;
+            (listener, accepted)
+        });
+        let first_client = TcpStream::connect(address).await.unwrap();
+        let (mut listener, (first_io, _)) = first_accept.await.unwrap();
+
+        let mut second_accept = tokio::spawn(async move {
+            let accepted = listener.accept().await;
+            (listener, accepted)
+        });
+        let _queued_client = TcpStream::connect(address).await.unwrap();
+        assert!(timeout(Duration::from_millis(50), &mut second_accept)
+            .await
+            .is_err());
+
+        drop(first_io);
+        let (_listener, (_second_io, _)) = timeout(Duration::from_secs(1), second_accept)
+            .await
+            .expect("queued connection should be accepted after the lifetime permit is released")
+            .unwrap();
+        drop(first_client);
+    }
+
+    #[tokio::test]
+    async fn http_connection_deadline_closes_slow_connections() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let mut listener = LimitedListener::with_limits(listener, 1, Duration::from_millis(30));
+        let accepted = tokio::spawn(async move { listener.accept().await });
+        let client = TcpStream::connect(address).await.unwrap();
+        let (mut server, _) = accepted.await.unwrap();
+
+        sleep(Duration::from_millis(50)).await;
+        let error = server
+            .write_all(b"HTTP/1.1 200 OK\r\n\r\n")
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+
+        drop(server);
+        drop(client);
     }
 }

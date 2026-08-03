@@ -82,12 +82,15 @@ async fn run() -> Result<(), String> {
 
     let (http_shutdown_tx, http_shutdown_rx) = oneshot::channel::<()>();
     let mut http_server: Option<JoinHandle<Result<(), String>>> = Some(tokio::spawn(async move {
-        axum::serve(http_listener, http::router(state))
-            .with_graceful_shutdown(async {
-                let _ = http_shutdown_rx.await;
-            })
-            .await
-            .map_err(|error| format!("HTTP playground server failed: {error}"))
+        axum::serve(
+            http::LimitedListener::new(http_listener),
+            http::router(state),
+        )
+        .with_graceful_shutdown(async {
+            let _ = http_shutdown_rx.await;
+        })
+        .await
+        .map_err(|error| format!("HTTP playground server failed: {error}"))
     }));
 
     let (proxy_shutdown_tx, proxy_shutdown_rx) = oneshot::channel::<()>();

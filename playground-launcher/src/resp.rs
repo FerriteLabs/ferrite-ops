@@ -29,7 +29,7 @@ pub const MAX_RESPONSE_ELEMENTS: usize = 8 * 1024;
 /// every element of every nested array together — rather than each element
 /// individually, so a reply made of many individually small elements (for
 /// example `KEYS *` on a large keyspace) cannot exhaust the launcher's memory.
-pub const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+pub const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 /// Maximum number of arguments accepted in one command.
 pub const MAX_ARGUMENTS: usize = 256;
 /// Time bound for a full connect/write/read cycle against the Ferrite child.

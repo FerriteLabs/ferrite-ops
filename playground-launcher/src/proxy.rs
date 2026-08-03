@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{oneshot, Semaphore};
+use tokio::sync::{oneshot, OwnedSemaphorePermit, Semaphore};
 use tokio::time::timeout;
 
 use crate::policy;
@@ -29,6 +29,8 @@ pub const MAX_REQUEST_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_CONNECTIONS: usize = 64;
 /// A client that sends nothing for this long is disconnected.
 pub const CLIENT_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+/// A client must accept each bounded response within this deadline.
+pub const CLIENT_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// A decoded client request, or the end of the client's stream.
 #[derive(Debug, PartialEq)]
@@ -63,11 +65,13 @@ pub async fn serve(
                     Ok(permit) => permit,
                     Err(_) => {
                         let mut stream = stream;
-                        let _ = stream
-                            .write_all(&resp::encode_error(
+                        let _ = write_response(
+                            &mut stream,
+                            &resp::encode_error(
                                 "ERR the Ferrite playground has too many connections; try again shortly",
-                            ))
-                            .await;
+                            ),
+                            CLIENT_WRITE_TIMEOUT,
+                        ).await;
                         let _ = stream.shutdown().await;
                         continue;
                     }
@@ -103,14 +107,22 @@ pub async fn handle_connection(
         let request = match timeout(CLIENT_IDLE_TIMEOUT, read_request(&mut client_read)).await {
             Ok(Ok(request)) => request,
             Ok(Err(error)) => {
-                let _ = client_write.write_all(&resp::encode_error(&error)).await;
+                let _ = write_response(
+                    &mut client_write,
+                    &resp::encode_error(&error),
+                    CLIENT_WRITE_TIMEOUT,
+                )
+                .await;
                 let _ = client_write.shutdown().await;
                 return Ok(());
             }
             Err(_) => {
-                let _ = client_write
-                    .write_all(&resp::encode_error("ERR playground client idle timeout"))
-                    .await;
+                let _ = write_response(
+                    &mut client_write,
+                    &resp::encode_error("ERR playground client idle timeout"),
+                    CLIENT_WRITE_TIMEOUT,
+                )
+                .await;
                 let _ = client_write.shutdown().await;
                 return Ok(());
             }
@@ -126,28 +138,33 @@ pub async fn handle_connection(
 
         let decision = policy::classify_bytes_arguments(&arguments);
         if !decision.is_allowed() {
-            client_write
-                .write_all(&resp::encode_error(&decision.message()))
-                .await
-                .map_err(|error| format!("failed to write policy rejection: {error}"))?;
+            write_response(
+                &mut client_write,
+                &resp::encode_error(&decision.message()),
+                CLIENT_WRITE_TIMEOUT,
+            )
+            .await
+            .map_err(|error| format!("failed to write policy rejection: {error}"))?;
             continue;
         }
 
         let permit = match Arc::clone(&backend_permits).try_acquire_owned() {
             Ok(permit) => permit,
             Err(_) => {
-                client_write
-                    .write_all(&resp::encode_error(
+                write_response(
+                    &mut client_write,
+                    &resp::encode_error(
                         "ERR the Ferrite playground backend is busy; try again shortly",
-                    ))
-                    .await
-                    .map_err(|error| format!("failed to write saturation rejection: {error}"))?;
+                    ),
+                    CLIENT_WRITE_TIMEOUT,
+                )
+                .await
+                .map_err(|error| format!("failed to write saturation rejection: {error}"))?;
                 continue;
             }
         };
 
         let reply = forward(&mut upstream, upstream_addr, &arguments).await;
-        drop(permit);
         let encoded = match reply {
             Ok(value) => {
                 let mut encoded = Vec::new();
@@ -166,11 +183,44 @@ pub async fn handle_connection(
                 resp::encode_error(&format!("ERR playground backend error: {error}"))
             }
         };
-        client_write
-            .write_all(&encoded)
+        write_backend_response(&mut client_write, &encoded, permit, CLIENT_WRITE_TIMEOUT)
             .await
             .map_err(|error| format!("failed to write RESP reply: {error}"))?;
     }
+}
+
+async fn write_backend_response<W>(
+    writer: &mut W,
+    encoded: &[u8],
+    permit: OwnedSemaphorePermit,
+    deadline: Duration,
+) -> Result<(), String>
+where
+    W: AsyncWriteExt + Unpin,
+{
+    let result = write_response(writer, encoded, deadline).await;
+    drop(permit);
+    result
+}
+
+async fn write_response<W>(writer: &mut W, encoded: &[u8], deadline: Duration) -> Result<(), String>
+where
+    W: AsyncWriteExt + Unpin,
+{
+    timeout(deadline, async {
+        writer
+            .write_all(encoded)
+            .await
+            .map_err(|error| error.to_string())?;
+        writer.flush().await.map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|_| {
+        format!(
+            "client write timeout after {} seconds",
+            deadline.as_secs_f64()
+        )
+    })?
 }
 
 async fn forward(
@@ -328,7 +378,7 @@ fn parse_number(payload: &[u8], field: &str) -> Result<i64, String> {
 mod tests {
     use super::*;
     use crate::testing::MockFerrite;
-    use tokio::io::BufReader as IoBufReader;
+    use tokio::io::{duplex, BufReader as IoBufReader};
 
     async fn decode(input: &[u8]) -> Result<Request, String> {
         let mut reader = IoBufReader::new(input);
@@ -599,5 +649,67 @@ mod tests {
             client.command(&["PING"]).await,
             RespValue::Simple("PONG".into())
         );
+    }
+
+    #[tokio::test]
+    async fn backend_permit_is_held_until_a_slow_client_write_times_out() {
+        let permits = Arc::new(Semaphore::new(1));
+        let permit = Arc::clone(&permits).acquire_owned().await.unwrap();
+        let (mut writer, _slow_reader) = duplex(8);
+        let payload = vec![b'x'; 1024];
+
+        let write = tokio::spawn(async move {
+            write_backend_response(&mut writer, &payload, permit, Duration::from_millis(50)).await
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            Arc::clone(&permits).try_acquire_owned().is_err(),
+            "the backend permit must remain held while the response write is blocked"
+        );
+        assert!(write.await.unwrap().unwrap_err().contains("write timeout"));
+        assert!(Arc::clone(&permits).try_acquire_owned().is_ok());
+    }
+
+    #[tokio::test]
+    async fn public_resp_connections_cannot_accumulate_past_the_limit() {
+        let upstream = MockFerrite::start().await;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let service = tokio::spawn(serve(
+            listener,
+            upstream.leaked_addr(),
+            Arc::new(Semaphore::new(4)),
+            shutdown_rx,
+        ));
+
+        let mut held = Vec::new();
+        for _ in 0..MAX_CONNECTIONS {
+            held.push(TcpStream::connect(address).await.unwrap());
+        }
+
+        let excess = TcpStream::connect(address).await.unwrap();
+        let mut excess = BufReader::new(excess);
+        let reply = timeout(
+            Duration::from_secs(1),
+            resp::read_value_budgeted(&mut excess, 0, &mut resp::ResponseBudget::default()),
+        )
+        .await
+        .expect("excess connection must be rejected promptly")
+        .unwrap();
+        assert!(
+            matches!(reply, RespValue::Error(message) if message.contains("too many connections"))
+        );
+
+        drop(held.pop());
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let mut replacement = crate::testing::RespClient::connect(&address.to_string()).await;
+        assert_eq!(
+            replacement.command(&["PING"]).await,
+            RespValue::Simple("PONG".into())
+        );
+
+        let _ = shutdown_tx.send(());
+        service.await.unwrap().unwrap();
     }
 }
