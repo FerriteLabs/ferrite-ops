@@ -186,11 +186,36 @@ for admin_command in DEBUG CONFIG MODULE ACL SAVE BGSAVE BGREWRITEAOF REPLICAOF;
     "HTTP execute refuses the administrative command ${admin_command}"
 done
 
+for rejected_command in \
+  "PLUGIN LIST" \
+  "AUDIT START" \
+  "MIGRATE.START redis://example.invalid" \
+  "LRANGE bounded-list 0 -1" \
+  "XRANGE stream - +"; do
+  REJECTED_REPLY="$(curl -s --max-time 5 -X POST -H 'content-type: application/json' \
+    --data "{\"command\":\"${rejected_command}\"}" \
+    "http://127.0.0.1:${HTTP_PORT}/api/execute" 2>/dev/null || true)"
+  assert_contains "$REJECTED_REPLY" '"success":false' \
+    "HTTP execute rejects ${rejected_command} before forwarding"
+done
+
 RESP_SHUTDOWN="$(resp_cmd 127.0.0.1 "$RESP_PORT" SHUTDOWN NOSAVE 2>/dev/null || true)"
 assert_contains "$RESP_SHUTDOWN" "playground" "public RESP port refuses SHUTDOWN with a policy error"
 
 RESP_CONFIG="$(resp_cmd 127.0.0.1 "$RESP_PORT" CONFIG SET appendonly yes 2>/dev/null || true)"
 assert_contains "$RESP_CONFIG" "playground" "public RESP port refuses CONFIG SET"
+
+for rejected_command in \
+  "PLUGIN LIST" \
+  "AUDIT START" \
+  "MIGRATE.START redis://example.invalid" \
+  "LRANGE bounded-list 0 -1" \
+  "XRANGE stream - +"; do
+  read -r -a rejected_arguments <<<"$rejected_command"
+  REJECTED_REPLY="$(resp_cmd 127.0.0.1 "$RESP_PORT" "${rejected_arguments[@]}" 2>/dev/null || true)"
+  assert_contains "$REJECTED_REPLY" "playground" \
+    "public RESP port rejects ${rejected_command} before forwarding"
+done
 
 sleep 1
 STILL_RUNNING="$(docker inspect --format='{{.State.Running}}' "$CONTAINER_ID" 2>/dev/null || true)"

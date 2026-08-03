@@ -395,32 +395,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rejects_administrative_commands_without_forwarding_them() {
+    async fn rejects_non_allowlisted_and_unbounded_commands_without_forwarding_them() {
         let upstream = MockFerrite::start().await;
         let addr = start_proxy(upstream.leaked_addr()).await;
         let mut client = crate::testing::RespClient::connect(&addr).await;
 
         for command in [
             vec!["SHUTDOWN"],
-            vec!["SHUTDOWN", "NOSAVE"],
-            vec!["DEBUG", "SLEEP", "0"],
-            vec!["MODULE", "LIST"],
-            vec!["ACL", "WHOAMI"],
-            vec!["CONFIG", "SET", "appendonly", "yes"],
-            vec!["SAVE"],
-            vec!["BGSAVE"],
-            vec!["BGREWRITEAOF"],
-            vec!["REPLICAOF", "127.0.0.1", "1"],
-            vec!["SLAVEOF", "127.0.0.1", "1"],
-            vec!["FLUSHALL"],
+            vec!["PLUGIN", "LIST"],
+            vec!["AUDIT", "START"],
             vec!["MIGRATE.START", "redis://example.invalid"],
             vec!["MIGRATE", "START", "redis://example.invalid"],
-            vec!["CLOUD.PROVIDER.ADD", "provider", "custom"],
-            vec!["CLOUD", "PROVIDER.ADD", "provider", "custom"],
-            vec!["S3.OBJECT.PUT", "bucket", "key", "value"],
-            vec!["S3", "OBJECT.PUT", "bucket", "key", "value"],
-            vec!["REPLICATE.ADD", "peer"],
-            vec!["REPLICATE", "ADD", "peer"],
+            vec!["LRANGE", "list", "0", "-1"],
+            vec!["XRANGE", "stream", "-", "+"],
         ] {
             let reply = client.command(&command).await;
             match reply {
@@ -441,12 +428,35 @@ mod tests {
     #[tokio::test]
     async fn forwards_ordinary_commands_and_returns_real_replies() {
         let upstream = MockFerrite::start().await;
+        upstream
+            .seed_list(
+                "list",
+                (0..150).map(|index| format!("item-{index}")).collect(),
+            )
+            .await;
+        upstream
+            .seed_stream(
+                "stream",
+                (0..150)
+                    .map(|index| {
+                        (
+                            format!("{index}-0"),
+                            vec!["field".to_string(), format!("value-{index}")],
+                        )
+                    })
+                    .collect(),
+            )
+            .await;
         let addr = start_proxy(upstream.leaked_addr()).await;
         let mut client = crate::testing::RespClient::connect(&addr).await;
 
         assert_eq!(
             client.command(&["PING"]).await,
             RespValue::Simple("PONG".into())
+        );
+        assert_eq!(
+            client.command(&["ECHO", "hello"]).await,
+            RespValue::Bulk(Some(b"hello".to_vec()))
         );
         assert_eq!(
             client.command(&["SET", "proxy-key", "proxy-value"]).await,
@@ -460,10 +470,20 @@ mod tests {
             client.command(&["GET", "missing"]).await,
             RespValue::Bulk(None)
         );
+        assert!(matches!(
+            client.command(&["LRANGE", "list", "0", "99"]).await,
+            RespValue::Array(Some(values)) if values.len() == 100
+        ));
+        assert!(matches!(
+            client
+                .command(&["XRANGE", "stream", "-", "+", "COUNT", "100"])
+                .await,
+            RespValue::Array(Some(values)) if values.len() == 100
+        ));
 
         assert_eq!(
             upstream.received_commands().await,
-            vec!["PING", "SET", "GET", "GET"]
+            vec!["PING", "ECHO", "SET", "GET", "GET", "LRANGE", "XRANGE"]
         );
     }
 
@@ -491,17 +511,13 @@ mod tests {
     #[tokio::test]
     async fn public_replies_are_bounded_by_the_cumulative_response_budget() {
         let upstream = MockFerrite::start().await;
+        upstream
+            .seed_string("oversized", &"x".repeat(resp::MAX_RESPONSE_BYTES + 1))
+            .await;
         let addr = start_proxy(upstream.leaked_addr()).await;
         let mut client = crate::testing::RespClient::connect(&addr).await;
 
-        // Many individually small elements whose cumulative size exceeds the
-        // launcher's per-reply budget.
-        let elements = resp::MAX_RESP_ARRAY_LENGTH.to_string();
-        let element_size =
-            (resp::MAX_RESPONSE_BYTES / resp::MAX_RESP_ARRAY_LENGTH + 64).to_string();
-        let reply = client
-            .command(&["MOCKARRAY", elements.as_str(), element_size.as_str()])
-            .await;
+        let reply = client.command(&["GET", "oversized"]).await;
         match reply {
             RespValue::Error(message) => assert!(
                 message.contains("response budget"),

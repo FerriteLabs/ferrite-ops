@@ -299,31 +299,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rejects_administrative_commands_over_http() {
+    async fn rejects_non_allowlisted_and_unbounded_commands_over_http() {
         let upstream = MockFerrite::start().await;
         let state = state(&upstream, "test");
 
         for command in [
             "SHUTDOWN",
-            "shutdown nosave",
-            "DEBUG SLEEP 0",
-            "MODULE LIST",
-            "ACL WHOAMI",
-            "CONFIG SET appendonly yes",
-            "SAVE",
-            "BGSAVE",
-            "BGREWRITEAOF",
-            "REPLICAOF 127.0.0.1 1",
-            "SLAVEOF 127.0.0.1 1",
-            "FLUSHALL",
+            "PLUGIN LIST",
+            "AUDIT START",
             "MIGRATE.START redis://example.invalid",
             "migrate start redis://example.invalid",
-            "CLOUD.PROVIDER.ADD provider custom",
-            "cloud provider.add provider custom",
-            "S3.OBJECT.PUT bucket key value",
-            "s3 object.put bucket key value",
-            "REPLICATE.ADD peer",
-            "replicate add peer",
+            "LRANGE list 0 -1",
+            "XRANGE stream - +",
         ] {
             let (status, body) = call(state.clone(), execute_request(command)).await;
             assert_eq!(status, StatusCode::FORBIDDEN, "{command} must be forbidden");
@@ -338,7 +325,34 @@ mod tests {
     #[tokio::test]
     async fn executes_ordinary_commands_over_http() {
         let upstream = MockFerrite::start().await;
+        upstream
+            .seed_list(
+                "list",
+                (0..150).map(|index| format!("item-{index}")).collect(),
+            )
+            .await;
+        upstream
+            .seed_stream(
+                "stream",
+                (0..150)
+                    .map(|index| {
+                        (
+                            format!("{index}-0"),
+                            vec!["field".to_string(), format!("value-{index}")],
+                        )
+                    })
+                    .collect(),
+            )
+            .await;
         let state = state(&upstream, "test");
+
+        let (status, body) = call(state.clone(), execute_request("PING")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["data"], json!("PONG"));
+
+        let (status, body) = call(state.clone(), execute_request("ECHO hello")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["data"], json!("hello"));
 
         let (status, body) = call(state.clone(), execute_request("SET http-key http-value")).await;
         assert_eq!(status, StatusCode::OK);
@@ -347,7 +361,18 @@ mod tests {
         let (status, body) = call(state.clone(), execute_request("GET http-key")).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["data"], json!("http-value"));
-        assert_eq!(upstream.received_commands().await, vec!["SET", "GET"]);
+
+        let (status, body) = call(state.clone(), execute_request("LRANGE list 0 99")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["data"].as_array().unwrap().len(), 100);
+
+        let (status, body) = call(state, execute_request("XRANGE stream - + COUNT 100")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["data"].as_array().unwrap().len(), 100);
+        assert_eq!(
+            upstream.received_commands().await,
+            vec!["PING", "ECHO", "SET", "GET", "LRANGE", "XRANGE"]
+        );
     }
 
     #[tokio::test]

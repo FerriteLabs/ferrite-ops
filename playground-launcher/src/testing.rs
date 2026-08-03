@@ -167,6 +167,10 @@ fn bulk(value: &str) -> RespValue {
 fn dispatch(state: &mut MockState, name: &str, args: &[String]) -> RespValue {
     match name {
         "PING" => RespValue::Simple("PONG".into()),
+        "ECHO" => match args.first() {
+            Some(value) => bulk(value),
+            None => RespValue::Error("ERR wrong number of arguments".into()),
+        },
         "SET" => {
             if args.len() < 2 {
                 return RespValue::Error("ERR wrong number of arguments".into());
