@@ -70,16 +70,28 @@ jobs:
           echo "sha256=${SHA256}" >> "$GITHUB_OUTPUT"
           echo "📦 Syncing to version ${VERSION} (source SHA256: ${SHA256})"
 
-      - name: Update Dockerfile
+      - name: Update Dockerfiles
         run: |
+          set -euo pipefail
+
           VERSION="${{ steps.version.outputs.version }}"
           SHA256="${{ steps.version.outputs.sha256 }}"
-          if grep -q 'ARG FERRITE_VERSION' Dockerfile; then
-            sed -i "s/ARG FERRITE_VERSION=.*/ARG FERRITE_VERSION=${VERSION}/" Dockerfile
-          fi
-          if grep -q 'ARG FERRITE_SOURCE_SHA256' Dockerfile; then
-            sed -i "s/ARG FERRITE_SOURCE_SHA256=.*/ARG FERRITE_SOURCE_SHA256=${SHA256}/" Dockerfile
-          fi
+          DOCKERFILES=(Dockerfile Dockerfile.moonshot Dockerfile.playground)
+
+          # Validate every target before editing any of them. This prevents a
+          # partial release sync if one auxiliary Dockerfile drifts structurally.
+          for dockerfile in "${DOCKERFILES[@]}"; do
+            test -f "$dockerfile"
+            test "$(grep -c '^ARG FERRITE_VERSION=' "$dockerfile")" -eq 1
+            test "$(grep -c '^ARG FERRITE_SOURCE_SHA256=' "$dockerfile")" -eq 1
+          done
+
+          for dockerfile in "${DOCKERFILES[@]}"; do
+            perl -pi -e "s/^ARG FERRITE_VERSION=.*/ARG FERRITE_VERSION=${VERSION}/" "$dockerfile"
+            perl -pi -e "s/^ARG FERRITE_SOURCE_SHA256=.*/ARG FERRITE_SOURCE_SHA256=${SHA256}/" "$dockerfile"
+            grep -qx "ARG FERRITE_VERSION=${VERSION}" "$dockerfile"
+            grep -qx "ARG FERRITE_SOURCE_SHA256=${SHA256}" "$dockerfile"
+          done
 
       - name: Update Helm chart
         run: |
@@ -109,7 +121,7 @@ jobs:
             **Source SHA256**: `${{ steps.version.outputs.sha256 }}`
 
             Updates:
-            - Dockerfile `FERRITE_VERSION` and `FERRITE_SOURCE_SHA256` args
+            - All three Dockerfiles' `FERRITE_VERSION` and `FERRITE_SOURCE_SHA256` args
             - Helm chart `version` and `appVersion`
             - RPM spec `Version`
           branch: version-sync/${{ steps.version.outputs.version }}

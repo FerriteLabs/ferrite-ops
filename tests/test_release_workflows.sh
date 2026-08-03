@@ -52,10 +52,16 @@ assert_contains "$RELEASE_CONTENT" "default: 'v0.4.0'" \
   "release.yml's workflow_dispatch default is a concrete semver release"
 
 # --- Static checks: version-sync.yml ----------------------------------------
+for dockerfile in Dockerfile Dockerfile.moonshot Dockerfile.playground; do
+  assert_contains "$VERSION_SYNC_CONTENT" "$dockerfile" \
+    "version-sync.yml includes ${dockerfile} in the atomic Dockerfile update"
+done
+assert_contains "$VERSION_SYNC_CONTENT" "DOCKERFILES=(" \
+  "version-sync.yml updates all Dockerfile defaults as one validated group"
 assert_contains "$VERSION_SYNC_CONTENT" "ARG FERRITE_SOURCE_SHA256=" \
-  "version-sync.yml updates the Dockerfile's FERRITE_SOURCE_SHA256 default"
+  "version-sync.yml updates each Dockerfile's FERRITE_SOURCE_SHA256 default"
 assert_contains "$VERSION_SYNC_CONTENT" "ARG FERRITE_VERSION=" \
-  "version-sync.yml updates the Dockerfile's FERRITE_VERSION default"
+  "version-sync.yml updates each Dockerfile's FERRITE_VERSION default"
 assert_contains "$VERSION_SYNC_CONTENT" 'grep -qE' \
   "version-sync.yml validates the version against a semver pattern"
 assert_contains "$VERSION_SYNC_CONTENT" "shasum -a 256" \
@@ -94,19 +100,68 @@ fi
 EXTRACT_DIR="$(mktemp -d)"
 trap 'rm -rf "$EXTRACT_DIR"' EXIT
 
-python3 - "$RELEASE_YML" "$EXTRACT_DIR/release_meta.sh" << 'PYEOF'
+python3 - "$RELEASE_YML" "$VERSION_SYNC_YML" \
+  "$EXTRACT_DIR/release_meta.sh" "$EXTRACT_DIR/update_dockerfiles.sh" << 'PYEOF'
 import sys
 import yaml
 
-release_yml_path, out_path = sys.argv[1], sys.argv[2]
+release_yml_path, version_sync_yml_path, release_out_path, sync_out_path = sys.argv[1:]
 with open(release_yml_path) as f:
     doc = yaml.safe_load(f)
 
 steps = doc["jobs"]["build-and-push"]["steps"]
 script = next(s["run"] for s in steps if s.get("name") == "Determine release version and source checksum")
-with open(out_path, "w") as f:
+with open(release_out_path, "w") as f:
     f.write(script)
+
+with open(version_sync_yml_path) as f:
+    sync_doc = yaml.safe_load(f)
+
+sync_steps = sync_doc["jobs"]["sync"]["steps"]
+sync_script = next(s["run"] for s in sync_steps if s.get("name") == "Update Dockerfiles")
+with open(sync_out_path, "w") as f:
+    f.write(sync_script)
 PYEOF
+
+# Exercise the version-sync Dockerfile step against isolated copies. All three
+# files must change together, and structural drift must fail before any edit.
+SYNC_VERSION="9.8.7"
+SYNC_SHA256="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+SYNC_SCRIPT="$(cat "${EXTRACT_DIR}/update_dockerfiles.sh")"
+SYNC_SCRIPT="${SYNC_SCRIPT//\$\{\{ steps.version.outputs.version \}\}/${SYNC_VERSION}}"
+SYNC_SCRIPT="${SYNC_SCRIPT//\$\{\{ steps.version.outputs.sha256 \}\}/${SYNC_SHA256}}"
+
+SYNC_DIR="${EXTRACT_DIR}/sync-success"
+mkdir -p "$SYNC_DIR"
+cp "${REPO_ROOT}/Dockerfile" "${REPO_ROOT}/Dockerfile.moonshot" \
+  "${REPO_ROOT}/Dockerfile.playground" "$SYNC_DIR/"
+if (cd "$SYNC_DIR" && bash -c "$SYNC_SCRIPT"); then
+  for dockerfile in Dockerfile Dockerfile.moonshot Dockerfile.playground; do
+    assert_contains "$(cat "${SYNC_DIR}/${dockerfile}")" "ARG FERRITE_VERSION=${SYNC_VERSION}" \
+      "version-sync functional replay updates ${dockerfile}'s version"
+    assert_contains "$(cat "${SYNC_DIR}/${dockerfile}")" "ARG FERRITE_SOURCE_SHA256=${SYNC_SHA256}" \
+      "version-sync functional replay updates ${dockerfile}'s checksum"
+  done
+else
+  harness_fail "version-sync functional replay unexpectedly failed"
+fi
+
+DRIFT_DIR="${EXTRACT_DIR}/sync-drift"
+mkdir -p "$DRIFT_DIR"
+cp "${REPO_ROOT}/Dockerfile" "${REPO_ROOT}/Dockerfile.moonshot" \
+  "${REPO_ROOT}/Dockerfile.playground" "$DRIFT_DIR/"
+sed '/^ARG FERRITE_SOURCE_SHA256=/d' "${DRIFT_DIR}/Dockerfile.playground" \
+  > "${DRIFT_DIR}/Dockerfile.playground.tmp"
+mv "${DRIFT_DIR}/Dockerfile.playground.tmp" "${DRIFT_DIR}/Dockerfile.playground"
+if (cd "$DRIFT_DIR" && bash -c "$SYNC_SCRIPT"); then
+  harness_fail "version-sync unexpectedly accepted a structurally drifted auxiliary Dockerfile"
+else
+  UNCHANGED_COUNT="$(grep -l '^ARG FERRITE_VERSION=0.4.0$' \
+    "${DRIFT_DIR}/Dockerfile" "${DRIFT_DIR}/Dockerfile.moonshot" \
+    "${DRIFT_DIR}/Dockerfile.playground" | wc -l | tr -d ' ')"
+  assert_eq "3" "$UNCHANGED_COUNT" \
+    "version-sync validates every Dockerfile before making any release-default edit"
+fi
 
 run_case() {
   local name="$1" event_name="$2" client_payload_version="$3" input_tag="$4" ref_name="${5:-}"
