@@ -19,11 +19,11 @@ assert_contains "$CONTENT" "branches: [main]" \
 assert_contains "$CONTENT" "active-release.env" \
   "ops tag workflow is triggered by canonical release metadata changes"
 assert_contains "$CONTENT" "charts/ferrite/Chart.yaml" \
-  "ops tag workflow watches the primary release chart"
+  "ops tag workflow validates the primary release chart against canonical metadata before tagging"
 assert_contains "$CONTENT" "gitops/argocd/overlays/production.yaml" \
-  "ops tag workflow watches production Argo CD revisions"
+  "ops tag workflow validates production Argo CD revisions before tagging"
 assert_contains "$CONTENT" "gitops/flux/overlays/production.yaml" \
-  "ops tag workflow watches production Flux revisions"
+  "ops tag workflow validates production Flux revisions before tagging"
 assert_contains "$CONTENT" "contents: write" \
   "ops tag workflow requests the content permission needed to push a tag"
 assert_not_contains "$CONTENT" "pull-requests:" \
@@ -43,6 +43,22 @@ assert_not_contains "$CONTENT" "git push --force" \
 assert_not_contains "$CONTENT" "targetRevision: HEAD" \
   "ops tag workflow never validates a mutable Argo CD revision"
 
+# --- Trigger scoping, concurrency, and main-tip validation ------------------
+assert_contains "$CONTENT" "group: ferrite-ops-tag-" \
+  "ops tag workflow serializes tagging with a version-keyed concurrency group"
+assert_contains "$CONTENT" "cancel-in-progress: false" \
+  "ops tag workflow never cancels an in-flight tag push"
+assert_contains "$CONTENT" "Validate this push is still the current main tip" \
+  "ops tag workflow re-validates main's tip immediately before tagging"
+assert_contains "$CONTENT" "git rev-parse origin/main" \
+  "ops tag workflow reads the current remote main tip, not a cached value"
+assert_contains "$CONTENT" "already superseded this one" \
+  "ops tag workflow explains that a superseded push is refused"
+assert_contains "$CONTENT" "resolve:" \
+  "ops tag workflow resolves the canonical version in its own job"
+assert_contains "$CONTENT" "needs.resolve.outputs.version" \
+  "ops tag workflow keys its concurrency group on the resolved canonical version"
+
 if ! command -v python3 >/dev/null 2>&1 ||
   ! python3 -c "import yaml" >/dev/null 2>&1; then
   echo "  skip: python3/PyYAML unavailable; skipping workflow extraction replay."
@@ -52,25 +68,48 @@ fi
 
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
+RESOLVE_SCRIPT="${TMP}/resolve.sh"
+MAIN_TIP_SCRIPT="${TMP}/main_tip.sh"
 VALIDATE_SCRIPT="${TMP}/validate.sh"
 TAG_SCRIPT="${TMP}/tag.sh"
-if python3 - "$WORKFLOW" "$VALIDATE_SCRIPT" "$TAG_SCRIPT" <<'PYEOF'
+if python3 - "$WORKFLOW" "$RESOLVE_SCRIPT" "$MAIN_TIP_SCRIPT" "$VALIDATE_SCRIPT" "$TAG_SCRIPT" <<'PYEOF'
 import sys
 import yaml
 
-workflow_path, validate_path, tag_path = sys.argv[1:]
+workflow_path, resolve_path, main_tip_path, validate_path, tag_path = sys.argv[1:]
 with open(workflow_path) as workflow_file:
     workflow = yaml.safe_load(workflow_file)
 
 trigger = workflow.get(True, {}).get("push", {})
 if trigger.get("branches") != ["main"]:
     raise SystemExit("tag workflow must trigger only on main")
+if trigger.get("paths") != ["active-release.env"]:
+    raise SystemExit(
+        f"tag workflow must trigger ONLY on active-release.env changes, got: {trigger.get('paths')}"
+    )
 
 permissions = workflow.get("permissions", {})
 if permissions != {"contents": "write"}:
     raise SystemExit(f"tag workflow permissions are not least-privilege: {permissions}")
 
-steps = workflow["jobs"]["tag"]["steps"]
+resolve_steps = workflow["jobs"]["resolve"]["steps"]
+resolve = next(
+    step["run"] for step in resolve_steps if step.get("name") == "Read canonical version from this push"
+)
+
+tag_job = workflow["jobs"]["tag"]
+if tag_job.get("needs") != "resolve":
+    raise SystemExit("tag job must depend on the resolve job")
+concurrency = tag_job.get("concurrency", {})
+if "needs.resolve.outputs.version" not in concurrency.get("group", ""):
+    raise SystemExit("tag job's concurrency group must be keyed on the resolved version")
+if concurrency.get("cancel-in-progress") is not False:
+    raise SystemExit("tag job's concurrency group must not cancel an in-flight tag push")
+
+steps = tag_job["steps"]
+main_tip = next(
+    step["run"] for step in steps if step.get("name") == "Validate this push is still the current main tip"
+)
 validate = next(
     step["run"] for step in steps if step.get("name") == "Validate canonical ops release"
 )
@@ -79,13 +118,17 @@ tag = next(
     for step in steps
     if step.get("name") == "Create and push immutable annotated tag"
 )
+with open(resolve_path, "w") as output:
+    output.write(resolve)
+with open(main_tip_path, "w") as output:
+    output.write(main_tip)
 with open(validate_path, "w") as output:
     output.write(validate)
 with open(tag_path, "w") as output:
     output.write(tag)
 PYEOF
 then
-  harness_ok "ops tag workflow has the expected trigger, permissions, and executable steps"
+  harness_ok "ops tag workflow has the expected trigger, permissions, job split, and concurrency"
 else
   harness_fail "ops tag workflow extraction failed"
   harness_summary
@@ -117,6 +160,41 @@ git init -q --bare "$REMOTE"
 git -C "$FIXTURE" remote add origin "$REMOTE"
 git -C "$FIXTURE" push -q -u origin main
 MERGED_SHA="$(git -C "$FIXTURE" rev-parse HEAD)"
+
+# --- resolve job: reads the canonical version from this exact push ---------
+RESOLVE_OUT="${TMP}/resolve.out"
+if ( cd "$FIXTURE" && GITHUB_OUTPUT="$RESOLVE_OUT" bash "$RESOLVE_SCRIPT" ); then
+  assert_contains "$(cat "$RESOLVE_OUT")" "version=${EXPECTED_VERSION}" \
+    "resolve job emits the canonical version for this push"
+else
+  harness_fail "resolve job unexpectedly failed"
+fi
+
+# --- main-tip validation: passes when this push IS the current tip ---------
+if ( cd "$FIXTURE" && MERGED_SHA="$MERGED_SHA" bash "$MAIN_TIP_SCRIPT" >"${TMP}/tip_ok.log" 2>&1 ); then
+  harness_ok "main-tip validation passes when this push is still main's current tip"
+else
+  harness_fail "main-tip validation unexpectedly failed: $(cat "${TMP}/tip_ok.log")"
+fi
+
+# --- main-tip validation: fails when main has since advanced ---------------
+# Simulate a second, later push landing on main (e.g. a rapid follow-up
+# release) between this workflow starting and reaching the tagging step.
+echo "later change" >> "${FIXTURE}/active-release.env.later"
+git -C "$FIXTURE" add active-release.env.later
+git -C "$FIXTURE" commit -q -m "a later push supersedes the one being validated"
+git -C "$FIXTURE" push -q origin main
+if ( cd "$FIXTURE" && MERGED_SHA="$MERGED_SHA" bash "$MAIN_TIP_SCRIPT" >"${TMP}/tip_stale.log" 2>&1 ); then
+  harness_fail "main-tip validation unexpectedly passed for a superseded push"
+else
+  assert_contains "$(cat "${TMP}/tip_stale.log")" "already superseded this one" \
+    "main-tip validation refuses to tag a push that main (now at a newer commit) has since advanced past"
+fi
+# Reset the fixture back to the originally merged commit for the remaining
+# tag-creation replays below, which validate tagging the ORIGINAL commit.
+git -C "$FIXTURE" reset -q --hard "$MERGED_SHA"
+git -C "$FIXTURE" push -q --force-with-lease origin main
+
 OUTPUT="${TMP}/release.out"
 : > "$OUTPUT"
 

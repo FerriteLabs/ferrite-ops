@@ -512,6 +512,32 @@ entirely:
   older candidate is always skipped — including when a stray `ALLOW_DOWNGRADE=true` is present in the
   step's own environment.
 
+## Immutable Ops Tag Trigger Scoping Resolution (this change)
+
+`tag-ops-release.yml` previously triggered on a push to `main` touching any of ~15 release-pin paths
+(Dockerfiles, both charts, Compose, GitOps, packaging, `release.yml`'s own default), which meant an
+unrelated push that happened to touch, say, `docker-compose.yml` without any corresponding
+`active-release.env` bump would still re-run this workflow.
+
+- The `push` trigger's `paths` filter is now exactly `[active-release.env]` — this workflow runs only
+  when the canonical release metadata itself changes, never for an unrelated pin-only push. Every other
+  release pin is still cross-validated against `active-release.env` in the `Validate canonical ops
+  release` step before tagging, so drift between them and the canonical version still fails loudly; it
+  simply no longer re-triggers the workflow on its own.
+- A new `resolve` job reads the canonical version from the exact push commit, and the `tag` job (which
+  depends on it) uses a `ferrite-ops-tag-<version>` concurrency group (`cancel-in-progress: false`) keyed
+  on that resolved version, so a retried or duplicate push for the same version serializes instead of
+  racing a concurrent tag creation/push.
+- The `tag` job re-validates that its push is still `origin/main`'s current tip in a dedicated step
+  immediately before tagging (`git fetch` + `git rev-parse origin/main` compared against `github.sha`),
+  refusing to tag a commit that a later release-metadata push has already superseded — this can happen
+  if this run simply queued behind the concurrency group, or a rapid follow-up release landed while it
+  was running.
+- `tests/test_ops_release_tag_workflow.sh` (32 checks) asserts the trigger's `paths` list is exactly
+  `[active-release.env]`, the `resolve`/`tag` job split and version-keyed concurrency, and functionally
+  replays both a main-tip check that passes (this push is still the tip) and one that fails (main has
+  since advanced past it).
+
 ## Deferred Items
 
 | ID | Description | Reason deferred |

@@ -1,38 +1,89 @@
 name: Tag Immutable Ops Release
 
+# Triggers ONLY when the canonical active-release.env changes on main — not
+# on unrelated pushes that happen to touch a Dockerfile, chart, or GitOps
+# overlay without a corresponding release-metadata bump. Every other release
+# pin (Dockerfiles, charts, Compose, GitOps, packaging, release.yml's
+# default) is still cross-validated against active-release.env below before
+# tagging, so drift between them and the canonical version still fails
+# loudly — it just no longer re-triggers this workflow on its own.
+
 on:
   push:
     branches: [main]
     paths:
       - active-release.env
-      - Dockerfile
-      - Dockerfile.moonshot
-      - Dockerfile.playground
-      - charts/ferrite/Chart.yaml
-      - charts/ferrite-sidecar/Chart.yaml
-      - docker-compose.yml
-      - docker-compose.moonshot.yml
-      - docker-compose.quickstart.yml
-      - gitops/argocd/overlays/production.yaml
-      - gitops/flux/overlays/production.yaml
-      - gitops/kustomize/base/statefulset.yaml
-      - packaging/rpm/ferrite.spec
-      - terraform/common/variables.tf
-      - terraform/aws-ecs/main.tf
-      - terraform/aws-eks/main.tf
-      - .github/workflows/release.yml
 
 permissions:
   contents: write
 
 jobs:
+  # Resolves the canonical version from this exact push commit. Kept as its
+  # own job so the "tag" job's concurrency group below can be keyed on the
+  # canonical version (job-level concurrency expressions may reference
+  # `needs.*.outputs`, but not another step's outputs within the same job).
+  resolve:
+    name: Resolve canonical release version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read canonical version from this push
+        id: version
+        run: |
+          set -euo pipefail
+
+          ACTIVE_RELEASE="active-release.env"
+          if [ ! -f "$ACTIVE_RELEASE" ]; then
+            echo "::error::Required release file is missing: ${ACTIVE_RELEASE}"
+            exit 1
+          fi
+          test "$(grep -c '^FERRITE_VERSION=' "$ACTIVE_RELEASE")" -eq 1
+          VERSION="$(sed -n 's/^FERRITE_VERSION=//p' "$ACTIVE_RELEASE")"
+          if ! printf '%s\n' "$VERSION" |
+            grep -qE '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?$'; then
+            echo "::error::active-release.env contains an invalid canonical SemVer: ${VERSION}"
+            exit 1
+          fi
+
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
   tag:
     name: Validate and tag merged release
+    needs: resolve
     runs-on: ubuntu-latest
+    # Keyed on the canonical version (not the commit SHA), so a retried or
+    # duplicate push for the SAME version serializes instead of racing a
+    # concurrent tag creation/push; cancel-in-progress is false because a
+    # git tag push must run to completion rather than be cut off mid-flight.
+    concurrency:
+      group: ferrite-ops-tag-${{ needs.resolve.outputs.version }}
+      cancel-in-progress: false
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+
+      # main can advance again between this push firing and this job
+      # reaching the tagging step (e.g. a rapid follow-up release-metadata
+      # push, or this run simply queuing behind the concurrency group above).
+      # Re-validate that this push is still main's current tip immediately
+      # before tagging, so a superseded push can never be tagged after a
+      # newer canonical release has already landed.
+      - name: Validate this push is still the current main tip
+        env:
+          MERGED_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+
+          git fetch --no-tags --depth=1 origin main
+          CURRENT_MAIN="$(git rev-parse origin/main)"
+          if [ "$CURRENT_MAIN" != "$MERGED_SHA" ]; then
+            echo "::error::main has advanced past this push (${MERGED_SHA} -> ${CURRENT_MAIN}); a later release-metadata push already superseded this one. Refusing to tag a non-tip commit."
+            exit 1
+          fi
 
       - name: Validate canonical ops release
         id: release

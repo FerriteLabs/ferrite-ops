@@ -83,4 +83,11 @@ assert_contains "$AUDIT_CONTENT" "version-supersession-reconcile" \
 assert_contains "$AUDIT_CONTENT" "validate VERSION" \
   "AUDIT.md records the new strict-SemVer validate subcommand"
 
+assert_contains "$AUDIT_CONTENT" "## Immutable Ops Tag Trigger Scoping Resolution" \
+  "AUDIT.md records the ops tag trigger scoping resolution"
+assert_contains "$AUDIT_CONTENT" "ferrite-ops-tag-<version>" \
+  "AUDIT.md records the version-keyed ops tag concurrency group"
+assert_contains "$AUDIT_CONTENT" "exactly \`[active-release.env]\`" \
+  "AUDIT.md records the restricted ops tag trigger paths"
+
 harness_summary
