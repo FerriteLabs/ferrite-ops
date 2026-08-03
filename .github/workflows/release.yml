@@ -117,6 +117,11 @@ jobs:
             echo "FERRITE_BUILD_ARGS_EOF"
           } >> "$GITHUB_OUTPUT"
 
+      # Every published tag is derived from the normalized release_meta
+      # outputs above, for every trigger. `latest=false` disables the action's
+      # own automatic latest tag, so `latest` is published only by the
+      # explicit, stable-gated entry below and a prerelease can never become
+      # `latest`.
       - name: Extract metadata (tags, labels)
         id: meta
         uses: docker/metadata-action@v5
@@ -124,6 +129,8 @@ jobs:
           images: |
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
             ${{ env.DOCKERHUB_IMAGE }}
+          flavor: |
+            latest=false
           tags: |
             type=raw,value=${{ steps.release_meta.outputs.version }}
             type=raw,value=${{ steps.release_meta.outputs.major_minor }},enable=${{ steps.release_meta.outputs.stable == 'true' }}

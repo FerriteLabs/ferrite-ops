@@ -62,6 +62,8 @@ assert_contains "$RELEASE_CONTENT" 'type=raw,value=latest,enable=${{ steps.relea
   "release.yml publishes latest only for stable semver releases"
 assert_not_contains "$RELEASE_CONTENT" 'type=raw,value=${{ inputs.tag }}' \
   "workflow_dispatch does not publish an unnormalized raw v-prefixed tag"
+assert_contains "$RELEASE_CONTENT" "latest=false" \
+  "release.yml disables docker/metadata-action's implicit latest tag"
 assert_contains "$RELEASE_CONTENT" "charts/ferrite-sidecar/Chart.yaml" \
   "release.yml updates the sidecar chart appVersion with the released Ferrite image"
 assert_contains "$ORCHESTRATION_CONTENT" "charts/ferrite-sidecar/Chart.yaml" \
@@ -118,10 +120,12 @@ fi
 EXTRACT_DIR="$(mktemp -d)"
 trap 'rm -rf "$EXTRACT_DIR"' EXIT
 
-python3 - "$RELEASE_YML" "$VERSION_SYNC_YML" "$ORCHESTRATION_YML" \
+EXTRACT_LOG="${EXTRACT_DIR}/extract.log"
+if ! python3 - "$RELEASE_YML" "$VERSION_SYNC_YML" "$ORCHESTRATION_YML" \
   "$EXTRACT_DIR/release_meta.sh" "$EXTRACT_DIR/update_dockerfiles.sh" \
   "$EXTRACT_DIR/release_chart.sh" "$EXTRACT_DIR/version_sync_chart.sh" \
-  "$EXTRACT_DIR/orchestration_chart.sh" << 'PYEOF'
+  "$EXTRACT_DIR/orchestration_chart.sh" "$EXTRACT_DIR/metadata_tags.txt" \
+  >"${EXTRACT_DIR}/extract.stdout" 2>"${EXTRACT_DIR}/extract.log" << 'PYEOF'
 import sys
 import yaml
 
@@ -134,6 +138,7 @@ import yaml
     release_chart_out_path,
     version_sync_chart_out_path,
     orchestration_chart_out_path,
+    metadata_tags_out_path,
 ) = sys.argv[1:]
 with open(release_yml_path) as f:
     doc = yaml.safe_load(f)
@@ -155,6 +160,15 @@ required_tags = [
 missing_tags = [tag for tag in required_tags if tag not in metadata_tags]
 if missing_tags:
     raise SystemExit(f"metadata tags are missing normalized outputs: {missing_tags}")
+
+metadata_flavor = next(
+    (s["with"].get("flavor", "") for s in steps if s.get("id") == "meta"), ""
+)
+if "latest=false" not in metadata_flavor:
+    raise SystemExit("docker/metadata-action must disable its implicit latest tag")
+
+with open(metadata_tags_out_path, "w") as f:
+    f.write(metadata_tags)
 
 with open(release_out_path, "w") as f:
     f.write(script)
@@ -191,6 +205,11 @@ orchestration_chart_script = next(
 with open(orchestration_chart_out_path, "w") as f:
     f.write(orchestration_chart_script)
 PYEOF
+then
+  harness_fail "release workflow extraction failed: $(cat "$EXTRACT_LOG")"
+  harness_summary
+  exit $?
+fi
 
 # Exercise the version-sync Dockerfile step against isolated copies. All three
 # files must change together, and structural drift must fail before any edit.
@@ -260,6 +279,44 @@ for chart_path in release_chart version_sync_chart orchestration_chart; do
   fi
 done
 
+# Resolve docker/metadata-action's tag template against the outputs a given
+# trigger actually produced, so the *effective* published tag set is asserted
+# rather than only the template text.
+effective_tags() {
+  local output_file="$1"
+  local version major major_minor stable line value enable
+
+  version="$(grep -E '^version=' "$output_file" | head -1 | cut -d= -f2-)"
+  major="$(grep -E '^major=' "$output_file" | head -1 | cut -d= -f2-)"
+  major_minor="$(grep -E '^major_minor=' "$output_file" | head -1 | cut -d= -f2-)"
+  stable="$(grep -E '^stable=' "$output_file" | head -1 | cut -d= -f2-)"
+
+  while IFS= read -r line; do
+    [[ -z "${line// /}" ]] && continue
+    line="${line//\$\{\{ steps.release_meta.outputs.version \}\}/${version}}"
+    line="${line//\$\{\{ steps.release_meta.outputs.major_minor \}\}/${major_minor}}"
+    line="${line//\$\{\{ steps.release_meta.outputs.major \}\}/${major}}"
+    line="${line//\$\{\{ steps.release_meta.outputs.stable == \'true\' \}\}/${stable}}"
+
+    enable="true"
+    if [[ "$line" == *",enable="* ]]; then
+      enable="${line##*,enable=}"
+      line="${line%%,enable=*}"
+    fi
+    value="${line#type=raw,value=}"
+    [[ "$enable" == "true" ]] && printf '%s\n' "$value"
+  done < "${EXTRACT_DIR}/metadata_tags.txt"
+}
+
+assert_tag_set() {
+  local case_name="$1" expected="$2"
+  local actual
+  actual="$(effective_tags "${EXTRACT_DIR}/output_${case_name}.txt" | sort | tr '\n' ' ')"
+  actual="${actual% }"
+  assert_eq "$expected" "$actual" "${case_name} publishes exactly the normalized tag set"
+  assert_not_contains "$actual" "v0." "${case_name} never publishes an unnormalized v-prefixed tag"
+}
+
 run_case() {
   local name="$1" event_name="$2" client_payload_version="$3" input_tag="$4" ref_name="${5:-}"
   local script
@@ -287,6 +344,7 @@ if run_case "push_tag" push "" "" "v0.4.0" >"${EXTRACT_DIR}/log_push_tag.txt" 2>
   assert_contains "$OUT" "FERRITE_VERSION=0.4.0" "push-tag case emits FERRITE_VERSION build-arg"
   assert_contains "$OUT" "FERRITE_SOURCE_SHA256=b4db8cc8eb0d3c2cef4a019a47d550c347df69fb8a4f77550c814fae463005cf" \
     "push-tag case computes the correct real SHA256 for the v0.4.0 tarball"
+  assert_tag_set push_tag "0 0.4 0.4.0 latest"
 else
   harness_fail "push-tag case unexpectedly failed: $(cat "${EXTRACT_DIR}/log_push_tag.txt")"
 fi
@@ -299,6 +357,7 @@ if run_case "workflow_dispatch" workflow_dispatch "" "v0.4.0" >"${EXTRACT_DIR}/l
     "workflow_dispatch emits an explicit FERRITE_VERSION build-arg"
   assert_contains "$OUT" "FERRITE_SOURCE_SHA256=b4db8cc8eb0d3c2cef4a019a47d550c347df69fb8a4f77550c814fae463005cf" \
     "workflow_dispatch computes and emits the matching source checksum"
+  assert_tag_set workflow_dispatch "0 0.4 0.4.0 latest"
 else
   harness_fail "workflow_dispatch case unexpectedly failed: $(cat "${EXTRACT_DIR}/log_workflow_dispatch.txt")"
 fi
@@ -314,6 +373,7 @@ if run_case "repository_dispatch" repository_dispatch "v0.4.0" "" \
     "repository_dispatch emits the 0 rolling tag"
   assert_contains "$OUT" "stable=true" \
     "repository_dispatch stable release enables latest"
+  assert_tag_set repository_dispatch "0 0.4 0.4.0 latest"
 else
   harness_fail "repository_dispatch case unexpectedly failed: $(cat "${EXTRACT_DIR}/log_repository_dispatch.txt")"
 fi
@@ -328,6 +388,7 @@ if (
     "prerelease keeps its normalized exact semver tag"
   assert_contains "$OUT" "stable=false" \
     "prerelease disables major, major.minor, and latest rolling tags"
+  assert_tag_set prerelease "0.5.0-rc.1"
 else
   harness_fail "prerelease case unexpectedly failed: $(cat "${EXTRACT_DIR}/log_prerelease.txt")"
 fi
