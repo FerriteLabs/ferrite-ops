@@ -5,7 +5,6 @@
 //! proxy, policy, and key-detail code be tested end to end — including proving
 //! that refused commands never reach the server — without a real Ferrite build.
 
-#![cfg(test)]
 // Fixture helpers are shared by several test modules; not every helper is used
 // by every module, so unused-warning noise is suppressed for the fixture only.
 #![allow(dead_code)]
