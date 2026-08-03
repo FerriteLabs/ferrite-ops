@@ -17,7 +17,7 @@ Deployment, monitoring, and packaging for [Ferrite](https://github.com/ferritela
 - `monitoring/` — Prometheus alerting rules
 - `packaging/` — deb/rpm package definitions
 - `scripts/` — Install and quickstart scripts
-- `ferrite.example.toml` — Example configuration (opt-in; see `docker/docker-compose.custom-config.yml`)
+- `ferrite.example.toml` — Documentation-only example config (schema reference; generate a real runtime config via the image's own `ferrite init` instead — see `docker/docker-compose.custom-config.yml`)
 
 ## Quick Start
 
@@ -39,18 +39,36 @@ helm install ferrite charts/ferrite
 
 By default `docker compose up` mounts nothing over `/etc/ferrite/ferrite.toml`,
 so the container uses the image's own generated, build-time-validated config.
-To opt in to a custom `ferrite.toml`, copy `ferrite.example.toml` (or write your
-own) and layer the custom-config override on top:
+`ferrite.example.toml` is a documentation-only reference and is **not**
+guaranteed to load in any specific packaged binary (its schema/defaults can
+drift from a given release) — never copy it in directly as a runtime config.
+
+To opt in to a custom `ferrite.toml`, generate one that is actually valid for
+the exact image you're running with that image's own `ferrite init`, then
+layer the custom-config override on top:
 
 ```bash
-cp ferrite.example.toml ferrite.toml
+docker compose build ferrite   # or: docker pull <image>
+
+mkdir -p ./ferrite-config
+docker run --rm --entrypoint ferrite \
+  -v "$(pwd)/ferrite-config:/etc/ferrite" \
+  ferrite:0.4.0 \
+  init --minimal --force -o /etc/ferrite/ferrite.toml -d /var/lib/ferrite/data
+
+# ferrite init defaults to loopback-only binds; rewrite them so the
+# container is reachable through Docker's published ports.
+sed -i.bak 's/^bind = "127\.0\.0\.1"$/bind = "0.0.0.0"/' ./ferrite-config/ferrite.toml
+rm -f ./ferrite-config/ferrite.toml.bak
+
+cp ./ferrite-config/ferrite.toml ferrite.toml
 docker compose -f docker-compose.yml -f docker/docker-compose.custom-config.yml up -d
 ```
 
 Point at a different file without editing the override by setting `FERRITE_CONFIG`:
 
 ```bash
-FERRITE_CONFIG=./my-ferrite.toml \
+FERRITE_CONFIG=./ferrite-config/ferrite.toml \
   docker compose -f docker-compose.yml -f docker/docker-compose.custom-config.yml up -d
 ```
 

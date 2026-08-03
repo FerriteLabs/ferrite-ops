@@ -43,10 +43,14 @@ assert_not_contains "$QUICKSTART_CONTENT" "ferrite.example.toml" \
   "quickstart Compose does not replace the image's generated, verified default config"
 assert_not_contains "$MOONSHOT_CONTENT" "ferrite.example.toml" \
   "Moonshot Compose does not replace the image's generated, verified default config"
-assert_contains "$OVERRIDE_CONTENT" "ferrite.example.toml" \
-  "the opt-in override documents ferrite.example.toml as its default custom-config source"
+assert_contains "$OVERRIDE_CONTENT" '${FERRITE_CONFIG:-./ferrite.toml}:/etc/ferrite/ferrite.toml' \
+  "the opt-in override's default mount is a version-valid ./ferrite.toml, not the invalid public example"
+assert_not_contains "$OVERRIDE_CONTENT" '${FERRITE_CONFIG:-./ferrite.example.toml}' \
+  "the opt-in override's actual mount default never falls back to the invalid public example"
 assert_contains "$OVERRIDE_CONTENT" '${FERRITE_CONFIG:-' \
   "the opt-in override still lets FERRITE_CONFIG point at a different file"
+assert_contains "$OVERRIDE_CONTENT" "ferrite init" \
+  "the opt-in override documents generating a version-valid config via the image's own ferrite init"
 assert_contains "$DEFAULT_CONTENT" "docker/docker-compose.custom-config.yml" \
   "the default compose file documents how to opt in to a custom config"
 
@@ -125,8 +129,10 @@ volumes = doc['services']['ferrite'].get('volumes', [])
 matches = [v['source'] for v in volumes if v.get('target') == '/etc/ferrite/ferrite.toml']
 print(matches[0] if matches else '')
 " "$OVERRIDE_RESOLVED")"
-assert_contains "$OVERRIDE_TOML_SOURCE" "ferrite.example.toml" \
-  "layering the opt-in override resolves the config mount to ferrite.example.toml by default"
+assert_contains "$OVERRIDE_TOML_SOURCE" "ferrite.toml" \
+  "layering the opt-in override resolves the config mount to ./ferrite.toml by default"
+assert_not_contains "$OVERRIDE_TOML_SOURCE" "ferrite.example.toml" \
+  "layering the opt-in override never resolves the config mount to the invalid public example by default"
 
 # --- Real runtime check: `docker compose up` with zero overrides -----------
 # Builds and starts the actual default `ferrite` service (no -f override, no
