@@ -17,12 +17,12 @@ Deployment, monitoring, and packaging for [Ferrite](https://github.com/ferritela
 - `monitoring/` — Prometheus alerting rules
 - `packaging/` — deb/rpm package definitions
 - `scripts/` — Install and quickstart scripts
-- `ferrite.example.toml` — Example configuration
+- `ferrite.example.toml` — Example configuration (opt-in; see `docker/docker-compose.custom-config.yml`)
 
 ## Quick Start
 
 ```bash
-# Docker (single instance)
+# Docker (single instance) — uses the image's own generated, validated config
 docker compose up -d
 
 # Docker with monitoring (Prometheus + Grafana)
@@ -33,6 +33,25 @@ helm install ferrite charts/ferrite
 
 # Quickstart script (builds from source)
 ./scripts/quickstart.sh
+```
+
+### Custom runtime configuration
+
+By default `docker compose up` mounts nothing over `/etc/ferrite/ferrite.toml`,
+so the container uses the image's own generated, build-time-validated config.
+To opt in to a custom `ferrite.toml`, copy `ferrite.example.toml` (or write your
+own) and layer the custom-config override on top:
+
+```bash
+cp ferrite.example.toml ferrite.toml
+docker compose -f docker-compose.yml -f docker/docker-compose.custom-config.yml up -d
+```
+
+Point at a different file without editing the override by setting `FERRITE_CONFIG`:
+
+```bash
+FERRITE_CONFIG=./my-ferrite.toml \
+  docker compose -f docker-compose.yml -f docker/docker-compose.custom-config.yml up -d
 ```
 
 ## Operational Quick Reference

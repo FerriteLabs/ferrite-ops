@@ -1,10 +1,20 @@
 # Ferrite Docker Compose Configuration
 #
 # Usage:
-#   docker compose up -d                    # Start Ferrite only
+#   docker compose up -d                    # Start Ferrite only, using the image's own
+#                                            # built-in, generated-and-validated config
 #   docker compose --profile monitoring up  # Start with Prometheus & Grafana
 #   docker compose --profile redis up       # Start with Redis for comparison
 #   docker compose --profile all up         # Start everything
+#
+# Custom runtime config (opt-in):
+#   By default no ferrite.toml is mounted, so the container uses the image's
+#   own generated, validated config. To override it, layer the custom-config
+#   override on top of this file:
+#     cp ferrite.example.toml ferrite.toml   # or write your own
+#     docker compose -f docker-compose.yml -f docker/docker-compose.custom-config.yml up -d
+#   Or point at a different file without editing the override:
+#     FERRITE_CONFIG=./my-ferrite.toml docker compose -f docker-compose.yml -f docker/docker-compose.custom-config.yml up -d
 
 services:
   # Primary Ferrite service
@@ -25,7 +35,6 @@ services:
       - "9090:9090"   # Prometheus metrics endpoint
     volumes:
       - ferrite-data:/var/lib/ferrite/data
-      - ${FERRITE_CONFIG:-./ferrite.example.toml}:/etc/ferrite/ferrite.toml:ro
     environment:
       - RUST_LOG=${RUST_LOG:-ferrite=info}
       - FERRITE_DATA_DIR=/var/lib/ferrite/data
