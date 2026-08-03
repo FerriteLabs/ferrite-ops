@@ -19,7 +19,7 @@ use crate::policy;
 use crate::resp::{self, RespValue, MAX_ARGUMENTS};
 
 pub const PUBLIC_RESP_ADDR: &str = "0.0.0.0:6379";
-/// Maximum size of one inline command line or one protocol header line.
+/// Maximum size of one RESP protocol header line.
 pub const MAX_REQUEST_LINE: usize = 64 * 1024;
 /// Maximum size of a single command argument sent by a client.
 pub const MAX_REQUEST_BULK: usize = 1024 * 1024;
@@ -282,7 +282,7 @@ async fn forward(
     })?
 }
 
-/// Decode one client command in either RESP array or inline form.
+/// Decode one RESP-array client command.
 pub async fn read_request<R>(reader: &mut R) -> Result<Request, String>
 where
     R: AsyncBufRead + Unpin + Send,
@@ -293,7 +293,9 @@ where
     };
 
     if !line.starts_with(b"*") {
-        return parse_inline(&line).map(Request::Command);
+        return Err(
+            "ERR Protocol error: inline commands are not supported; use RESP arrays".to_string(),
+        );
     }
 
     let count = parse_number(&line[1..], "argument count")?;
@@ -371,19 +373,6 @@ where
     Ok(Some(line))
 }
 
-fn parse_inline(line: &[u8]) -> Result<Vec<Vec<u8>>, String> {
-    let command = std::str::from_utf8(line)
-        .map_err(|_| "ERR Protocol error: inline commands must be valid UTF-8".to_string())?;
-    crate::command::parse(command)
-        .map(|arguments| {
-            arguments
-                .into_iter()
-                .map(String::into_bytes)
-                .collect::<Vec<_>>()
-        })
-        .map_err(|error| format!("ERR Protocol error: {error}"))
-}
-
 fn parse_number(payload: &[u8], field: &str) -> Result<i64, String> {
     std::str::from_utf8(payload)
         .map_err(|_| format!("ERR Protocol error: invalid {field}"))?
@@ -404,31 +393,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn decodes_array_and_inline_requests() {
+    async fn decodes_resp_array_arguments_without_text_reparsing() {
         assert_eq!(
             decode(b"*2\r\n$3\r\nGET\r\n$1\r\na\r\n").await.unwrap(),
             Request::Command(vec![b"GET".to_vec(), b"a".to_vec()])
         );
         assert_eq!(
-            decode(b"PING\r\n").await.unwrap(),
-            Request::Command(vec![b"PING".to_vec()])
-        );
-        assert_eq!(
-            decode(b"SET \"hello world\" 'value with spaces'\r\n")
-                .await
-                .unwrap(),
+            decode(&resp::encode_command(&[
+                &b"SET"[..],
+                &b"literal \"quoted\" argument"[..],
+                &[0xff, 0x00, b' '][..],
+            ]))
+            .await
+            .unwrap(),
             Request::Command(vec![
                 b"SET".to_vec(),
-                b"hello world".to_vec(),
-                b"value with spaces".to_vec(),
-            ])
-        );
-        assert_eq!(
-            decode(b"SET escaped\\ key line\\nbreak\r\n").await.unwrap(),
-            Request::Command(vec![
-                b"SET".to_vec(),
-                b"escaped key".to_vec(),
-                b"line\nbreak".to_vec(),
+                b"literal \"quoted\" argument".to_vec(),
+                vec![0xff, 0x00, b' '],
             ])
         );
         assert_eq!(decode(b"").await.unwrap(), Request::Eof);
@@ -462,19 +443,12 @@ mod tests {
             .unwrap_err()
             .contains("exceeds"));
 
-        assert!(decode(b"GET \"unterminated\r\n")
-            .await
-            .unwrap_err()
-            .contains("unterminated quote"));
-        let inline_many = format!("{}\r\n", vec!["X"; MAX_ARGUMENTS + 1].join(" "));
-        assert!(decode(inline_many.as_bytes())
-            .await
-            .unwrap_err()
-            .contains("too many arguments"));
-        assert!(decode(b"PING \xff\r\n")
-            .await
-            .unwrap_err()
-            .contains("valid UTF-8"));
+        for inline in [b"PING\r\n".as_slice(), b"SET \"unterminated\r\n".as_slice()] {
+            assert!(decode(inline)
+                .await
+                .unwrap_err()
+                .contains("inline commands are not supported"));
+        }
     }
 
     async fn start_proxy_with_permits(
@@ -719,18 +693,37 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn inline_administrative_commands_are_rejected_too() {
+    async fn inline_wire_commands_are_rejected_and_the_connection_is_closed() {
         let upstream = MockFerrite::start().await;
         let addr = start_proxy(upstream.leaked_addr()).await;
         let mut stream = TcpStream::connect(&addr).await.unwrap();
-        stream.write_all(b"shutdown nosave\r\n").await.unwrap();
+        stream
+            .write_all(b"SET \"quoted key\" value\r\n")
+            .await
+            .unwrap();
 
         let mut reader = BufReader::new(stream);
         let reply = resp::read_value_budgeted(&mut reader, 0, &mut resp::ResponseBudget::default())
             .await
             .unwrap();
-        assert!(matches!(reply, RespValue::Error(_)));
-        assert!(!upstream.was_shutdown().await);
+        assert!(matches!(
+            reply,
+            RespValue::Error(message) if message.contains("inline commands are not supported")
+        ));
+
+        let mut stream = reader.into_inner();
+        let follow_up = stream.write_all(&resp::encode_command(&["PING"])).await;
+        if follow_up.is_ok() {
+            let mut reader = BufReader::new(stream);
+            assert!(
+                resp::read_value_budgeted(&mut reader, 0, &mut resp::ResponseBudget::default())
+                    .await
+                    .is_err(),
+                "an inline protocol error closes the public connection"
+            );
+        }
+        sleep(Duration::from_millis(20)).await;
+        assert!(upstream.received_commands().await.is_empty());
     }
 
     #[tokio::test]
