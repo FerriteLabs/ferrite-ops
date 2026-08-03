@@ -6,8 +6,11 @@ set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${HERE}/.." && pwd)"
+ACTIVE_RELEASE="${REPO_ROOT}/active-release.env"
 # shellcheck source=tests/lib/harness.sh
 source "${HERE}/lib/harness.sh"
+
+EXPECTED_VERSION="$(sed -n 's/^FERRITE_VERSION=//p' "$ACTIVE_RELEASE")"
 
 if ! command -v docker >/dev/null 2>&1; then
   echo "  skip: docker is not installed in this environment."
@@ -92,7 +95,8 @@ for _ in $(seq 1 80); do
   sleep 0.25
 done
 assert_contains "$HEALTH" '"success":true' "HTTP health succeeds only after the real RESP PING succeeds"
-assert_contains "$HEALTH" '"version":"0.4.0"' "HTTP health reports the image's Ferrite version"
+assert_contains "$HEALTH" "\"version\":\"${EXPECTED_VERSION}\"" \
+  "HTTP health reports the active Ferrite version"
 
 INDEX="$(curl -fsS --max-time 5 "http://127.0.0.1:${HTTP_PORT}/" 2>/dev/null || true)"
 assert_contains "$INDEX" 'id="command-form"' "root serves an interactive command form"

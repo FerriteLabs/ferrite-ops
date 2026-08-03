@@ -14,7 +14,7 @@ services:
       dockerfile: Dockerfile
       args:
           RUST_VERSION: "1.94"
-    image: ferrite:${FERRITE_VERSION:-latest}
+    image: ferrite:${FERRITE_VERSION:-0.4.0}
     container_name: ferrite
     hostname: ferrite
     labels:

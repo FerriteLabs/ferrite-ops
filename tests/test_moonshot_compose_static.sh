@@ -7,12 +7,14 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${HERE}/.." && pwd)"
 COMPOSE_FILE="${REPO_ROOT}/docker-compose.moonshot.yml"
 DOCKERFILE="${REPO_ROOT}/Dockerfile.moonshot"
+ACTIVE_RELEASE="${REPO_ROOT}/active-release.env"
 # shellcheck source=tests/lib/harness.sh
 source "${HERE}/lib/harness.sh"
 
 COMPOSE_CONTENT="$(cat "$COMPOSE_FILE")"
 DOCKERFILE_CONTENT="$(cat "$DOCKERFILE")"
-EXPECTED_SHA256="b4db8cc8eb0d3c2cef4a019a47d550c347df69fb8a4f77550c814fae463005cf"
+EXPECTED_VERSION="$(sed -n 's/^FERRITE_VERSION=//p' "$ACTIVE_RELEASE")"
+EXPECTED_SHA256="$(sed -n 's/^FERRITE_SOURCE_SHA256=//p' "$ACTIVE_RELEASE")"
 
 assert_not_contains "$COMPOSE_CONTENT" "../ferrite" \
   "Moonshot Compose never depends on a sibling Ferrite checkout"
@@ -20,7 +22,7 @@ assert_contains "$COMPOSE_CONTENT" "context: ." \
   "Moonshot Compose uses ferrite-ops as its build context"
 assert_contains "$COMPOSE_CONTENT" "dockerfile: Dockerfile.moonshot" \
   "Moonshot Compose selects the repository-owned Moonshot Dockerfile"
-assert_contains "$COMPOSE_CONTENT" 'FERRITE_VERSION: "${FERRITE_VERSION:-0.4.0}"' \
+assert_contains "$COMPOSE_CONTENT" "FERRITE_VERSION: \"\${FERRITE_VERSION:-${EXPECTED_VERSION}}\"" \
   "Moonshot Compose passes the current Ferrite version explicitly"
 assert_contains "$COMPOSE_CONTENT" "FERRITE_SOURCE_SHA256: \"\${FERRITE_SOURCE_SHA256:-${EXPECTED_SHA256}}\"" \
   "Moonshot Compose passes the matching v0.4.0 checksum explicitly"

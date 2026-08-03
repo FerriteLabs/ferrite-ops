@@ -8,15 +8,18 @@ set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${HERE}/.." && pwd)"
 DOCKERFILE="${REPO_ROOT}/Dockerfile.moonshot"
+ACTIVE_RELEASE="${REPO_ROOT}/active-release.env"
 # shellcheck source=tests/lib/harness.sh
 source "${HERE}/lib/harness.sh"
 
-if [[ ! -f "$DOCKERFILE" ]]; then
-  echo "  FAIL: ${DOCKERFILE} not found" >&2
+if [[ ! -f "$DOCKERFILE" || ! -f "$ACTIVE_RELEASE" ]]; then
+  echo "  FAIL: Dockerfile.moonshot or active-release.env not found" >&2
   exit 1
 fi
 
 CONTENT="$(cat "$DOCKERFILE")"
+EXPECTED_VERSION="$(sed -n 's/^FERRITE_VERSION=//p' "$ACTIVE_RELEASE")"
+EXPECTED_SHA256="$(sed -n 's/^FERRITE_SOURCE_SHA256=//p' "$ACTIVE_RELEASE")"
 
 # 1. No COPY/ADD of a local (non --from=, non URL) path that doesn't exist
 #    in the repository (this is exactly what F-07 flagged: the original
@@ -65,10 +68,9 @@ assert_contains "$CONTENT" "PING" "HEALTHCHECK exercises PING"
 assert_contains "$CONTENT" "FERRITE_SOURCE_URL" "Dockerfile.moonshot fetches Ferrite source via an overridable FERRITE_SOURCE_URL"
 assert_contains "$CONTENT" "github.com/FerriteLabs/ferrite" "Dockerfile.moonshot's default source points at the public FerriteLabs/ferrite repository"
 ACTUAL_VERSION_DEFAULT="$(grep -oE '^ARG FERRITE_VERSION=[0-9A-Za-z.+-]+' "$DOCKERFILE" | head -1 | cut -d= -f2)"
-assert_eq "0.4.0" "${ACTUAL_VERSION_DEFAULT:-}" "ARG FERRITE_VERSION default matches the primary Dockerfile (0.4.0)"
-EXPECTED_SHA256="b4db8cc8eb0d3c2cef4a019a47d550c347df69fb8a4f77550c814fae463005cf"
+assert_eq "$EXPECTED_VERSION" "${ACTUAL_VERSION_DEFAULT:-}" "ARG FERRITE_VERSION matches active-release.env"
 ACTUAL_SHA256_DEFAULT="$(grep -oE '^ARG FERRITE_SOURCE_SHA256=[0-9a-fA-F]+' "$DOCKERFILE" | head -1 | cut -d= -f2)"
-assert_eq "$EXPECTED_SHA256" "${ACTUAL_SHA256_DEFAULT:-}" "ARG FERRITE_SOURCE_SHA256 default matches the primary Dockerfile's verified v0.4.0 tarball SHA256"
+assert_eq "$EXPECTED_SHA256" "${ACTUAL_SHA256_DEFAULT:-}" "ARG FERRITE_SOURCE_SHA256 matches active-release.env"
 assert_contains "$CONTENT" "sha256sum -c -" "source stage verifies the fetched tarball with sha256sum"
 assert_contains "$CONTENT" 'if [ -z "$FERRITE_SOURCE_SHA256" ]' "source stage refuses to build when FERRITE_SOURCE_SHA256 is empty"
 

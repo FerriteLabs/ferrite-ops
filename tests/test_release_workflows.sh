@@ -23,14 +23,20 @@ source "${HERE}/lib/harness.sh"
 RELEASE_YML="${REPO_ROOT}/.github/workflows/release.yml"
 VERSION_SYNC_YML="${REPO_ROOT}/.github/workflows/version-sync.yml"
 ORCHESTRATION_YML="${REPO_ROOT}/.github/workflows/release-orchestration.yml"
+ACTIVE_RELEASE="${REPO_ROOT}/active-release.env"
 
-for f in "$RELEASE_YML" "$VERSION_SYNC_YML" "$ORCHESTRATION_YML"; do
+for f in "$RELEASE_YML" "$VERSION_SYNC_YML" "$ORCHESTRATION_YML" "$ACTIVE_RELEASE"; do
   if [[ ! -f "$f" ]]; then
     echo "  FAIL: ${f} not found" >&2
     exit 1
   fi
 done
 
+EXPECTED_VERSION="$(sed -n 's/^FERRITE_VERSION=//p' "$ACTIVE_RELEASE")"
+EXPECTED_SHA256="$(sed -n 's/^FERRITE_SOURCE_SHA256=//p' "$ACTIVE_RELEASE")"
+EXPECTED_MAJOR="${EXPECTED_VERSION%%.*}"
+EXPECTED_MAJOR_MINOR="${EXPECTED_VERSION%.*}"
+EXPECTED_TAG_SET="${EXPECTED_MAJOR} ${EXPECTED_MAJOR_MINOR} ${EXPECTED_VERSION} latest"
 RELEASE_CONTENT="$(cat "$RELEASE_YML")"
 VERSION_SYNC_CONTENT="$(cat "$VERSION_SYNC_YML")"
 ORCHESTRATION_CONTENT="$(cat "$ORCHESTRATION_YML")"
@@ -52,8 +58,8 @@ assert_contains "$RELEASE_CONTENT" "github.event.client_payload.version" \
   "release.yml derives the version from repository_dispatch client_payload.version"
 assert_contains "$RELEASE_CONTENT" "inputs.tag" \
   "release.yml derives the version from the workflow_dispatch input"
-assert_contains "$RELEASE_CONTENT" "default: 'v0.4.0'" \
-  "release.yml's workflow_dispatch default is a concrete semver release"
+assert_contains "$RELEASE_CONTENT" "default: 'v${EXPECTED_VERSION}'" \
+  "release.yml's workflow_dispatch default matches active-release.env"
 assert_contains "$RELEASE_CONTENT" 'type=raw,value=${{ steps.release_meta.outputs.version }}' \
   "release.yml tags every trigger with the normalized exact semver"
 assert_contains "$RELEASE_CONTENT" 'type=raw,value=${{ steps.release_meta.outputs.major_minor }}' \
@@ -78,6 +84,10 @@ for dockerfile in Dockerfile Dockerfile.moonshot Dockerfile.playground; do
 done
 assert_contains "$VERSION_SYNC_CONTENT" "DOCKERFILES=(" \
   "version-sync.yml updates all Dockerfile defaults as one validated group"
+assert_contains "$VERSION_SYNC_CONTENT" "active-release.env" \
+  "version-sync.yml updates canonical active release metadata"
+assert_contains "$VERSION_SYNC_CONTENT" "Synchronize active release metadata and pins" \
+  "version-sync.yml stages every active release pin as one update group"
 assert_contains "$VERSION_SYNC_CONTENT" "ARG FERRITE_SOURCE_SHA256=" \
   "version-sync.yml updates each Dockerfile's FERRITE_SOURCE_SHA256 default"
 assert_contains "$VERSION_SYNC_CONTENT" "ARG FERRITE_VERSION=" \
@@ -90,6 +100,20 @@ assert_contains "$VERSION_SYNC_CONTENT" "shasum -a 256" \
   "version-sync.yml computes the source checksum when not explicitly provided"
 assert_contains "$VERSION_SYNC_CONTENT" "charts/ferrite-sidecar/Chart.yaml" \
   "version-sync.yml keeps the sidecar appVersion synchronized"
+for active_target in \
+  docker-compose.quickstart.yml \
+  docker-compose.yml \
+  docker-compose.moonshot.yml \
+  gitops/argocd/overlays/production.yaml \
+  gitops/flux/overlays/production.yaml \
+  terraform/common/variables.tf \
+  terraform/aws-ecs/main.tf \
+  terraform/aws-eks/main.tf \
+  terraform/README.md \
+  .github/workflows/release.yml; do
+  assert_contains "$VERSION_SYNC_CONTENT" "$active_target" \
+    "version-sync.yml includes ${active_target} in the release transaction"
+done
 assert_contains "$ORCHESTRATION_CONTENT" "'^[0-9a-f]{64}$'" \
   "release-orchestration.yml validates supplied and computed source checksums"
 
@@ -226,13 +250,17 @@ version_sync_meta_script = next(
 with open(version_sync_meta_out_path, "w") as f:
     f.write(version_sync_meta_script)
 
-sync_script = next(s["run"] for s in sync_steps if s.get("name") == "Update Dockerfiles")
+sync_script = next(
+    s["run"]
+    for s in sync_steps
+    if s.get("name") == "Synchronize active release metadata and pins"
+)
 with open(sync_out_path, "w") as f:
     f.write(sync_script)
 
-version_sync_chart_script = next(
-    s["run"] for s in sync_steps if s.get("name") == "Update Helm chart"
-)
+# The active-pin synchronizer now owns chart updates as part of the same
+# transaction; retain this extracted path for the common extraction fixture.
+version_sync_chart_script = sync_script
 with open(version_sync_chart_out_path, "w") as f:
     f.write(version_sync_chart_script)
 
@@ -260,16 +288,41 @@ then
   exit $?
 fi
 
-# Exercise the version-sync Dockerfile step against isolated copies. All three
-# files must change together, and structural drift must fail before any edit.
+# Exercise the full active-release transaction against isolated copies. Every
+# pin must change together, and structural drift must fail before any edit.
 SYNC_VERSION="9.8.7"
 SYNC_SHA256="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 SYNC_SCRIPT="$(cat "${EXTRACT_DIR}/update_dockerfiles.sh")"
+SYNC_TARGETS=(
+  active-release.env
+  Dockerfile
+  Dockerfile.moonshot
+  Dockerfile.playground
+  charts/ferrite/Chart.yaml
+  charts/ferrite-sidecar/Chart.yaml
+  docker-compose.quickstart.yml
+  docker-compose.yml
+  docker-compose.moonshot.yml
+  gitops/argocd/overlays/production.yaml
+  gitops/flux/overlays/production.yaml
+  terraform/common/variables.tf
+  terraform/aws-ecs/main.tf
+  terraform/aws-eks/main.tf
+  terraform/README.md
+  .github/workflows/release.yml
+)
+
+copy_sync_targets() {
+  local destination="$1" target
+  for target in "${SYNC_TARGETS[@]}"; do
+    mkdir -p "${destination}/$(dirname "$target")"
+    cp "${REPO_ROOT}/${target}" "${destination}/${target}"
+  done
+}
 
 SYNC_DIR="${EXTRACT_DIR}/sync-success"
 mkdir -p "$SYNC_DIR"
-cp "${REPO_ROOT}/Dockerfile" "${REPO_ROOT}/Dockerfile.moonshot" \
-  "${REPO_ROOT}/Dockerfile.playground" "$SYNC_DIR/"
+copy_sync_targets "$SYNC_DIR"
 if (cd "$SYNC_DIR" && VERSION="$SYNC_VERSION" SHA256="$SYNC_SHA256" bash -c "$SYNC_SCRIPT"); then
   for dockerfile in Dockerfile Dockerfile.moonshot Dockerfile.playground; do
     assert_contains "$(cat "${SYNC_DIR}/${dockerfile}")" "ARG FERRITE_VERSION=${SYNC_VERSION}" \
@@ -277,30 +330,63 @@ if (cd "$SYNC_DIR" && VERSION="$SYNC_VERSION" SHA256="$SYNC_SHA256" bash -c "$SY
     assert_contains "$(cat "${SYNC_DIR}/${dockerfile}")" "ARG FERRITE_SOURCE_SHA256=${SYNC_SHA256}" \
       "version-sync functional replay updates ${dockerfile}'s checksum"
   done
+  assert_contains "$(cat "${SYNC_DIR}/active-release.env")" "FERRITE_VERSION=${SYNC_VERSION}" \
+    "version-sync functional replay updates canonical release version"
+  assert_contains "$(cat "${SYNC_DIR}/active-release.env")" "FERRITE_SOURCE_SHA256=${SYNC_SHA256}" \
+    "version-sync functional replay updates canonical release checksum"
+  assert_contains "$(cat "${SYNC_DIR}/charts/ferrite/Chart.yaml")" "appVersion: \"${SYNC_VERSION}\"" \
+    "version-sync functional replay updates the primary chart appVersion"
+  assert_contains "$(cat "${SYNC_DIR}/charts/ferrite-sidecar/Chart.yaml")" "appVersion: \"${SYNC_VERSION}\"" \
+    "version-sync functional replay updates the sidecar chart appVersion"
+  assert_contains "$(cat "${SYNC_DIR}/docker-compose.quickstart.yml")" \
+    "ferrite:${SYNC_VERSION}" "version-sync functional replay updates quickstart"
+  assert_contains "$(cat "${SYNC_DIR}/docker-compose.yml")" \
+    "FERRITE_VERSION:-${SYNC_VERSION}" "version-sync functional replay updates default Compose"
+  assert_eq "2" "$(grep -c "FERRITE_VERSION:-${SYNC_VERSION}" "${SYNC_DIR}/docker-compose.moonshot.yml")" \
+    "version-sync functional replay updates both Moonshot version defaults"
+  assert_eq "2" "$(grep -c "FERRITE_SOURCE_SHA256:-${SYNC_SHA256}" "${SYNC_DIR}/docker-compose.moonshot.yml")" \
+    "version-sync functional replay updates both Moonshot checksum defaults"
+  assert_contains "$(cat "${SYNC_DIR}/gitops/argocd/overlays/production.yaml")" \
+    "targetRevision: v${SYNC_VERSION}" "version-sync functional replay updates Argo CD"
+  assert_contains "$(cat "${SYNC_DIR}/gitops/flux/overlays/production.yaml")" \
+    "tag: v${SYNC_VERSION}" "version-sync functional replay updates Flux"
+  for terraform_file in terraform/common/variables.tf terraform/aws-ecs/main.tf terraform/aws-eks/main.tf; do
+    assert_contains "$(grep -A5 '^variable "ferrite_version"' "${SYNC_DIR}/${terraform_file}")" \
+      "default     = \"${SYNC_VERSION}\"" \
+      "version-sync functional replay updates ${terraform_file}"
+  done
+  assert_eq "2" \
+    "$(grep -c "ferrite_version[[:space:]]*= \"${SYNC_VERSION}\"" "${SYNC_DIR}/terraform/README.md")" \
+    "version-sync functional replay updates Terraform examples"
+  assert_contains "$(cat "${SYNC_DIR}/.github/workflows/release.yml")" \
+    "default: 'v${SYNC_VERSION}'" \
+    "version-sync functional replay updates the release workflow dispatch default"
 else
   harness_fail "version-sync functional replay unexpectedly failed"
 fi
 
 DRIFT_DIR="${EXTRACT_DIR}/sync-drift"
 mkdir -p "$DRIFT_DIR"
-cp "${REPO_ROOT}/Dockerfile" "${REPO_ROOT}/Dockerfile.moonshot" \
-  "${REPO_ROOT}/Dockerfile.playground" "$DRIFT_DIR/"
+copy_sync_targets "$DRIFT_DIR"
 sed '/^ARG FERRITE_SOURCE_SHA256=/d' "${DRIFT_DIR}/Dockerfile.playground" \
   > "${DRIFT_DIR}/Dockerfile.playground.tmp"
 mv "${DRIFT_DIR}/Dockerfile.playground.tmp" "${DRIFT_DIR}/Dockerfile.playground"
 if (cd "$DRIFT_DIR" && VERSION="$SYNC_VERSION" SHA256="$SYNC_SHA256" bash -c "$SYNC_SCRIPT"); then
   harness_fail "version-sync unexpectedly accepted a structurally drifted auxiliary Dockerfile"
 else
-  UNCHANGED_COUNT="$(grep -l '^ARG FERRITE_VERSION=0.4.0$' \
+  UNCHANGED_COUNT="$(grep -l "^ARG FERRITE_VERSION=${EXPECTED_VERSION}$" \
     "${DRIFT_DIR}/Dockerfile" "${DRIFT_DIR}/Dockerfile.moonshot" \
     "${DRIFT_DIR}/Dockerfile.playground" | wc -l | tr -d ' ')"
   assert_eq "3" "$UNCHANGED_COUNT" \
-    "version-sync validates every Dockerfile before making any release-default edit"
+    "version-sync validates every target before making any release-default edit"
+  assert_contains "$(cat "${DRIFT_DIR}/active-release.env")" \
+    "FERRITE_VERSION=${EXPECTED_VERSION}" \
+    "structural drift leaves canonical metadata unchanged"
 fi
 
 # Replay every chart release path. The primary package follows the core
 # release, while the sidecar package version remains independently versioned.
-for chart_path in release_chart version_sync_chart orchestration_chart; do
+for chart_path in release_chart orchestration_chart; do
   CHART_DIR="${EXTRACT_DIR}/${chart_path}"
   mkdir -p "${CHART_DIR}/charts/ferrite" "${CHART_DIR}/charts/ferrite-sidecar"
   cp "${REPO_ROOT}/charts/ferrite/Chart.yaml" "${CHART_DIR}/charts/ferrite/Chart.yaml"
@@ -376,45 +462,45 @@ run_case() {
   )
 }
 
-if run_case "push_tag" push "" "" "v0.4.0" >"${EXTRACT_DIR}/log_push_tag.txt" 2>&1; then
+if run_case "push_tag" push "" "" "v${EXPECTED_VERSION}" >"${EXTRACT_DIR}/log_push_tag.txt" 2>&1; then
   OUT="$(cat "${EXTRACT_DIR}/output_push_tag.txt")"
-  assert_contains "$OUT" "version=0.4.0" "push-tag case derives version=0.4.0 from GITHUB_REF_NAME"
-  assert_contains "$OUT" "major_minor=0.4" "push-tag case derives normalized major.minor tag"
-  assert_contains "$OUT" "major=0" "push-tag case derives normalized major tag"
+  assert_contains "$OUT" "version=${EXPECTED_VERSION}" "push-tag case derives active version from GITHUB_REF_NAME"
+  assert_contains "$OUT" "major_minor=${EXPECTED_MAJOR_MINOR}" "push-tag case derives normalized major.minor tag"
+  assert_contains "$OUT" "major=${EXPECTED_MAJOR}" "push-tag case derives normalized major tag"
   assert_contains "$OUT" "stable=true" "push-tag stable release enables rolling semver/latest tags"
-  assert_contains "$OUT" "FERRITE_VERSION=0.4.0" "push-tag case emits FERRITE_VERSION build-arg"
-  assert_contains "$OUT" "FERRITE_SOURCE_SHA256=b4db8cc8eb0d3c2cef4a019a47d550c347df69fb8a4f77550c814fae463005cf" \
-    "push-tag case computes the correct real SHA256 for the v0.4.0 tarball"
-  assert_tag_set push_tag "0 0.4 0.4.0 latest"
+  assert_contains "$OUT" "FERRITE_VERSION=${EXPECTED_VERSION}" "push-tag case emits FERRITE_VERSION build-arg"
+  assert_contains "$OUT" "FERRITE_SOURCE_SHA256=${EXPECTED_SHA256}" \
+    "push-tag case computes the active release source SHA256"
+  assert_tag_set push_tag "$EXPECTED_TAG_SET"
 else
   harness_fail "push-tag case unexpectedly failed: $(cat "${EXTRACT_DIR}/log_push_tag.txt")"
 fi
 
-if run_case "workflow_dispatch" workflow_dispatch "" "v0.4.0" >"${EXTRACT_DIR}/log_workflow_dispatch.txt" 2>&1; then
+if run_case "workflow_dispatch" workflow_dispatch "" "v${EXPECTED_VERSION}" >"${EXTRACT_DIR}/log_workflow_dispatch.txt" 2>&1; then
   OUT="$(cat "${EXTRACT_DIR}/output_workflow_dispatch.txt")"
-  assert_contains "$OUT" "version=0.4.0" \
-    "workflow_dispatch derives version=0.4.0 from its version tag input"
-  assert_contains "$OUT" "FERRITE_VERSION=0.4.0" \
+  assert_contains "$OUT" "version=${EXPECTED_VERSION}" \
+    "workflow_dispatch derives the active version from its version tag input"
+  assert_contains "$OUT" "FERRITE_VERSION=${EXPECTED_VERSION}" \
     "workflow_dispatch emits an explicit FERRITE_VERSION build-arg"
-  assert_contains "$OUT" "FERRITE_SOURCE_SHA256=b4db8cc8eb0d3c2cef4a019a47d550c347df69fb8a4f77550c814fae463005cf" \
-    "workflow_dispatch computes and emits the matching source checksum"
-  assert_tag_set workflow_dispatch "0 0.4 0.4.0 latest"
+  assert_contains "$OUT" "FERRITE_SOURCE_SHA256=${EXPECTED_SHA256}" \
+    "workflow_dispatch computes and emits the active source checksum"
+  assert_tag_set workflow_dispatch "$EXPECTED_TAG_SET"
 else
   harness_fail "workflow_dispatch case unexpectedly failed: $(cat "${EXTRACT_DIR}/log_workflow_dispatch.txt")"
 fi
 
-if run_case "repository_dispatch" repository_dispatch "v0.4.0" "" \
+if run_case "repository_dispatch" repository_dispatch "v${EXPECTED_VERSION}" "" \
   >"${EXTRACT_DIR}/log_repository_dispatch.txt" 2>&1; then
   OUT="$(cat "${EXTRACT_DIR}/output_repository_dispatch.txt")"
-  assert_contains "$OUT" "version=0.4.0" \
-    "repository_dispatch normalizes v0.4.0 to the exact 0.4.0 tag"
-  assert_contains "$OUT" "major_minor=0.4" \
-    "repository_dispatch emits the 0.4 rolling tag"
-  assert_contains "$OUT" "major=0" \
-    "repository_dispatch emits the 0 rolling tag"
+  assert_contains "$OUT" "version=${EXPECTED_VERSION}" \
+    "repository_dispatch normalizes the active version to the exact tag"
+  assert_contains "$OUT" "major_minor=${EXPECTED_MAJOR_MINOR}" \
+    "repository_dispatch emits the active major.minor rolling tag"
+  assert_contains "$OUT" "major=${EXPECTED_MAJOR}" \
+    "repository_dispatch emits the active major rolling tag"
   assert_contains "$OUT" "stable=true" \
     "repository_dispatch stable release enables latest"
-  assert_tag_set repository_dispatch "0 0.4 0.4.0 latest"
+  assert_tag_set repository_dispatch "$EXPECTED_TAG_SET"
 else
   harness_fail "repository_dispatch case unexpectedly failed: $(cat "${EXTRACT_DIR}/log_repository_dispatch.txt")"
 fi
@@ -444,7 +530,7 @@ fi
 # Exercise every payload-consuming metadata script with shell-substitution
 # strings. They must reject the value as invalid data without executing it.
 MALICIOUS_MARKER="${EXTRACT_DIR}/payload-executed"
-MALICIOUS_VERSION="0.4.0\$(touch ${MALICIOUS_MARKER})"
+MALICIOUS_VERSION="${EXPECTED_VERSION}\$(touch ${MALICIOUS_MARKER})"
 MALICIOUS_SHA256="\$(touch ${MALICIOUS_MARKER})"
 
 if run_case "malicious_release" repository_dispatch "$MALICIOUS_VERSION" "" \
@@ -478,7 +564,7 @@ if run_version_sync_meta "$MALICIOUS_VERSION" "$SYNC_SHA256" \
 else
   harness_ok "version-sync.yml rejects malicious dispatch versions"
 fi
-if run_version_sync_meta "0.4.0" "$MALICIOUS_SHA256" \
+if run_version_sync_meta "$EXPECTED_VERSION" "$MALICIOUS_SHA256" \
   "${EXTRACT_DIR}/malicious_sync_checksum.out" >/dev/null 2>&1; then
   harness_fail "version-sync.yml unexpectedly accepted a malicious checksum"
 else
@@ -507,7 +593,7 @@ if run_orchestration_meta "$MALICIOUS_VERSION" "$SYNC_SHA256" \
 else
   harness_ok "release-orchestration.yml rejects malicious versions"
 fi
-if run_orchestration_meta "0.4.0" "$MALICIOUS_SHA256" \
+if run_orchestration_meta "$EXPECTED_VERSION" "$MALICIOUS_SHA256" \
   "${EXTRACT_DIR}/malicious_orchestration_checksum.out" >/dev/null 2>&1; then
   harness_fail "release-orchestration.yml unexpectedly accepted a malicious checksum"
 else

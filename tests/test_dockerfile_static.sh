@@ -9,15 +9,18 @@ set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${HERE}/.." && pwd)"
 DOCKERFILE="${REPO_ROOT}/Dockerfile"
+ACTIVE_RELEASE="${REPO_ROOT}/active-release.env"
 # shellcheck source=tests/lib/harness.sh
 source "${HERE}/lib/harness.sh"
 
-if [[ ! -f "$DOCKERFILE" ]]; then
-  echo "  FAIL: ${DOCKERFILE} not found" >&2
+if [[ ! -f "$DOCKERFILE" || ! -f "$ACTIVE_RELEASE" ]]; then
+  echo "  FAIL: Dockerfile or active-release.env not found" >&2
   exit 1
 fi
 
 CONTENT="$(cat "$DOCKERFILE")"
+EXPECTED_VERSION="$(sed -n 's/^FERRITE_VERSION=//p' "$ACTIVE_RELEASE")"
+EXPECTED_SHA256="$(sed -n 's/^FERRITE_SOURCE_SHA256=//p' "$ACTIVE_RELEASE")"
 
 # 1. No COPY/ADD of a local (non --from=, non URL) path that doesn't exist
 #    in the repository. This is what broke the original Dockerfile, which
@@ -67,7 +70,7 @@ assert_contains "$CONTENT" "github.com/FerriteLabs/ferrite" "Dockerfile's defaul
 
 # 6. FERRITE_VERSION default must not be silently bumped by future edits.
 ACTUAL_DEFAULT="$(grep -oE '^ARG FERRITE_VERSION=[0-9A-Za-z.+-]+' "$DOCKERFILE" | head -1 | cut -d= -f2)"
-assert_eq "0.4.0" "${ACTUAL_DEFAULT:-}" "ARG FERRITE_VERSION defaults to the current Ferrite release 0.4.0"
+assert_eq "$EXPECTED_VERSION" "${ACTUAL_DEFAULT:-}" "ARG FERRITE_VERSION matches active-release.env"
 assert_contains "$CONTENT" "rm -f rust-toolchain rust-toolchain.toml" \
   "fetched contributor toolchain cannot override the Docker build toolchain"
 assert_contains "$CONTENT" '[ "$FERRITE_VERSION" = "0.4.0" ]' \
@@ -145,10 +148,9 @@ fi
 #     the verified v0.4.0 tarball digest, and be checked before extraction
 #     (i.e. the sha256sum verification must appear before the `tar`
 #     extraction step in the source stage).
-EXPECTED_SHA256="b4db8cc8eb0d3c2cef4a019a47d550c347df69fb8a4f77550c814fae463005cf"
 ACTUAL_SHA256_DEFAULT="$(grep -oE '^ARG FERRITE_SOURCE_SHA256=[0-9a-fA-F]+' "$DOCKERFILE" | head -1 | cut -d= -f2)"
 assert_eq "$EXPECTED_SHA256" "${ACTUAL_SHA256_DEFAULT:-}" \
-  "ARG FERRITE_SOURCE_SHA256 defaults to the verified v0.4.0 tarball SHA256"
+  "ARG FERRITE_SOURCE_SHA256 matches active-release.env"
 
 SOURCE_STAGE_BODY="$(sed -n '/^FROM chef AS source$/,/^FROM chef AS planner$/p' "$DOCKERFILE")"
 assert_contains "$SOURCE_STAGE_BODY" "sha256sum -c -" \
