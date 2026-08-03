@@ -49,20 +49,6 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Extract metadata (tags, labels)
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: |
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-            ${{ env.DOCKERHUB_IMAGE }}
-          tags: |
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=semver,pattern={{major}}
-            type=raw,value=latest,enable={{is_default_branch}}
-            type=raw,value=${{ inputs.tag }},enable=${{ github.event_name == 'workflow_dispatch' }}
-
       # Determine the Ferrite source version to bake into this image, from
       # whichever trigger fired this workflow, and its verified source
       # tarball checksum. This is passed explicitly to the Docker build
@@ -112,13 +98,37 @@ jobs:
 
           echo "::notice::Building Ferrite v${VERSION} (source SHA256: ${SHA256})"
 
+          MAJOR="${VERSION%%.*}"
+          MAJOR_MINOR="${VERSION%.*}"
+          if [[ "$VERSION" == *-* ]]; then
+            STABLE=false
+          else
+            STABLE=true
+          fi
+
           {
             echo "version=${VERSION}"
+            echo "major=${MAJOR}"
+            echo "major_minor=${MAJOR_MINOR}"
+            echo "stable=${STABLE}"
             echo "build_args<<FERRITE_BUILD_ARGS_EOF"
             printf 'FERRITE_VERSION=%s\n' "$VERSION"
             printf 'FERRITE_SOURCE_SHA256=%s\n' "$SHA256"
             echo "FERRITE_BUILD_ARGS_EOF"
           } >> "$GITHUB_OUTPUT"
+
+      - name: Extract metadata (tags, labels)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+            ${{ env.DOCKERHUB_IMAGE }}
+          tags: |
+            type=raw,value=${{ steps.release_meta.outputs.version }}
+            type=raw,value=${{ steps.release_meta.outputs.major_minor }},enable=${{ steps.release_meta.outputs.stable == 'true' }}
+            type=raw,value=${{ steps.release_meta.outputs.major }},enable=${{ steps.release_meta.outputs.stable == 'true' }}
+            type=raw,value=latest,enable=${{ steps.release_meta.outputs.stable == 'true' }}
 
       - name: Build and push (amd64 + arm64)
         id: build

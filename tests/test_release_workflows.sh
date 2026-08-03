@@ -50,6 +50,16 @@ assert_contains "$RELEASE_CONTENT" "inputs.tag" \
   "release.yml derives the version from the workflow_dispatch input"
 assert_contains "$RELEASE_CONTENT" "default: 'v0.4.0'" \
   "release.yml's workflow_dispatch default is a concrete semver release"
+assert_contains "$RELEASE_CONTENT" 'type=raw,value=${{ steps.release_meta.outputs.version }}' \
+  "release.yml tags every trigger with the normalized exact semver"
+assert_contains "$RELEASE_CONTENT" 'type=raw,value=${{ steps.release_meta.outputs.major_minor }}' \
+  "release.yml derives the normalized major.minor tag from release_meta"
+assert_contains "$RELEASE_CONTENT" 'type=raw,value=${{ steps.release_meta.outputs.major }}' \
+  "release.yml derives the normalized major tag from release_meta"
+assert_contains "$RELEASE_CONTENT" 'type=raw,value=latest,enable=${{ steps.release_meta.outputs.stable == '\''true'\'' }}' \
+  "release.yml publishes latest only for stable semver releases"
+assert_not_contains "$RELEASE_CONTENT" 'type=raw,value=${{ inputs.tag }}' \
+  "workflow_dispatch does not publish an unnormalized raw v-prefixed tag"
 
 # --- Static checks: version-sync.yml ----------------------------------------
 for dockerfile in Dockerfile Dockerfile.moonshot Dockerfile.playground; do
@@ -111,6 +121,22 @@ with open(release_yml_path) as f:
 
 steps = doc["jobs"]["build-and-push"]["steps"]
 script = next(s["run"] for s in steps if s.get("name") == "Determine release version and source checksum")
+release_index = next(i for i, s in enumerate(steps) if s.get("id") == "release_meta")
+metadata_index = next(i for i, s in enumerate(steps) if s.get("id") == "meta")
+if release_index >= metadata_index:
+    raise SystemExit("release_meta must run before docker/metadata-action")
+
+metadata_tags = next(s["with"]["tags"] for s in steps if s.get("id") == "meta")
+required_tags = [
+    "type=raw,value=${{ steps.release_meta.outputs.version }}",
+    "type=raw,value=${{ steps.release_meta.outputs.major_minor }}",
+    "type=raw,value=${{ steps.release_meta.outputs.major }}",
+    "type=raw,value=latest,enable=${{ steps.release_meta.outputs.stable == 'true' }}",
+]
+missing_tags = [tag for tag in required_tags if tag not in metadata_tags]
+if missing_tags:
+    raise SystemExit(f"metadata tags are missing normalized outputs: {missing_tags}")
+
 with open(release_out_path, "w") as f:
     f.write(script)
 
@@ -184,6 +210,9 @@ run_case() {
 if run_case "push_tag" push "" "" "v0.4.0" >"${EXTRACT_DIR}/log_push_tag.txt" 2>&1; then
   OUT="$(cat "${EXTRACT_DIR}/output_push_tag.txt")"
   assert_contains "$OUT" "version=0.4.0" "push-tag case derives version=0.4.0 from GITHUB_REF_NAME"
+  assert_contains "$OUT" "major_minor=0.4" "push-tag case derives normalized major.minor tag"
+  assert_contains "$OUT" "major=0" "push-tag case derives normalized major tag"
+  assert_contains "$OUT" "stable=true" "push-tag stable release enables rolling semver/latest tags"
   assert_contains "$OUT" "FERRITE_VERSION=0.4.0" "push-tag case emits FERRITE_VERSION build-arg"
   assert_contains "$OUT" "FERRITE_SOURCE_SHA256=b4db8cc8eb0d3c2cef4a019a47d550c347df69fb8a4f77550c814fae463005cf" \
     "push-tag case computes the correct real SHA256 for the v0.4.0 tarball"
@@ -201,6 +230,35 @@ if run_case "workflow_dispatch" workflow_dispatch "" "v0.4.0" >"${EXTRACT_DIR}/l
     "workflow_dispatch computes and emits the matching source checksum"
 else
   harness_fail "workflow_dispatch case unexpectedly failed: $(cat "${EXTRACT_DIR}/log_workflow_dispatch.txt")"
+fi
+
+if run_case "repository_dispatch" repository_dispatch "v0.4.0" "" \
+  >"${EXTRACT_DIR}/log_repository_dispatch.txt" 2>&1; then
+  OUT="$(cat "${EXTRACT_DIR}/output_repository_dispatch.txt")"
+  assert_contains "$OUT" "version=0.4.0" \
+    "repository_dispatch normalizes v0.4.0 to the exact 0.4.0 tag"
+  assert_contains "$OUT" "major_minor=0.4" \
+    "repository_dispatch emits the 0.4 rolling tag"
+  assert_contains "$OUT" "major=0" \
+    "repository_dispatch emits the 0 rolling tag"
+  assert_contains "$OUT" "stable=true" \
+    "repository_dispatch stable release enables latest"
+else
+  harness_fail "repository_dispatch case unexpectedly failed: $(cat "${EXTRACT_DIR}/log_repository_dispatch.txt")"
+fi
+
+if (
+  curl() { printf 'prerelease-source-fixture'; }
+  export -f curl
+  run_case "prerelease" workflow_dispatch "" "v0.5.0-rc.1"
+) >"${EXTRACT_DIR}/log_prerelease.txt" 2>&1; then
+  OUT="$(cat "${EXTRACT_DIR}/output_prerelease.txt")"
+  assert_contains "$OUT" "version=0.5.0-rc.1" \
+    "prerelease keeps its normalized exact semver tag"
+  assert_contains "$OUT" "stable=false" \
+    "prerelease disables major, major.minor, and latest rolling tags"
+else
+  harness_fail "prerelease case unexpectedly failed: $(cat "${EXTRACT_DIR}/log_prerelease.txt")"
 fi
 
 if run_case "bad_semver" push "" "" "not-a-version" >"${EXTRACT_DIR}/log_bad_semver.txt" 2>&1; then
