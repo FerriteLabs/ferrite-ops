@@ -22,6 +22,7 @@ use crate::resp::{self, RespValue};
 #[derive(Debug, Clone)]
 pub enum Stored {
     Str(String),
+    Bytes(Vec<u8>),
     List(Vec<String>),
     Set(BTreeSet<String>),
     Hash(BTreeMap<String, String>),
@@ -32,7 +33,7 @@ pub enum Stored {
 impl Stored {
     fn type_name(&self) -> &'static str {
         match self {
-            Stored::Str(_) => "string",
+            Stored::Str(_) | Stored::Bytes(_) => "string",
             Stored::List(_) => "list",
             Stored::Set(_) => "set",
             Stored::Hash(_) => "hash",
@@ -98,6 +99,10 @@ impl MockFerrite {
 
     pub async fn seed_string(&self, key: &str, value: &str) {
         self.seed(key, Stored::Str(value.to_string())).await;
+    }
+
+    pub async fn seed_bytes(&self, key: &str, value: Vec<u8>) {
+        self.seed(key, Stored::Bytes(value)).await;
     }
 
     pub async fn seed_list(&self, key: &str, values: Vec<String>) {
@@ -185,6 +190,7 @@ fn dispatch(state: &mut MockState, name: &str, args: &[String]) -> RespValue {
             .get(args.first().map(String::as_str).unwrap_or(""))
         {
             Some(Stored::Str(value)) => bulk(value),
+            Some(Stored::Bytes(value)) => RespValue::Bulk(Some(value.clone())),
             Some(_) => RespValue::Error("WRONGTYPE".into()),
             None => RespValue::Bulk(None),
         },
@@ -195,23 +201,12 @@ fn dispatch(state: &mut MockState, name: &str, args: &[String]) -> RespValue {
         "TTL" => RespValue::Integer(-1),
         "STRLEN" => match state.data.get(&args[0]) {
             Some(Stored::Str(value)) => RespValue::Integer(value.len() as i64),
+            Some(Stored::Bytes(value)) => RespValue::Integer(value.len() as i64),
             _ => RespValue::Integer(0),
         },
         "GETRANGE" => match state.data.get(&args[0]) {
-            Some(Stored::Str(value)) => {
-                let start: usize = args[1].parse().unwrap_or(0);
-                let end: i64 = args[2].parse().unwrap_or(-1);
-                let end = if end < 0 {
-                    value.len().saturating_sub(1)
-                } else {
-                    std::cmp::min(end as usize, value.len().saturating_sub(1))
-                };
-                if start > end || value.is_empty() {
-                    bulk("")
-                } else {
-                    bulk(&value[start..=end])
-                }
-            }
+            Some(Stored::Str(value)) => range_bulk(value.as_bytes(), args),
+            Some(Stored::Bytes(value)) => range_bulk(value, args),
             _ => bulk(""),
         },
         "LLEN" => match state.data.get(&args[0]) {
@@ -337,6 +332,21 @@ fn dispatch(state: &mut MockState, name: &str, args: &[String]) -> RespValue {
             ))
         }
         _ => RespValue::Error(format!("ERR unknown command '{name}'")),
+    }
+}
+
+fn range_bulk(value: &[u8], args: &[String]) -> RespValue {
+    let start: usize = args[1].parse().unwrap_or(0);
+    let end: i64 = args[2].parse().unwrap_or(-1);
+    let end = if end < 0 {
+        value.len().saturating_sub(1)
+    } else {
+        std::cmp::min(end as usize, value.len().saturating_sub(1))
+    };
+    if start > end || value.is_empty() {
+        RespValue::Bulk(Some(Vec::new()))
+    } else {
+        RespValue::Bulk(Some(value[start..=end].to_vec()))
     }
 }
 

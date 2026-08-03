@@ -17,6 +17,13 @@ pub const PAGE_LIMIT: i64 = 100;
 pub const STRING_PREVIEW_BYTES: i64 = 4096;
 /// Cumulative response budget for one key-detail RESP command.
 pub const KEY_DETAIL_RESPONSE_BYTES: usize = 1024 * 1024;
+/// The maximum JSON value retained while assembling an HTTP key-detail body.
+///
+/// The remaining HTTP response space is reserved for key metadata and the
+/// API envelope. RESP values are converted with this cap before JSON
+/// serialization, so a page of binary collection values cannot grow into a
+/// large intermediate JSON allocation.
+pub const KEY_DETAIL_JSON_VALUE_BYTES: usize = 48 * 1024;
 /// Read a bounded view of one key.
 pub async fn detail(addr: &str, key: &str) -> Result<Option<Value>, String> {
     let key_type = resp::as_string(execute(addr, &["TYPE", key]).await?, "TYPE")?;
@@ -113,19 +120,23 @@ async fn string_page(addr: &str, key: &str) -> Result<Page, String> {
     let total = resp::as_integer(execute(addr, &["STRLEN", key]).await?, "STRLEN")?;
     // GETRANGE, never GET: a string value may be far larger than the preview.
     let end = (STRING_PREVIEW_BYTES - 1).to_string();
-    let value = resp::to_json(execute(addr, &["GETRANGE", key, "0", &end]).await?)?;
-    let returned = match &value {
-        Value::String(value) => value.len() as i64,
-        Value::Array(bytes) => bytes.len() as i64,
-        _ => 0,
+    let response = execute(addr, &["GETRANGE", key, "0", &end]).await?;
+    let returned = match &response {
+        RespValue::Bulk(Some(value)) => value.len() as i64,
+        RespValue::Bulk(None) => 0,
+        _ => return Err("GETRANGE returned an unexpected response".to_string()),
     };
+    let value = resp::to_json_with_budget(response, KEY_DETAIL_JSON_VALUE_BYTES)?;
     Ok(Page::bounded(value, total, returned, STRING_PREVIEW_BYTES))
 }
 
 async fn list_page(addr: &str, key: &str) -> Result<Page, String> {
     let total = resp::as_integer(execute(addr, &["LLEN", key]).await?, "LLEN")?;
     let stop = (PAGE_LIMIT - 1).to_string();
-    let value = resp::to_json(execute(addr, &["LRANGE", key, "0", &stop]).await?)?;
+    let value = resp::to_json_with_budget(
+        execute(addr, &["LRANGE", key, "0", &stop]).await?,
+        KEY_DETAIL_JSON_VALUE_BYTES,
+    )?;
     let returned = array_len(&value);
     Ok(Page::bounded(value, total, returned, PAGE_LIMIT))
 }
@@ -133,7 +144,10 @@ async fn list_page(addr: &str, key: &str) -> Result<Page, String> {
 async fn zset_page(addr: &str, key: &str) -> Result<Page, String> {
     let total = resp::as_integer(execute(addr, &["ZCARD", key]).await?, "ZCARD")?;
     let stop = (PAGE_LIMIT - 1).to_string();
-    let value = resp::to_json(execute(addr, &["ZRANGE", key, "0", &stop, "WITHSCORES"]).await?)?;
+    let value = resp::to_json_with_budget(
+        execute(addr, &["ZRANGE", key, "0", &stop, "WITHSCORES"]).await?,
+        KEY_DETAIL_JSON_VALUE_BYTES,
+    )?;
     // WITHSCORES returns member/score pairs.
     let returned = array_len(&value) / 2;
     Ok(Page::bounded(value, total, returned, PAGE_LIMIT))
@@ -142,7 +156,10 @@ async fn zset_page(addr: &str, key: &str) -> Result<Page, String> {
 async fn stream_page(addr: &str, key: &str) -> Result<Page, String> {
     let total = resp::as_integer(execute(addr, &["XLEN", key]).await?, "XLEN")?;
     let count = PAGE_LIMIT.to_string();
-    let value = resp::to_json(execute(addr, &["XRANGE", key, "-", "+", "COUNT", &count]).await?)?;
+    let value = resp::to_json_with_budget(
+        execute(addr, &["XRANGE", key, "-", "+", "COUNT", &count]).await?,
+        KEY_DETAIL_JSON_VALUE_BYTES,
+    )?;
     let returned = array_len(&value);
     Ok(Page::bounded(value, total, returned, PAGE_LIMIT))
 }

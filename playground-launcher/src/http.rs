@@ -30,6 +30,9 @@ use crate::{command, keys, policy};
 pub const HTTP_ADDR: &str = "0.0.0.0:8080";
 pub const MAX_BODY_BYTES: usize = 64 * 1024;
 pub const MAX_RESPONSE_BODY_BYTES: usize = 64 * 1024;
+/// Leaves room for the API envelope and bounded metadata around a converted
+/// RESP value. Conversion uses this cap before it can allocate JSON/base64.
+pub const MAX_JSON_VALUE_BYTES: usize = MAX_RESPONSE_BODY_BYTES - 1024;
 pub const MAX_HTTP_CONNECTIONS: usize = 32;
 pub const HTTP_CONNECTION_LIFETIME: Duration = Duration::from_secs(30);
 
@@ -253,9 +256,16 @@ async fn execute(State(state): State<AppState>, Json(request): Json<ExecuteReque
     };
 
     match resp::execute(&state.resp_addr, &arguments).await {
-        Ok(value) => match resp::to_json(value) {
+        Ok(value) => match resp::to_json_with_budget(value, MAX_JSON_VALUE_BYTES) {
             Ok(value) => api_response(StatusCode::OK, ApiResponse::ok(value)),
-            Err(error) => api_response(StatusCode::UNPROCESSABLE_ENTITY, ApiResponse::error(error)),
+            Err(error) => api_response(
+                if error.contains("JSON conversion exceeds") {
+                    StatusCode::PAYLOAD_TOO_LARGE
+                } else {
+                    StatusCode::UNPROCESSABLE_ENTITY
+                },
+                ApiResponse::error(error),
+            ),
         },
         Err(error) => api_response(
             StatusCode::BAD_GATEWAY,
@@ -288,20 +298,59 @@ async fn key_detail(State(state): State<AppState>, Path(key): Path<String>) -> R
 }
 
 fn api_response(status: StatusCode, body: ApiResponse) -> Response {
-    let mut status = status;
-    let mut encoded = serde_json::to_vec(&body).unwrap_or_else(|_| {
-        br#"{"success":false,"error":"failed to serialize API response"}"#.to_vec()
-    });
-    if encoded.len() > MAX_RESPONSE_BODY_BYTES {
-        status = StatusCode::PAYLOAD_TOO_LARGE;
-        encoded =
-            br#"{"success":false,"error":"response exceeds the playground output limit"}"#.to_vec();
-    }
+    let (status, encoded) = match serialize_api_response(&body) {
+        Ok(encoded) => (status, encoded),
+        Err(()) => (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            br#"{"success":false,"error":"response exceeds the playground output limit"}"#.to_vec(),
+        ),
+    };
     Response::builder()
         .status(status)
         .header(header::CONTENT_TYPE, "application/json")
         .body(Body::from(encoded))
         .expect("static API response headers are valid")
+}
+
+struct LimitedJsonBuffer {
+    bytes: Vec<u8>,
+    limit: usize,
+}
+
+impl LimitedJsonBuffer {
+    fn new(limit: usize) -> Self {
+        Self {
+            bytes: Vec::with_capacity(limit.min(1024)),
+            limit,
+        }
+    }
+
+    fn into_inner(self) -> Vec<u8> {
+        self.bytes
+    }
+}
+
+impl io::Write for LimitedJsonBuffer {
+    fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+        if self.bytes.len().saturating_add(data.len()) > self.limit {
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "JSON response exceeds output budget",
+            ));
+        }
+        self.bytes.extend_from_slice(data);
+        Ok(data.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn serialize_api_response(body: &ApiResponse) -> Result<Vec<u8>, ()> {
+    let mut writer = LimitedJsonBuffer::new(MAX_RESPONSE_BODY_BYTES);
+    serde_json::to_writer(&mut writer, body).map_err(|_| ())?;
+    Ok(writer.into_inner())
 }
 
 fn try_backend_permit(state: &AppState) -> Option<OwnedSemaphorePermit> {
@@ -624,6 +673,97 @@ mod tests {
             .await
             .unwrap();
         assert!(bytes.len() <= MAX_RESPONSE_BODY_BYTES);
+    }
+
+    #[tokio::test]
+    async fn binary_bulk_near_the_http_limit_uses_a_compact_base64_object() {
+        let upstream = MockFerrite::start().await;
+        // Base64 expands this 45 KiB value to 60 KiB, which fits below the
+        // conversion cap and leaves room for the API envelope.
+        let binary = vec![0xff; 45 * 1024];
+        upstream
+            .seed_bytes("near-limit-binary", binary.clone())
+            .await;
+
+        let (status, body) = call(
+            state(&upstream, "test"),
+            execute_request("GET near-limit-binary"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["data"]["encoding"], json!("base64"));
+        assert!(body["data"]["data"].is_string());
+        assert_eq!(
+            body["data"]["data"].as_str().unwrap().len(),
+            ((binary.len() + 2) / 3) * 4
+        );
+        assert!(
+            body["data"].as_array().is_none(),
+            "binary data must never be serialized as one JSON element per byte"
+        );
+    }
+
+    #[tokio::test]
+    async fn oversized_binary_bulk_is_rejected_during_http_conversion() {
+        let upstream = MockFerrite::start().await;
+        // Its base64 payload alone exceeds MAX_JSON_VALUE_BYTES, so the
+        // converter must fail before allocating a JSON byte array or payload.
+        upstream
+            .seed_bytes("over-limit-binary", vec![0xff; 49 * 1024])
+            .await;
+
+        let response = router(state(&upstream, "test"))
+            .oneshot(execute_request("GET over-limit-binary"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let bytes = to_bytes(response.into_body(), MAX_RESPONSE_BODY_BYTES)
+            .await
+            .unwrap();
+        assert!(bytes.len() <= MAX_RESPONSE_BODY_BYTES);
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["success"], json!(false));
+        assert!(body["error"]
+            .as_str()
+            .unwrap()
+            .contains("JSON conversion exceeds"));
+    }
+
+    #[tokio::test]
+    async fn concurrent_binary_http_responses_remain_compact_and_bounded() {
+        let upstream = MockFerrite::start().await;
+        let binary = vec![0xff; 45 * 1024];
+        upstream
+            .seed_bytes("concurrent-binary", binary.clone())
+            .await;
+        let state = AppState {
+            resp_addr: upstream.addr(),
+            version: "test".into(),
+            backend_permits: Arc::new(Semaphore::new(32)),
+        };
+        let expected_base64_length = ((binary.len() + 2) / 3) * 4;
+        let mut requests = tokio::task::JoinSet::new();
+
+        for _ in 0..16 {
+            let state = state.clone();
+            requests.spawn(async move {
+                let (status, body) = call(state, execute_request("GET concurrent-binary")).await;
+                (
+                    status,
+                    body["data"]["encoding"].as_str() == Some("base64"),
+                    body["data"]["data"].as_str().map(str::len),
+                    body["data"].as_array().is_none(),
+                )
+            });
+        }
+
+        while let Some(result) = requests.join_next().await {
+            let (status, encoded, length, is_not_byte_array) = result.unwrap();
+            assert_eq!(status, StatusCode::OK);
+            assert!(encoded);
+            assert_eq!(length, Some(expected_base64_length));
+            assert!(is_not_byte_array);
+        }
     }
 
     #[tokio::test]

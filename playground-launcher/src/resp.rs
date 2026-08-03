@@ -473,56 +473,208 @@ pub async fn execute_within(
     })?
 }
 
+/// Convert a RESP value to JSON while bounding the encoded JSON value.
+///
+/// The budget is charged before allocating base64 or JSON container data.
+/// This is required for HTTP callers: a valid RESP bulk value can be much
+/// larger than the HTTP response cap, and invalid UTF-8 must not turn into an
+/// array containing one JSON number per input byte.
+pub fn to_json_with_budget(value: RespValue, byte_limit: usize) -> Result<Value, String> {
+    let mut budget = JsonBudget::new(byte_limit);
+    to_json_budgeted(value, &mut budget)
+}
+
+/// Convert a RESP value to JSON with the normal RESP response ceiling.
+///
+/// HTTP handlers must use [`to_json_with_budget`] with their smaller response
+/// budget. Keeping this convenience API bounded prevents other callers from
+/// accidentally expanding a binary bulk string into an unbounded JSON value.
 pub fn to_json(value: RespValue) -> Result<Value, String> {
+    to_json_with_budget(value, MAX_RESPONSE_BYTES)
+}
+
+struct JsonBudget {
+    byte_limit: usize,
+    bytes_used: usize,
+}
+
+impl JsonBudget {
+    fn new(byte_limit: usize) -> Self {
+        Self {
+            byte_limit,
+            bytes_used: 0,
+        }
+    }
+
+    fn consume(&mut self, bytes: usize) -> Result<(), String> {
+        let next = self.bytes_used.saturating_add(bytes);
+        if next > self.byte_limit {
+            return Err(format!(
+                "JSON conversion exceeds the playground output budget of {} bytes",
+                self.byte_limit
+            ));
+        }
+        self.bytes_used = next;
+        Ok(())
+    }
+
+    fn consume_json_string(&mut self, value: &str) -> Result<(), String> {
+        // serde_json leaves ordinary UTF-8 bytes intact and escapes quotes,
+        // backslashes, and ASCII controls. Charge the exact byte count before
+        // Value::String or the serializer can allocate the output.
+        let mut encoded = 2usize;
+        for byte in value.bytes() {
+            encoded = encoded.saturating_add(match byte {
+                b'"' | b'\\' | b'\x08' | b'\t' | b'\n' | b'\x0c' | b'\r' => 2,
+                0x00..=0x1f => 6,
+                _ => 1,
+            });
+        }
+        self.consume(encoded)
+    }
+}
+
+fn to_json_budgeted(value: RespValue, budget: &mut JsonBudget) -> Result<Value, String> {
     match value {
-        RespValue::Simple(value) => Ok(Value::String(value)),
+        RespValue::Simple(value) => {
+            budget.consume_json_string(&value)?;
+            Ok(Value::String(value))
+        }
         RespValue::Error(error) => Err(error),
-        RespValue::Integer(value) => Ok(json!(value)),
-        RespValue::Bulk(None) | RespValue::Array(None) => Ok(Value::Null),
-        RespValue::Bulk(Some(value)) => match String::from_utf8(value) {
-            Ok(value) => Ok(Value::String(value)),
-            Err(error) => Ok(Value::Array(
-                error
-                    .into_bytes()
-                    .into_iter()
-                    .map(|byte| json!(byte))
-                    .collect(),
-            )),
-        },
-        RespValue::Array(Some(values)) | RespValue::Set(values) | RespValue::Push(values) => values
-            .into_iter()
-            .map(to_json)
-            .collect::<Result<Vec<_>, _>>()
-            .map(Value::Array),
-        RespValue::Null => Ok(Value::Null),
-        RespValue::Boolean(value) => Ok(json!(value)),
+        RespValue::Integer(value) => {
+            budget.consume(value.to_string().len())?;
+            Ok(json!(value))
+        }
+        RespValue::Bulk(None) | RespValue::Array(None) | RespValue::Null => {
+            budget.consume(4)?;
+            Ok(Value::Null)
+        }
+        RespValue::Bulk(Some(value)) => bulk_to_json(value, budget),
+        RespValue::Array(Some(values)) | RespValue::Set(values) | RespValue::Push(values) => {
+            values_to_json(values, budget)
+        }
+        RespValue::Boolean(value) => {
+            budget.consume(if value { 4 } else { 5 })?;
+            Ok(json!(value))
+        }
         RespValue::Double(value) => Ok(match value.parse::<f64>() {
-            Ok(parsed) if parsed.is_finite() => json!(parsed),
+            Ok(parsed) if parsed.is_finite() => {
+                budget.consume(value.len())?;
+                json!(parsed)
+            }
             // inf/-inf/nan have no JSON number representation.
-            _ => Value::String(value),
+            _ => {
+                budget.consume_json_string(&value)?;
+                Value::String(value)
+            }
         }),
-        RespValue::BigNumber(value) => Ok(Value::String(value)),
+        RespValue::BigNumber(value) => {
+            budget.consume_json_string(&value)?;
+            Ok(Value::String(value))
+        }
         RespValue::BlobError(error) => Err(String::from_utf8_lossy(&error).into_owned()),
         RespValue::Verbatim(data) => {
-            let text = String::from_utf8_lossy(&data).into_owned();
+            let text = std::str::from_utf8(&data)
+                .map_err(|_| "RESP verbatim string was not valid UTF-8".to_string())?;
             // Verbatim strings are `<3-char format>:<content>`.
-            Ok(Value::String(match text.get(3..4) {
-                Some(":") => text[4..].to_string(),
+            let text = match text.get(3..4) {
+                Some(":") => &text[4..],
                 _ => text,
-            }))
+            };
+            budget.consume_json_string(text)?;
+            Ok(Value::String(text.to_string()))
         }
         RespValue::Map(entries) => {
+            budget.consume(2)?;
             let mut object = serde_json::Map::with_capacity(entries.len());
-            for (key, value) in entries {
-                let key = match to_json(key)? {
+            for (index, (key, value)) in entries.into_iter().enumerate() {
+                if index > 0 {
+                    budget.consume(1)?;
+                }
+                let key = match to_json_budgeted(key, budget)? {
                     Value::String(key) => key,
-                    other => other.to_string(),
+                    other => serde_json::to_string(&other)
+                        .map_err(|error| format!("failed to serialize RESP map key: {error}"))?,
                 };
-                object.insert(key, to_json(value)?);
+                budget.consume_json_string(&key)?;
+                budget.consume(1)?;
+                object.insert(key, to_json_budgeted(value, budget)?);
             }
             Ok(Value::Object(object))
         }
     }
+}
+
+fn values_to_json(values: Vec<RespValue>, budget: &mut JsonBudget) -> Result<Value, String> {
+    budget.consume(2)?;
+    let mut json_values = Vec::with_capacity(values.len());
+    for (index, value) in values.into_iter().enumerate() {
+        if index > 0 {
+            budget.consume(1)?;
+        }
+        json_values.push(to_json_budgeted(value, budget)?);
+    }
+    Ok(Value::Array(json_values))
+}
+
+fn bulk_to_json(value: Vec<u8>, budget: &mut JsonBudget) -> Result<Value, String> {
+    if let Ok(text) = std::str::from_utf8(&value) {
+        budget.consume_json_string(text)?;
+        return Ok(Value::String(
+            String::from_utf8(value).expect("UTF-8 was checked"),
+        ));
+    }
+
+    // The base64 alphabet has no JSON-escaped bytes. Reserve the whole
+    // compact object before allocating its encoded payload.
+    let encoded_length = base64_encoded_length(value.len())?;
+    const PREFIX: &str = r#"{"encoding":"base64","data":""#;
+    const SUFFIX: &str = r#""}"#;
+    budget.consume(
+        PREFIX
+            .len()
+            .saturating_add(encoded_length)
+            .saturating_add(SUFFIX.len()),
+    )?;
+
+    let mut object = serde_json::Map::with_capacity(2);
+    object.insert("encoding".to_string(), Value::String("base64".to_string()));
+    object.insert("data".to_string(), Value::String(base64_encode(&value)));
+    Ok(Value::Object(object))
+}
+
+fn base64_encoded_length(length: usize) -> Result<usize, String> {
+    length
+        .checked_add(2)
+        .and_then(|value| value.checked_div(3))
+        .and_then(|value| value.checked_mul(4))
+        .ok_or_else(|| "binary response is too large to encode as base64".to_string())
+}
+
+fn base64_encode(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let output_length =
+        base64_encoded_length(bytes.len()).expect("slice lengths always have a base64 length");
+    let mut output = String::with_capacity(output_length);
+
+    for chunk in bytes.chunks(3) {
+        let first = chunk[0];
+        let second = *chunk.get(1).unwrap_or(&0);
+        let third = *chunk.get(2).unwrap_or(&0);
+        output.push(ALPHABET[(first >> 2) as usize] as char);
+        output.push(ALPHABET[(((first & 0x03) << 4) | (second >> 4)) as usize] as char);
+        output.push(if chunk.len() > 1 {
+            ALPHABET[(((second & 0x0f) << 2) | (third >> 6)) as usize] as char
+        } else {
+            '='
+        });
+        output.push(if chunk.len() > 2 {
+            ALPHABET[(third & 0x3f) as usize] as char
+        } else {
+            '='
+        });
+    }
+    output
 }
 
 pub fn as_string(value: RespValue, command: &str) -> Result<String, String> {
@@ -585,14 +737,23 @@ mod tests {
     }
 
     #[test]
-    fn converts_binary_bulk_values_without_data_loss() {
+    fn converts_binary_bulk_values_to_compact_base64_without_data_loss() {
         assert_eq!(
             to_json(RespValue::Bulk(Some(vec![0xff, 0x00]))).unwrap(),
-            json!([255, 0])
+            json!({ "encoding": "base64", "data": "/wA=" })
         );
         assert_eq!(
             to_json(RespValue::Error("ERR failure".into())).unwrap_err(),
             "ERR failure"
+        );
+    }
+
+    #[test]
+    fn refuses_oversized_binary_json_before_base64_allocation() {
+        let error = to_json_with_budget(RespValue::Bulk(Some(vec![0xff; 1024])), 128).unwrap_err();
+        assert!(
+            error.contains("JSON conversion exceeds"),
+            "unexpected error: {error}"
         );
     }
 
