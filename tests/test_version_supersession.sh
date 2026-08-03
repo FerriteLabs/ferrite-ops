@@ -19,16 +19,26 @@ ONES="1111111111111111111111111111111111111111111111111111111111111111"
 # --- Static checks ----------------------------------------------------------
 assert_contains "$CONTENT" "pull_request:" \
   "supersession check runs on pull requests"
+assert_contains "$CONTENT" "merge_group:" \
+  "supersession check runs at merge-queue time"
+assert_contains "$CONTENT" "workflow_run:" \
+  "automated PR checks reconcile after Version Sync runs"
+assert_contains "$CONTENT" "push:" \
+  "automated PR checks reconcile whenever main advances"
 assert_contains "$CONTENT" "active-release.env" \
   "supersession check is scoped to active-release.env changes"
 assert_contains "$CONTENT" "contents: read" \
   "supersession check is read-only"
-assert_not_contains "$CONTENT" "contents: write" \
-  "supersession check never writes to the repository"
 assert_contains "$CONTENT" "head.sha" \
   "supersession check reads the PR head, not the merge ref"
 assert_contains "$CONTENT" '"$ORDER_SCRIPT" classify' \
   "supersession check classifies the PR against the base with the shared guard"
+assert_contains "$CONTENT" "checks: write" \
+  "automated PR reconciliation can attach a required check to the PR head"
+assert_contains "$CONTENT" 'startswith("version-sync/")' \
+  "reconciliation is limited to automated version-sync branches"
+assert_contains "$CONTENT" 'repos/${REPOSITORY}/check-runs' \
+  "reconciliation writes the supersession result to each PR head"
 
 if ! command -v python3 >/dev/null 2>&1 || ! python3 -c "import yaml" >/dev/null 2>&1; then
   echo "  skip: python3/PyYAML unavailable; skipping supersession functional replay."
@@ -39,6 +49,7 @@ fi
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 CHECK_SCRIPT="${TMP}/check.sh"
+RECONCILE_SCRIPT="${TMP}/reconcile.sh"
 if ! python3 - "$WORKFLOW" "$CHECK_SCRIPT" <<'PYEOF'
 import sys, yaml
 wf_path, out_path = sys.argv[1:]
@@ -55,6 +66,23 @@ then
   exit $?
 fi
 harness_ok "extracted the supersession check step from the workflow"
+
+if ! python3 - "$WORKFLOW" "$RECONCILE_SCRIPT" <<'PYEOF'
+import sys, yaml
+wf_path, out_path = sys.argv[1:]
+with open(wf_path) as f:
+    doc = yaml.safe_load(f)
+steps = doc["jobs"]["reconcile-automated-prs"]["steps"]
+run = next(s["run"] for s in steps if s.get("name") == "Check every open automated version-sync PR")
+with open(out_path, "w") as f:
+    f.write(run)
+PYEOF
+then
+  harness_fail "could not extract the automated PR reconciliation step"
+  harness_summary
+  exit $?
+fi
+harness_ok "extracted the automated PR reconciliation step from the workflow"
 
 REMOTE="${TMP}/origin.git"
 git init -q --bare "$REMOTE"
@@ -125,6 +153,64 @@ else
   assert_contains "$(cat "${TMP}/equal_diff.out")" "source must not be rewritten" \
     "a same-version checksum-conflict PR is rejected"
 fi
+
+# Reconciliation must process every PR even when an earlier PR contains
+# malformed metadata. Mock the GitHub API with one malformed PR followed by a
+# stale PR and verify both receive failure checks before the job reports error.
+RECONCILE_FIXTURE="${TMP}/reconcile-repo"
+MOCK_BIN="${TMP}/mock-bin"
+MOCK_CHECKS="${TMP}/checks.jsonl"
+mkdir -p "$RECONCILE_FIXTURE" "$MOCK_BIN"
+write_env "0.4.2" "$ONES" "$RECONCILE_FIXTURE"
+: > "$MOCK_CHECKS"
+cat > "${MOCK_BIN}/gh" <<'MOCKEOF'
+#!/usr/bin/env bash
+set -euo pipefail
+case "$*" in
+  *"/pulls?state=open&per_page=100"*)
+    printf '1\tsha-invalid\tversion-sync/invalid\n'
+    printf '2\tsha-stale\tversion-sync/0.4.1\n'
+    ;;
+  *"ref=sha-invalid"*)
+    printf 'FERRITE_VERSION=not-semver\nFERRITE_SOURCE_SHA256=%s\n' \
+      '1111111111111111111111111111111111111111111111111111111111111111' | base64
+    ;;
+  *"ref=sha-stale"*)
+    printf 'FERRITE_VERSION=0.4.1\nFERRITE_SOURCE_SHA256=%s\n' \
+      '1111111111111111111111111111111111111111111111111111111111111111' | base64
+    ;;
+  *"/check-runs"*)
+    payload="$(cat)"
+    printf '%s' "$payload" | jq -c . >> "$MOCK_CHECKS"
+    printf '{}\n'
+    ;;
+  *)
+    echo "unexpected gh invocation: $*" >&2
+    exit 1
+    ;;
+esac
+MOCKEOF
+chmod +x "${MOCK_BIN}/gh"
+
+if (
+  cd "$RECONCILE_FIXTURE" &&
+    PATH="${MOCK_BIN}:$PATH" \
+    MOCK_CHECKS="$MOCK_CHECKS" \
+    GH_TOKEN="test-token" \
+    REPOSITORY="ferritelabs/ferrite-ops" \
+    ORDER_SCRIPT="$ORDER" \
+    bash "$RECONCILE_SCRIPT" >"${TMP}/reconcile.out" 2>&1
+); then
+  harness_fail "reconciliation unexpectedly succeeded despite malformed metadata"
+else
+  harness_ok "reconciliation reports malformed release metadata"
+fi
+assert_eq "2" "$(wc -l < "$MOCK_CHECKS" | tr -d ' ')" \
+  "a malformed PR does not prevent later PRs from receiving checks"
+assert_eq "2" "$(jq -r '.conclusion' "$MOCK_CHECKS" | grep -c '^failure$')" \
+  "malformed and stale PRs both receive fail-closed checks"
+assert_contains "$(cat "${TMP}/reconcile.out")" "PR #2: OLDER (failure)" \
+  "reconciliation continues through the stale PR after an earlier error"
 
 if command -v actionlint >/dev/null 2>&1; then
   if actionlint "$WORKFLOW"; then

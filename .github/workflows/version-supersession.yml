@@ -1,11 +1,13 @@
 # Merge-time guard that stops a stale, already-clean version-sync PR from
-# regressing the canonical release. A version-sync PR is opened against the
-# active-release.env that existed when it was created; if main is bumped to a
-# newer release before that PR merges, the stale PR would silently downgrade
-# active-release.env on merge. This check compares the PR's proposed
-# active-release.env against the current tip of the PR's base branch (main)
-# and fails the PR if it would move the canonical version backwards — so a
-# superseded PR must be rebased (or closed) before it can merge.
+# regressing the canonical release. Automated version-sync PRs are created
+# with GITHUB_TOKEN, which intentionally does not emit pull_request events.
+# This workflow therefore covers every enforcement point:
+#   - normal pull_request checks for human-created PRs,
+#   - merge_group checks at the merge queue's current base,
+#   - workflow_run reconciliation after Version Sync creates/updates a PR, and
+#   - push reconciliation whenever main advances active-release.env.
+# Reconciliation writes the same required check directly onto each automated
+# version-sync PR head, so GITHUB_TOKEN event suppression cannot bypass it.
 
 name: Version Supersession Check
 
@@ -13,6 +15,15 @@ on:
   pull_request:
     paths:
       - active-release.env
+  merge_group:
+    types: [checks_requested]
+  push:
+    branches: [main]
+    paths:
+      - active-release.env
+  workflow_run:
+    workflows: [Version Sync]
+    types: [completed]
 
 permissions:
   contents: read
@@ -20,24 +31,25 @@ permissions:
 jobs:
   supersession:
     name: Reject superseded release PRs
+    if: github.event_name == 'pull_request' || github.event_name == 'merge_group'
     runs-on: ubuntu-latest
     steps:
-      # Check out the PR head itself (not the merge ref) so the proposed
-      # active-release.env is read regardless of whether the PR is currently
-      # mergeable against an advanced main.
+      # For pull_request, check the proposed head itself. For merge_group,
+      # github.sha is the merge-queue candidate containing the proposed file.
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.pull_request.head.sha }}
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
           fetch-depth: 0
 
       - name: Reject a superseded active-release change
         env:
-          BASE_REF: ${{ github.event.pull_request.base.ref }}
+          BASE_REF: ${{ github.event.pull_request.base.ref || github.event.merge_group.base_ref }}
           ORDER_SCRIPT: scripts/release-ordering.sh
         run: |
           set -euo pipefail
 
           ACTIVE_RELEASE="active-release.env"
+          BASE_REF="${BASE_REF#refs/heads/}"
 
           # Proposed values from the PR head working tree.
           PR_VERSION="$(sed -n 's/^FERRITE_VERSION=//p' "$ACTIVE_RELEASE")"
@@ -70,3 +82,118 @@ jobs:
               exit 1
               ;;
           esac
+
+  # create-pull-request uses GITHUB_TOKEN, so GitHub suppresses the
+  # pull_request event for the generated PR. Reconcile after every Version
+  # Sync run and whenever main's canonical release advances, attaching this
+  # workflow's required check directly to every open version-sync PR head.
+  reconcile-automated-prs:
+    name: Reconcile automated release checks
+    if: github.event_name == 'workflow_run' || github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      checks: write
+      contents: read
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check every open automated version-sync PR
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          ORDER_SCRIPT: scripts/release-ordering.sh
+        run: |
+          set -euo pipefail
+
+          ACTIVE_RELEASE="active-release.env"
+          BASE_VERSION="$(sed -n 's/^FERRITE_VERSION=//p' "$ACTIVE_RELEASE")"
+          BASE_SHA256="$(sed -n 's/^FERRITE_SOURCE_SHA256=//p' "$ACTIVE_RELEASE")"
+          TMP_DIR="$(mktemp -d)"
+          trap 'rm -rf "$TMP_DIR"' EXIT
+
+          PRS="$(gh api --paginate "repos/${REPOSITORY}/pulls?state=open&per_page=100" \
+            --jq '.[] |
+              select(.base.ref == "main") |
+              select(.head.ref | startswith("version-sync/")) |
+              [.number, .head.sha, .head.ref] | @tsv')"
+
+          if [ -z "$PRS" ]; then
+            echo "::notice::No open automated version-sync PRs require reconciliation."
+            exit 0
+          fi
+
+          RECONCILE_ERRORS=0
+          while IFS=$'\t' read -r PR_NUMBER HEAD_SHA HEAD_REF; do
+            PR_ENV="${TMP_DIR}/active-release-${PR_NUMBER}.env"
+            CLASS="ERROR"
+            CONCLUSION="failure"
+            TITLE="Unable to validate release ordering"
+            SUMMARY="PR #${PR_NUMBER} (${HEAD_REF}) could not be validated and must not merge until this check succeeds."
+
+            if ! gh api "repos/${REPOSITORY}/contents/${ACTIVE_RELEASE}?ref=${HEAD_SHA}" \
+              --jq '.content' | tr -d '\n' | base64 --decode > "$PR_ENV"; then
+              echo "::error::Could not read active-release.env from PR #${PR_NUMBER} (${HEAD_SHA})."
+              RECONCILE_ERRORS=1
+            else
+              PR_VERSION="$(sed -n 's/^FERRITE_VERSION=//p' "$PR_ENV")"
+              PR_SHA256="$(sed -n 's/^FERRITE_SOURCE_SHA256=//p' "$PR_ENV")"
+              CLASS_ERROR="${TMP_DIR}/classify-${PR_NUMBER}.err"
+              if CLASS="$(bash "$ORDER_SCRIPT" classify \
+                "$PR_VERSION" "$PR_SHA256" "$BASE_VERSION" "$BASE_SHA256" \
+                2>"$CLASS_ERROR")"; then
+                CONCLUSION="success"
+                TITLE="Release ordering is current"
+                SUMMARY="PR #${PR_NUMBER} (${HEAD_REF}) proposes ${PR_VERSION}; main is ${BASE_VERSION}. Classification: ${CLASS}."
+                case "$CLASS" in
+                  NEWER|EQUAL_SAME)
+                    ;;
+                  OLDER)
+                    CONCLUSION="failure"
+                    TITLE="Release PR is superseded"
+                    SUMMARY="${SUMMARY} This PR would downgrade active-release.env and must not merge."
+                    ;;
+                  EQUAL_DIFFERENT)
+                    CONCLUSION="failure"
+                    TITLE="Released source checksum changed"
+                    SUMMARY="${SUMMARY} A released version's source checksum must not be rewritten."
+                    ;;
+                  *)
+                    CONCLUSION="failure"
+                    TITLE="Invalid release-ordering result"
+                    SUMMARY="PR #${PR_NUMBER} produced an unexpected ordering result and must not merge."
+                    RECONCILE_ERRORS=1
+                    ;;
+                esac
+              else
+                echo "::error::PR #${PR_NUMBER} contains invalid release metadata."
+                RECONCILE_ERRORS=1
+              fi
+            fi
+
+            if ! jq -n \
+              --arg name "Reject superseded release PRs" \
+              --arg head_sha "$HEAD_SHA" \
+              --arg conclusion "$CONCLUSION" \
+              --arg title "$TITLE" \
+              --arg summary "$SUMMARY" \
+              '{
+                name: $name,
+                head_sha: $head_sha,
+                status: "completed",
+                conclusion: $conclusion,
+                output: {title: $title, summary: $summary}
+              }' |
+              gh api --method POST "repos/${REPOSITORY}/check-runs" --input -; then
+              echo "::error::Could not write the supersession check for PR #${PR_NUMBER}."
+              RECONCILE_ERRORS=1
+              continue
+            fi
+
+            echo "::notice::PR #${PR_NUMBER}: ${CLASS} (${CONCLUSION})"
+          done <<< "$PRS"
+
+          if [ "$RECONCILE_ERRORS" -ne 0 ]; then
+            echo "::error::One or more automated release PRs could not be fully reconciled."
+            exit 1
+          fi

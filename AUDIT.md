@@ -432,14 +432,19 @@ stops a stale PR from doing the same:
 - `allow_downgrade` is read only from `workflow_dispatch` inputs (default `false`); a
   `repository_dispatch` client payload can never supply it, so an automated dispatch can never bypass
   the downgrade guard.
-- New `version-supersession.yml` runs on `active-release.env` pull requests, reads the PR head (not the
-  merge ref), and compares it against the current tip of the base branch. It fails a PR that would move
-  the canonical version backwards (or keep the version while changing its source checksum), so a clean
-  but stale version-sync PR cannot regress `main` after `main` has advanced.
+- New `version-supersession.yml` compares proposed `active-release.env` metadata against the current
+  tip of `main` for normal pull requests and merge-queue candidates. Because GitHub intentionally
+  suppresses `pull_request` events for the automated PRs created with `GITHUB_TOKEN`, it also
+  reconciles after every Version Sync run and whenever `main` advances, writing the same required
+  success/failure check directly onto each open `version-sync/*` PR head. Older versions and
+  same-version checksum rewrites fail, so event suppression cannot leave a stale automated PR clean.
 - `tests/test_version_sync_ordering.sh` (19 checks) functionally replays the guard for
   newer/equal-same/checksum-mismatch/older/manual-override/malicious-input cases;
-  `tests/test_version_supersession.sh` (12 checks) replays the merge-time check against temporary Git
-  remotes for newer/stale/equal/checksum-conflict PRs. `actionlint` accepts every workflow.
+  `tests/test_version_supersession.sh` (22 checks) verifies pull-request, merge-queue, post-sync, and
+  main-advance enforcement wiring and replays the comparison against temporary Git remotes for
+  newer/stale/equal/checksum-conflict PRs. Its batch reconciliation replay also proves malformed
+  metadata fails closed without preventing later stale PRs from receiving failure checks.
+  `actionlint` accepts every workflow.
 
 ## Final Verification Pass (immutable version tags and release ordering)
 

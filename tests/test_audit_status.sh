@@ -63,6 +63,10 @@ assert_contains "$AUDIT_CONTENT" "allow_downgrade" \
   "AUDIT.md records the manual-only allow_downgrade override"
 assert_contains "$AUDIT_CONTENT" "scripts/release-ordering.sh" \
   "AUDIT.md records the shared SemVer ordering guard"
+assert_contains "$AUDIT_CONTENT" "suppresses \`pull_request\` events" \
+  "AUDIT.md records automated-PR event suppression and reconciliation"
+assert_contains "$AUDIT_CONTENT" "merge-queue" \
+  "AUDIT.md records merge-time supersession enforcement"
 assert_contains "$AUDIT_CONTENT" "28/28 discovered suites" \
   "AUDIT.md records the full 28-suite verification pass"
 
