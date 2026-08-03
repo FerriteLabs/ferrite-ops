@@ -49,6 +49,7 @@
 | F-38 | P1 | Inline RESP parsing | Inline commands used text quoting/escaping semantics that are incompatible with binary-safe Redis wire arguments. | Fixed; public RESP accepts arrays only, rejects inline input with one bounded protocol error, and closes the connection |
 | F-39 | P1 | HTTP binary JSON | Invalid UTF-8 bulk replies expanded into a JSON number per byte and only hit the HTTP output cap after allocating the body. | Fixed; conversion reserves the output budget first and returns compact typed base64 data |
 | F-40 | P0 | Proxy session state | A timeout, oversized reply, parse error, or upstream I/O error dropped a stateful child connection and silently reconnected the public client on default SELECT/HELLO state. | Fixed; one bounded state-loss error is returned and the public client connection closes |
+| F-41 | P0 | Request memory | Declared bulk/array request sizes were only bounded per connection (up to 8 MiB) across as many as 64 simultaneous connections, and the 300-second idle timeout let a slow client hold a fully allocated buffer almost indefinitely, so worst-case unauthenticated request memory was hundreds of MiB. | Fixed; one global in-flight request-byte budget (4 MiB) is reserved from every declared bulk/array size before its payload buffer is allocated and held through backend execution and response delivery, per-client bulk/command size limits are reduced (256 KiB / 1 MiB), the idle wait for a new command is reduced to 20 seconds, and a new 5-second read deadline bounds completing an already-declared command so a slow/partial client cannot hold its reservation open indefinitely |
 
 ## D-01 Resolution
 
@@ -177,10 +178,30 @@ Response and resource bounds:
   `ZRANGE ... WITHSCORES`, and `XRANGE ... COUNT` pages. Hashes and sets return type, TTL, length,
   `value_omitted: true`, and a clear v0.4.0 scan-omission reason without invoking `HSCAN`/`SSCAN`.
 
+Request memory bounds:
+
+- one launcher-owned `RequestByteBudget` (4 MiB) is shared by every public RESP client on the
+  instance. Each declared `$<length>` bulk header and the declared `*<count>` argument shape are
+  reserved from it immediately after being parsed and *before* the corresponding buffer is
+  allocated, so worst-case declared-request memory is bounded by this one budget rather than by
+  the number of open connections;
+- over-budget declarations are rejected immediately, without waiting, with one bounded protocol
+  error, and never allocate a payload buffer;
+- a command's reservation is held through policy classification, backend forwarding, and response
+  delivery, and is only released when it is dropped at the end of that command's handling;
+- per-client limits are reduced to conservative playground values: a single bulk argument is capped
+  at 256 KiB, one whole command at 1 MiB, the idle wait for a brand new command at 20 seconds, and a
+  new 5-second read deadline bounds completing an already-declared command, so a client that declares
+  a bulk length and then trickles its bytes in slowly cannot hold its reservation, or the buffer it
+  guards, open indefinitely.
+
 ## Runtime Verification Completed
 
-- 72 `playground-launcher` unit tests pass (`cargo test`), run from `tests/run.sh` via
-  `tests/test_playground_launcher_unit.sh` and from a dedicated CI job.
+- 74 `playground-launcher` unit tests pass (`cargo test`), run from `tests/run.sh` via
+  `tests/test_playground_launcher_unit.sh` and from a dedicated CI job, including a slow-partial-client
+  test proving a stalled declared bulk is disconnected and its request-byte budget reservation is
+  released at the read deadline, and a concurrent-declared-bulk test proving the shared budget caps
+  simultaneous reservations and is released for reuse once a prior reservation is dropped.
 - The exact Playground image build, start, and probe suite passes: `SHUTDOWN`, `PLUGIN`, `AUDIT`,
   `MIGRATE.START`, unbounded `LRANGE`, and `XRANGE` without `COUNT` are refused over both HTTP and
   RESP before forwarding; bounded basics continue to work; the child is confirmed to run with

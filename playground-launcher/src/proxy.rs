@@ -21,14 +21,37 @@ use crate::resp::{self, RespValue, MAX_ARGUMENTS};
 pub const PUBLIC_RESP_ADDR: &str = "0.0.0.0:6379";
 /// Maximum size of one RESP protocol header line.
 pub const MAX_REQUEST_LINE: usize = 64 * 1024;
-/// Maximum size of a single command argument sent by a client.
-pub const MAX_REQUEST_BULK: usize = 1024 * 1024;
+/// Maximum size of a single command argument sent by a client. Kept small
+/// because it is also the largest single reservation any one client can hold
+/// against the shared [`MAX_IN_FLIGHT_REQUEST_BYTES`] budget at once.
+pub const MAX_REQUEST_BULK: usize = 256 * 1024;
 /// Maximum total size of one command, across all its arguments.
-pub const MAX_REQUEST_BYTES: usize = 8 * 1024 * 1024;
+pub const MAX_REQUEST_BYTES: usize = 1024 * 1024;
+/// Global byte budget for declared bulk/array request sizes, shared across
+/// every public RESP client. This — not the per-connection or per-command
+/// limits above — is what actually bounds worst-case unauthenticated request
+/// memory to a single-digit number of mebibytes, regardless of how many
+/// connections are open or how many of them declare large commands at once.
+pub const MAX_IN_FLIGHT_REQUEST_BYTES: usize = 4 * 1024 * 1024;
+/// Bookkeeping overhead charged per declared argument slot (covers the
+/// `Vec<u8>` header and allocator rounding) before the argument vector or any
+/// bulk buffer is allocated, so a large declared array count is charged
+/// against the budget even before its element sizes are known.
+const ARGUMENT_SLOT_OVERHEAD_BYTES: usize = 64;
 /// Maximum number of simultaneous public RESP clients.
 pub const MAX_CONNECTIONS: usize = 64;
-/// A client that sends nothing for this long is disconnected.
-pub const CLIENT_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+/// A client that sends nothing at all for this long is disconnected. This
+/// only bounds the wait for a brand new command to begin; a conservative
+/// playground value keeps an idle unauthenticated connection cheap.
+pub const CLIENT_IDLE_TIMEOUT: Duration = Duration::from_secs(20);
+/// Once a client has started sending a command (its header line has
+/// arrived), each subsequent read — a further header line or bulk payload
+/// bytes — must make progress within this deadline. This is deliberately
+/// tighter than [`CLIENT_IDLE_TIMEOUT`] so a client that declares a bulk
+/// length and then trickles its bytes in slowly cannot hold its
+/// [`MAX_IN_FLIGHT_REQUEST_BYTES`] reservation, or the buffer it guards,
+/// open indefinitely.
+pub const CLIENT_READ_TIMEOUT: Duration = Duration::from_secs(5);
 /// A client must accept each bounded response within this deadline.
 pub const CLIENT_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 /// Error returned once an upstream operation can no longer preserve this
@@ -36,12 +59,63 @@ pub const CLIENT_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 /// bounded public response regardless of the upstream parse/I/O error.
 const UPSTREAM_STATE_LOSS_ERROR: &str =
     "ERR playground upstream state was lost; reconnect before sending another command";
+/// Error returned when the shared in-flight request-byte budget is already
+/// exhausted by other clients' declared bulk/array sizes. Kept static so
+/// rejection is always immediate and bounded, never itself allocating in
+/// proportion to the offending request.
+const REQUEST_BUDGET_EXHAUSTED_ERROR: &str =
+    "ERR the Ferrite playground request budget is exhausted; try again shortly";
 
 /// A decoded client request, or the end of the client's stream.
 #[derive(Debug, PartialEq)]
 pub enum Request {
     Command(Vec<Vec<u8>>),
     Eof,
+}
+
+/// Global in-flight byte budget for declared bulk/array request sizes,
+/// shared across every public RESP client on this launcher instance.
+///
+/// Bytes are reserved from declared `$<length>` bulk headers and the
+/// declared `*<count>` argument count *before* any payload buffer is
+/// allocated, and the reservation is held by the caller through backend
+/// execution and response delivery — released only once that reservation is
+/// dropped. This means a slow client, or many clients declaring large
+/// commands concurrently, can never commit more memory than this one budget
+/// allows, regardless of per-connection or per-command limits.
+#[derive(Clone)]
+pub struct RequestByteBudget {
+    permits: Arc<Semaphore>,
+}
+
+impl RequestByteBudget {
+    pub fn new(capacity_bytes: usize) -> Self {
+        Self {
+            permits: Arc::new(Semaphore::new(capacity_bytes)),
+        }
+    }
+
+    /// Reserve `bytes` from the shared budget, failing immediately — without
+    /// waiting — if the budget is currently exhausted by other clients. A
+    /// reservation of zero bytes never touches the semaphore and always
+    /// succeeds with no permit to hold.
+    fn reserve(&self, bytes: usize) -> Result<Option<OwnedSemaphorePermit>, String> {
+        if bytes == 0 {
+            return Ok(None);
+        }
+        let permits = u32::try_from(bytes).unwrap_or(u32::MAX);
+        Arc::clone(&self.permits)
+            .try_acquire_many_owned(permits)
+            .map(Some)
+            .map_err(|_| REQUEST_BUDGET_EXHAUSTED_ERROR.to_string())
+    }
+
+    /// Bytes currently free in the shared budget. Test-only: production code
+    /// only ever reserves and releases (by dropping) permits.
+    #[cfg(test)]
+    fn available_bytes(&self) -> usize {
+        self.permits.available_permits()
+    }
 }
 
 /// Accept public RESP clients until `shutdown` resolves.
@@ -52,6 +126,10 @@ pub async fn serve(
     shutdown: oneshot::Receiver<()>,
 ) -> Result<(), String> {
     let permits = Arc::new(Semaphore::new(MAX_CONNECTIONS));
+    // One budget for the whole launcher instance: every public RESP client
+    // spawned from this accept loop reserves from it, so it is what actually
+    // bounds worst-case declared-request memory, not the per-connection cap.
+    let request_budget = Arc::new(RequestByteBudget::new(MAX_IN_FLIGHT_REQUEST_BYTES));
     tokio::pin!(shutdown);
 
     loop {
@@ -83,10 +161,11 @@ pub async fn serve(
                 };
 
                 let backend_permits = Arc::clone(&backend_permits);
+                let request_budget = Arc::clone(&request_budget);
                 tokio::spawn(async move {
                     let _permit = permit;
                     if let Err(error) =
-                        handle_connection(stream, upstream_addr, backend_permits).await
+                        handle_connection(stream, upstream_addr, backend_permits, request_budget).await
                     {
                         eprintln!("warning: public RESP client {peer} failed: {error}");
                     }
@@ -101,6 +180,7 @@ pub async fn handle_connection(
     client: TcpStream,
     upstream_addr: &str,
     backend_permits: Arc<Semaphore>,
+    request_budget: Arc<RequestByteBudget>,
 ) -> Result<(), String> {
     let (client_read, mut client_write) = client.into_split();
     let mut client_read = BufReader::new(client_read);
@@ -109,7 +189,12 @@ pub async fn handle_connection(
     let mut upstream: Option<BufReader<TcpStream>> = None;
 
     loop {
-        let request = match timeout(CLIENT_IDLE_TIMEOUT, read_request(&mut client_read)).await {
+        let request = match timeout(
+            CLIENT_IDLE_TIMEOUT,
+            read_request(&mut client_read, &request_budget),
+        )
+        .await
+        {
             Ok(Ok(request)) => request,
             Ok(Err(error)) => {
                 let _ = write_response(
@@ -132,6 +217,13 @@ pub async fn handle_connection(
                 return Ok(());
             }
         };
+
+        // Held for the rest of this iteration — through policy checks,
+        // backend forwarding, and response delivery — and only released
+        // when it goes out of scope at the end of the loop body (or on an
+        // early `continue`/`return`), so the reservation for this command's
+        // declared size always covers its whole lifetime on this launcher.
+        let (request, _request_reservation) = request;
 
         let arguments = match request {
             Request::Eof => return Ok(()),
@@ -283,13 +375,30 @@ async fn forward(
 }
 
 /// Decode one RESP-array client command.
-pub async fn read_request<R>(reader: &mut R) -> Result<Request, String>
+///
+/// Every declared bulk length, and the declared argument count itself, is
+/// reserved from `budget` immediately after being parsed and *before* the
+/// corresponding buffer is allocated. Reservations accumulate in the
+/// returned `Vec<OwnedSemaphorePermit>`; the caller must keep it alive for as
+/// long as this command's memory is in use (through backend execution and
+/// response delivery), and dropping it is what releases the budget.
+///
+/// Once the leading `*<count>` line has arrived — meaning a command has
+/// begun — every subsequent read (further header lines and bulk payload
+/// bytes) is bounded by [`CLIENT_READ_TIMEOUT`] rather than the more
+/// generous idle wait for a brand new command, so a client that declares a
+/// length and then trickles its bytes in slowly cannot hold its reservation
+/// indefinitely.
+pub async fn read_request<R>(
+    reader: &mut R,
+    budget: &RequestByteBudget,
+) -> Result<(Request, Vec<OwnedSemaphorePermit>), String>
 where
     R: AsyncBufRead + Unpin + Send,
 {
     let line = match read_line(reader, MAX_REQUEST_LINE).await? {
         Some(line) => line,
-        None => return Ok(Request::Eof),
+        None => return Ok((Request::Eof, Vec::new())),
     };
 
     if !line.starts_with(b"*") {
@@ -300,7 +409,7 @@ where
 
     let count = parse_number(&line[1..], "argument count")?;
     if count <= 0 {
-        return Ok(Request::Command(Vec::new()));
+        return Ok((Request::Command(Vec::new()), Vec::new()));
     }
     if count as usize > MAX_ARGUMENTS {
         return Err(format!(
@@ -308,11 +417,19 @@ where
         ));
     }
 
+    let mut reservation = Vec::new();
+    // Charge the declared array shape itself before allocating its backing
+    // vector below.
+    if let Some(permit) = budget.reserve((count as usize) * ARGUMENT_SLOT_OVERHEAD_BYTES)? {
+        reservation.push(permit);
+    }
+
     let mut arguments = Vec::with_capacity(count as usize);
     let mut total = 0usize;
     for _ in 0..count {
-        let header = read_line(reader, MAX_REQUEST_LINE)
-            .await?
+        let header = timeout(CLIENT_READ_TIMEOUT, read_line(reader, MAX_REQUEST_LINE))
+            .await
+            .map_err(|_| read_timeout_error())??
             .ok_or_else(|| "ERR unexpected end of RESP command".to_string())?;
         if !header.starts_with(b"$") {
             return Err("ERR Protocol error: expected '$', got something else".to_string());
@@ -330,10 +447,16 @@ where
             ));
         }
 
+        // Reserve this argument's declared size from the shared budget
+        // before allocating the buffer that will hold it.
+        if let Some(permit) = budget.reserve(length as usize)? {
+            reservation.push(permit);
+        }
+
         let mut data = vec![0u8; length as usize + 2];
-        reader
-            .read_exact(&mut data)
+        timeout(CLIENT_READ_TIMEOUT, reader.read_exact(&mut data))
             .await
+            .map_err(|_| read_timeout_error())?
             .map_err(|error| format!("ERR failed to read RESP argument: {error}"))?;
         if !data.ends_with(b"\r\n") {
             return Err("ERR Protocol error: unbalanced argument terminator".to_string());
@@ -342,7 +465,14 @@ where
         arguments.push(data);
     }
 
-    Ok(Request::Command(arguments))
+    Ok((Request::Command(arguments), reservation))
+}
+
+fn read_timeout_error() -> String {
+    format!(
+        "ERR Protocol error: timed out reading command after {} seconds",
+        CLIENT_READ_TIMEOUT.as_secs()
+    )
 }
 
 /// Read one CRLF/LF-terminated line, refusing lines longer than `limit`.
@@ -389,8 +519,11 @@ mod tests {
     use tokio::time::sleep;
 
     async fn decode(input: &[u8]) -> Result<Request, String> {
+        let budget = RequestByteBudget::new(MAX_IN_FLIGHT_REQUEST_BYTES);
         let mut reader = IoBufReader::new(input);
-        read_request(&mut reader).await
+        read_request(&mut reader, &budget)
+            .await
+            .map(|(request, _reservation)| request)
     }
 
     #[tokio::test]
@@ -456,11 +589,24 @@ mod tests {
         upstream: &'static str,
         backend_permits: Arc<Semaphore>,
     ) -> String {
+        start_proxy_with_permits_and_budget(
+            upstream,
+            backend_permits,
+            Arc::new(RequestByteBudget::new(MAX_IN_FLIGHT_REQUEST_BYTES)),
+        )
+        .await
+    }
+
+    async fn start_proxy_with_permits_and_budget(
+        upstream: &'static str,
+        backend_permits: Arc<Semaphore>,
+        request_budget: Arc<RequestByteBudget>,
+    ) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap().to_string();
         tokio::spawn(async move {
             let (client, _) = listener.accept().await.unwrap();
-            let _ = handle_connection(client, upstream, backend_permits).await;
+            let _ = handle_connection(client, upstream, backend_permits, request_budget).await;
         });
         addr
     }
@@ -808,5 +954,99 @@ mod tests {
 
         let _ = shutdown_tx.send(());
         service.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn concurrent_declared_bulk_requests_are_capped_by_the_shared_request_budget() {
+        // A budget sized for a bit more than one 2,000-byte declared bulk
+        // (plus its small array-shape overhead), but not two at once.
+        let budget = RequestByteBudget::new(2_100);
+
+        let mut first_input = b"*1\r\n$2000\r\n".to_vec();
+        first_input.extend(vec![b'a'; 2000]);
+        first_input.extend(b"\r\n");
+        let mut first_reader = IoBufReader::new(first_input.as_slice());
+        let (first_request, first_reservation) = read_request(&mut first_reader, &budget)
+            .await
+            .expect("the first declared bulk fits the shared budget");
+        assert_eq!(first_request, Request::Command(vec![vec![b'a'; 2000]]));
+        assert!(
+            !first_reservation.is_empty(),
+            "a non-zero declared bulk must hold at least one budget permit"
+        );
+
+        // A second, concurrently-arriving client declaring another
+        // similarly sized bulk no longer fits in the remaining shared
+        // budget and is rejected immediately, without waiting, and without
+        // ever allocating its payload buffer.
+        let mut second_input = b"*1\r\n$2000\r\n".to_vec();
+        second_input.extend(vec![b'b'; 2000]);
+        second_input.extend(b"\r\n");
+        let mut second_reader = IoBufReader::new(second_input.as_slice());
+        let second_result = timeout(
+            Duration::from_millis(200),
+            read_request(&mut second_reader, &budget),
+        )
+        .await
+        .expect("an over-budget request must be rejected immediately, not after waiting");
+        assert!(
+            second_result
+                .unwrap_err()
+                .contains("request budget is exhausted"),
+            "a concurrent declared bulk that no longer fits the shared budget must be refused"
+        );
+
+        // Releasing the first reservation — as happens once its command's
+        // response has been delivered — frees the budget back up for a
+        // subsequent client.
+        drop(first_reservation);
+        let mut third_input = b"*1\r\n$2000\r\n".to_vec();
+        third_input.extend(vec![b'c'; 2000]);
+        third_input.extend(b"\r\n");
+        let mut third_reader = IoBufReader::new(third_input.as_slice());
+        let (third_request, _third_reservation) = read_request(&mut third_reader, &budget)
+            .await
+            .expect("the budget must be available again once the prior reservation is released");
+        assert_eq!(third_request, Request::Command(vec![vec![b'c'; 2000]]));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn slow_partial_client_holds_its_reservation_only_until_the_read_deadline() {
+        let budget = RequestByteBudget::new(4096);
+        let (mut writer, reader) = duplex(4096);
+        let mut reader = IoBufReader::new(reader);
+
+        // Declare one 2,000-byte bulk argument, then send only a few of its
+        // bytes and stall — simulating a slow or malicious client that
+        // trickles data in rather than sending it promptly.
+        writer.write_all(b"*1\r\n$2000\r\n").await.unwrap();
+        writer.write_all(&[b'x'; 10]).await.unwrap();
+
+        let read_budget = budget.clone();
+        let read = tokio::spawn(async move { read_request(&mut reader, &read_budget).await });
+
+        // Let the reader task run until it genuinely blocks waiting for the
+        // rest of the declared bulk.
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+        assert!(
+            budget.available_bytes() < 4096,
+            "the declared bulk length must be reserved before all of its bytes arrive"
+        );
+
+        // The client never sends the remaining bytes; once the read
+        // deadline elapses the stalled read must fail with a bounded error
+        // rather than hang, and its reservation must be released.
+        tokio::time::advance(CLIENT_READ_TIMEOUT + Duration::from_secs(1)).await;
+        let result = read.await.unwrap();
+        assert!(
+            result.unwrap_err().contains("timed out"),
+            "a stalled partial client must be disconnected with a bounded timeout error"
+        );
+        assert_eq!(
+            budget.available_bytes(),
+            4096,
+            "the reservation held by a stalled client must be released once it times out"
+        );
     }
 }

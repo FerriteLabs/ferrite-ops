@@ -16,7 +16,7 @@ use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
 
-use crate::proxy::{read_request, Request};
+use crate::proxy::{read_request, Request, RequestByteBudget};
 use crate::resp::{self, RespValue};
 
 #[derive(Debug, Clone)]
@@ -146,11 +146,16 @@ async fn serve_connection(stream: TcpStream, state: Arc<Mutex<MockState>>) {
     let mut reader = BufReader::new(read_half);
     let mut database = 0;
     let mut protocol = 2;
+    // This mock stands in for the real Ferrite child, which enforces no such
+    // budget of its own, so it is given a generously large one purely to
+    // satisfy `read_request`'s signature.
+    let request_budget = RequestByteBudget::new(64 * 1024 * 1024);
 
     loop {
-        let request = match read_request(&mut reader).await {
-            Ok(Request::Command(arguments)) => arguments,
-            Ok(Request::Eof) | Err(_) => return,
+        let request = match read_request(&mut reader, &request_budget).await {
+            Ok((Request::Command(arguments), _reservation)) => arguments,
+            Ok((Request::Eof, _)) => return,
+            Err(_) => return,
         };
         if request.is_empty() {
             continue;
