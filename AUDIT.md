@@ -393,6 +393,66 @@ Request memory bounds:
 - Verification containers, volumes, and temporary images were removed. No required external tool was
   unavailable.
 
+## Immutable Version Tags and Serialized Promotion Resolution (this change)
+
+Container releases now separate the exact, immutable version tag from the floating tags so an
+out-of-order, retried, or concurrent release can never overwrite `latest`/`<major>`/`<major>.<minor>`
+with an older image:
+
+- `release.yml`'s `build-and-push` job publishes ONLY the exact version tag (e.g. `0.4.1`) plus its
+  digest, for every trigger and channel. Exact tags are unique per version, so this expensive multi-arch
+  build is no longer serialized and independent releases build concurrently without racing.
+- A new serialized `promote-stable` job advances the floating tags to the freshly built digest with
+  `docker buildx imagetools create` — no rebuild, and the existing cosign signature/attestations remain
+  valid because the promoted tags reference the same signed digest. It runs only for stable releases
+  (prereleases stay exact-only) and only when the candidate is `>=` the current promoted stable version.
+- The current promoted stable version is read from trustworthy registry metadata (the `latest` tag's
+  `org.opencontainers.image.version` label), never from mutable workflow input; a missing `latest` is
+  treated as the first promotion, and any other read failure aborts rather than promoting blindly.
+- The fixed `ferrite-floating-tag-promotion` concurrency group (`cancel-in-progress: false`) serializes
+  the read-compare-write, and the `>=` gate (via `scripts/release-ordering.sh`) makes an older release
+  skip promotion instead of regressing `latest`.
+- `scripts/release-ordering.sh` is the shared SemVer-precedence engine (`semver-cmp`/`ge`/`classify`),
+  with strict input validation so untrusted payloads cannot inject shell metacharacters.
+  `tests/test_release_ordering.sh` (24 checks) covers numeric and pre-release precedence, the `ge`
+  contract, all four `classify` outcomes, and injection rejection. `tests/test_release_promotion.sh`
+  (22 checks) statically verifies the split/serialized/imagetools architecture and functionally replays
+  promotion for `0.4.1` then a late `0.4.0`, equal retries, serialized concurrent candidates,
+  dual-registry promotion, and prerelease rejection.
+
+## Release Ordering and Supersession Resolution (this change)
+
+Version-sync now refuses to move the canonical `active-release.env` backwards, and a merge-time check
+stops a stale PR from doing the same:
+
+- `version-sync.yml` gains a `Guard release ordering` step that classifies the candidate against the
+  checked-out canonical `active-release.env` with the shared guard. NEWER proceeds; EQUAL with an
+  identical source checksum is a no-op; EQUAL with a differing checksum fails loudly; OLDER is skipped
+  unless a manual run set `allow_downgrade=true`. The sync, RPM, and PR steps are gated on the guard.
+- `allow_downgrade` is read only from `workflow_dispatch` inputs (default `false`); a
+  `repository_dispatch` client payload can never supply it, so an automated dispatch can never bypass
+  the downgrade guard.
+- New `version-supersession.yml` runs on `active-release.env` pull requests, reads the PR head (not the
+  merge ref), and compares it against the current tip of the base branch. It fails a PR that would move
+  the canonical version backwards (or keep the version while changing its source checksum), so a clean
+  but stale version-sync PR cannot regress `main` after `main` has advanced.
+- `tests/test_version_sync_ordering.sh` (19 checks) functionally replays the guard for
+  newer/equal-same/checksum-mismatch/older/manual-override/malicious-input cases;
+  `tests/test_version_supersession.sh` (12 checks) replays the merge-time check against temporary Git
+  remotes for newer/stale/equal/checksum-conflict PRs. `actionlint` accepts every workflow.
+
+## Final Verification Pass (immutable version tags and release ordering)
+
+- `bash tests/run.sh` passes all 28/28 discovered suites, including the four new release-ordering,
+  promotion, version-sync-ordering, and supersession suites.
+- `actionlint .github/workflows/*.yml` passes with no findings, including the split build/promote
+  `release.yml`, the guarded `version-sync.yml`, and the new `version-supersession.yml`.
+- `shellcheck --severity=warning scripts/*.sh tests/*.sh` passes with no findings, including the new
+  `scripts/release-ordering.sh` and its tests.
+- No production behavior outside the release/version-sync workflows and the shared ordering script was
+  changed; existing Docker, Helm, Compose, GitOps, Terraform, and playground coverage is unchanged and
+  still green.
+
 ## Deferred Items
 
 | ID | Description | Reason deferred |

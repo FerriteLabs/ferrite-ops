@@ -51,4 +51,19 @@ assert_not_contains "$AUDIT_CONTENT" "| D-01 |" "AUDIT.md no longer lists D-01 a
 assert_not_contains "$AUDIT_CONTENT" 'compiles `playground-launcher` against `crates/ferrite-studio`' \
   "AUDIT.md no longer claims the Playground uses placeholder Studio APIs"
 
+assert_contains "$AUDIT_CONTENT" "## Immutable Version Tags and Serialized Promotion Resolution" \
+  "AUDIT.md records the split exact-build / serialized-promotion resolution"
+assert_contains "$AUDIT_CONTENT" "ferrite-floating-tag-promotion" \
+  "AUDIT.md records the serialized floating-tag promotion concurrency group"
+assert_contains "$AUDIT_CONTENT" "docker buildx imagetools create" \
+  "AUDIT.md records digest promotion via imagetools compatible with cosign"
+assert_contains "$AUDIT_CONTENT" "## Release Ordering and Supersession Resolution" \
+  "AUDIT.md records the version-sync ordering and supersession resolution"
+assert_contains "$AUDIT_CONTENT" "allow_downgrade" \
+  "AUDIT.md records the manual-only allow_downgrade override"
+assert_contains "$AUDIT_CONTENT" "scripts/release-ordering.sh" \
+  "AUDIT.md records the shared SemVer ordering guard"
+assert_contains "$AUDIT_CONTENT" "28/28 discovered suites" \
+  "AUDIT.md records the full 28-suite verification pass"
+
 harness_summary
