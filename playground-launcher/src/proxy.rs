@@ -129,8 +129,13 @@ pub async fn handle_connection(client: TcpStream, upstream_addr: &str) -> Result
         let encoded = match reply {
             Ok(value) => {
                 let mut encoded = Vec::new();
-                resp::encode_value(&value, &mut encoded);
-                encoded
+                match resp::encode_value(&value, &mut encoded, resp::MAX_RESPONSE_BYTES) {
+                    Ok(()) => encoded,
+                    Err(error) => {
+                        upstream = None;
+                        resp::encode_error(&format!("ERR playground backend error: {error}"))
+                    }
+                }
             }
             Err(error) => {
                 // The upstream stream may be desynchronized after a failure,
@@ -462,9 +467,11 @@ mod tests {
 
         // Many individually small elements whose cumulative size exceeds the
         // launcher's per-reply budget.
-        let elements = (resp::MAX_RESPONSE_BYTES / 1024 + 512).to_string();
+        let elements = resp::MAX_RESP_ARRAY_LENGTH.to_string();
+        let element_size =
+            (resp::MAX_RESPONSE_BYTES / resp::MAX_RESP_ARRAY_LENGTH + 64).to_string();
         let reply = client
-            .command(&["MOCKARRAY", elements.as_str(), "1024"])
+            .command(&["MOCKARRAY", elements.as_str(), element_size.as_str()])
             .await;
         match reply {
             RespValue::Error(message) => assert!(

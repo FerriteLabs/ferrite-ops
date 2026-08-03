@@ -153,7 +153,7 @@ async fn serve_connection(stream: TcpStream, state: Arc<Mutex<MockState>>) {
         };
 
         let mut encoded = Vec::new();
-        resp::encode_value(&reply, &mut encoded);
+        resp::encode_value(&reply, &mut encoded, usize::MAX).unwrap();
         if write_half.write_all(&encoded).await.is_err() {
             return;
         }

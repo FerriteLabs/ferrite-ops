@@ -16,9 +16,13 @@ use tokio::time::timeout;
 /// Upper bound on a single bulk string in a reply.
 pub const MAX_RESP_BULK_LENGTH: usize = 16 * 1024 * 1024;
 /// Upper bound on the number of elements in a single reply array.
-pub const MAX_RESP_ARRAY_LENGTH: usize = 1_000_000;
+pub const MAX_RESP_ARRAY_LENGTH: usize = 4 * 1024;
 /// Upper bound on reply nesting.
 pub const MAX_RESP_DEPTH: usize = 64;
+/// Upper bound on decoded RESP values in one reply, including aggregate roots.
+pub const MAX_RESPONSE_NODES: usize = 8 * 1024;
+/// Upper bound on aggregate child slots claimed across one decoded reply.
+pub const MAX_RESPONSE_ELEMENTS: usize = 8 * 1024;
 /// Cumulative byte budget for one decoded reply.
 ///
 /// This bounds the *whole* reply — every header line, every bulk payload, and
@@ -34,31 +38,83 @@ pub const RESP_TIMEOUT: Duration = Duration::from_secs(5);
 /// Cumulative byte budget consumed while decoding a single reply.
 #[derive(Debug)]
 pub struct ResponseBudget {
-    limit: usize,
-    used: usize,
+    byte_limit: usize,
+    bytes_used: usize,
+    node_limit: usize,
+    nodes_used: usize,
+    element_limit: usize,
+    elements_used: usize,
 }
 
 impl ResponseBudget {
-    pub fn new(limit: usize) -> Self {
-        Self { limit, used: 0 }
+    pub fn new(byte_limit: usize) -> Self {
+        Self::with_limits(byte_limit, MAX_RESPONSE_NODES, MAX_RESPONSE_ELEMENTS)
+    }
+
+    pub fn with_limits(byte_limit: usize, node_limit: usize, element_limit: usize) -> Self {
+        Self {
+            byte_limit,
+            bytes_used: 0,
+            node_limit,
+            nodes_used: 0,
+            element_limit,
+            elements_used: 0,
+        }
     }
 
     /// Charge `bytes` to the budget, failing once the cumulative total for
     /// this reply exceeds the limit.
-    pub fn consume(&mut self, bytes: usize) -> Result<(), String> {
-        self.used = self.used.saturating_add(bytes);
-        if self.used > self.limit {
+    pub fn consume_bytes(&mut self, bytes: usize) -> Result<(), String> {
+        let next = self.bytes_used.saturating_add(bytes);
+        if next > self.byte_limit {
             return Err(format!(
                 "response exceeds the playground response budget of {} bytes",
-                self.limit
+                self.byte_limit
             ));
         }
+        self.bytes_used = next;
+        Ok(())
+    }
+
+    /// Charge one decoded RESP value before constructing it.
+    pub fn consume_node(&mut self) -> Result<(), String> {
+        let next = self.nodes_used.saturating_add(1);
+        if next > self.node_limit {
+            return Err(format!(
+                "response exceeds the playground decoded-node budget of {} values",
+                self.node_limit
+            ));
+        }
+        self.nodes_used = next;
+        Ok(())
+    }
+
+    /// Reserve aggregate child slots before allocating their backing vector.
+    pub fn reserve_elements(&mut self, elements: usize) -> Result<(), String> {
+        let next = self.elements_used.saturating_add(elements);
+        if next > self.element_limit {
+            return Err(format!(
+                "response exceeds the playground decoded-element budget of {} elements",
+                self.element_limit
+            ));
+        }
+        self.elements_used = next;
         Ok(())
     }
 
     /// Bytes charged to this budget so far.
     pub fn used(&self) -> usize {
-        self.used
+        self.bytes_used
+    }
+
+    #[cfg(test)]
+    fn nodes_used(&self) -> usize {
+        self.nodes_used
+    }
+
+    #[cfg(test)]
+    fn elements_used(&self) -> usize {
+        self.elements_used
     }
 }
 
@@ -112,82 +168,98 @@ pub fn encode_command<S: AsRef<[u8]>>(arguments: &[S]) -> Vec<u8> {
     encoded
 }
 
-/// Serialize a decoded value back onto the wire, byte-for-byte equivalent to
-/// what the Ferrite child produced.
-pub fn encode_value(value: &RespValue, out: &mut Vec<u8>) {
+/// Serialize a decoded value back onto the wire without allowing `out` to
+/// exceed `limit`.
+pub fn encode_value(value: &RespValue, out: &mut Vec<u8>, limit: usize) -> Result<(), String> {
     match value {
         RespValue::Simple(value) => {
-            out.push(b'+');
-            out.extend_from_slice(value.as_bytes());
-            out.extend_from_slice(b"\r\n");
+            append(out, b"+", limit)?;
+            append(out, value.as_bytes(), limit)?;
+            append(out, b"\r\n", limit)?;
         }
         RespValue::Error(error) => {
-            out.push(b'-');
-            out.extend_from_slice(error.as_bytes());
-            out.extend_from_slice(b"\r\n");
+            append(out, b"-", limit)?;
+            append(out, error.as_bytes(), limit)?;
+            append(out, b"\r\n", limit)?;
         }
         RespValue::Integer(value) => {
-            out.extend_from_slice(format!(":{value}\r\n").as_bytes());
+            append(out, format!(":{value}\r\n").as_bytes(), limit)?;
         }
-        RespValue::Bulk(None) => out.extend_from_slice(b"$-1\r\n"),
+        RespValue::Bulk(None) => append(out, b"$-1\r\n", limit)?,
         RespValue::Bulk(Some(data)) => {
-            out.extend_from_slice(format!("${}\r\n", data.len()).as_bytes());
-            out.extend_from_slice(data);
-            out.extend_from_slice(b"\r\n");
+            append(out, format!("${}\r\n", data.len()).as_bytes(), limit)?;
+            append(out, data, limit)?;
+            append(out, b"\r\n", limit)?;
         }
-        RespValue::Array(None) => out.extend_from_slice(b"*-1\r\n"),
+        RespValue::Array(None) => append(out, b"*-1\r\n", limit)?,
         RespValue::Array(Some(values)) => {
-            out.extend_from_slice(format!("*{}\r\n", values.len()).as_bytes());
+            append(out, format!("*{}\r\n", values.len()).as_bytes(), limit)?;
             for value in values {
-                encode_value(value, out);
+                encode_value(value, out, limit)?;
             }
         }
-        RespValue::Null => out.extend_from_slice(b"_\r\n"),
+        RespValue::Null => append(out, b"_\r\n", limit)?,
         RespValue::Boolean(value) => {
-            out.extend_from_slice(if *value { b"#t\r\n" } else { b"#f\r\n" })
+            append(out, if *value { b"#t\r\n" } else { b"#f\r\n" }, limit)?;
         }
         RespValue::Double(value) => {
-            out.extend_from_slice(format!(",{value}\r\n").as_bytes());
+            append(out, format!(",{value}\r\n").as_bytes(), limit)?;
         }
         RespValue::BigNumber(value) => {
-            out.extend_from_slice(format!("({value}\r\n").as_bytes());
+            append(out, format!("({value}\r\n").as_bytes(), limit)?;
         }
         RespValue::BlobError(data) => {
-            out.extend_from_slice(format!("!{}\r\n", data.len()).as_bytes());
-            out.extend_from_slice(data);
-            out.extend_from_slice(b"\r\n");
+            append(out, format!("!{}\r\n", data.len()).as_bytes(), limit)?;
+            append(out, data, limit)?;
+            append(out, b"\r\n", limit)?;
         }
         RespValue::Verbatim(data) => {
-            out.extend_from_slice(format!("={}\r\n", data.len()).as_bytes());
-            out.extend_from_slice(data);
-            out.extend_from_slice(b"\r\n");
+            append(out, format!("={}\r\n", data.len()).as_bytes(), limit)?;
+            append(out, data, limit)?;
+            append(out, b"\r\n", limit)?;
         }
         RespValue::Map(entries) => {
-            out.extend_from_slice(format!("%{}\r\n", entries.len()).as_bytes());
+            append(out, format!("%{}\r\n", entries.len()).as_bytes(), limit)?;
             for (key, value) in entries {
-                encode_value(key, out);
-                encode_value(value, out);
+                encode_value(key, out, limit)?;
+                encode_value(value, out, limit)?;
             }
         }
         RespValue::Set(values) => {
-            out.extend_from_slice(format!("~{}\r\n", values.len()).as_bytes());
+            append(out, format!("~{}\r\n", values.len()).as_bytes(), limit)?;
             for value in values {
-                encode_value(value, out);
+                encode_value(value, out, limit)?;
             }
         }
         RespValue::Push(values) => {
-            out.extend_from_slice(format!(">{}\r\n", values.len()).as_bytes());
+            append(out, format!(">{}\r\n", values.len()).as_bytes(), limit)?;
             for value in values {
-                encode_value(value, out);
+                encode_value(value, out, limit)?;
             }
         }
     }
+    Ok(())
+}
+
+fn append(out: &mut Vec<u8>, bytes: &[u8], limit: usize) -> Result<(), String> {
+    if out.len().saturating_add(bytes.len()) > limit {
+        return Err(format!(
+            "encoded response exceeds the playground output budget of {limit} bytes"
+        ));
+    }
+    out.extend_from_slice(bytes);
+    Ok(())
 }
 
 /// Encode an error reply for a command the playground refuses to forward.
 pub fn encode_error(message: &str) -> Vec<u8> {
     let mut out = Vec::new();
-    encode_value(&RespValue::Error(message.to_string()), &mut out);
+    encode_value(
+        &RespValue::Error(message.to_string()),
+        &mut out,
+        MAX_RESPONSE_BYTES,
+    )
+    .expect("playground-generated error replies are bounded");
     out
 }
 
@@ -204,6 +276,7 @@ where
         if depth > MAX_RESP_DEPTH {
             return Err("RESP response nesting is too deep".to_string());
         }
+        budget.consume_node()?;
 
         let mut line = Vec::new();
         let read = reader
@@ -216,7 +289,7 @@ where
         if !line.ends_with(b"\r\n") {
             return Err("RESP response line did not end with CRLF".to_string());
         }
-        budget.consume(line.len())?;
+        budget.consume_bytes(line.len())?;
         line.truncate(line.len() - 2);
         let (&prefix, payload) = line
             .split_first()
@@ -240,7 +313,7 @@ where
                     return Err(format!("invalid RESP bulk length: {length}"));
                 }
 
-                budget.consume(length as usize + 2)?;
+                budget.consume_bytes(length as usize + 2)?;
                 let mut data = vec![0; length as usize + 2];
                 reader
                     .read_exact(&mut data)
@@ -261,7 +334,9 @@ where
                     return Err(format!("invalid RESP array length: {length}"));
                 }
 
-                let mut values = Vec::with_capacity(std::cmp::min(length as usize, 1024));
+                let length = length as usize;
+                budget.reserve_elements(length)?;
+                let mut values = Vec::with_capacity(length);
                 for _ in 0..length {
                     values.push(read_value_budgeted(reader, depth + 1, budget).await?);
                 }
@@ -280,7 +355,7 @@ where
                 if length < 0 || length as usize > MAX_RESP_BULK_LENGTH {
                     return Err(format!("invalid RESP blob length: {length}"));
                 }
-                budget.consume(length as usize + 2)?;
+                budget.consume_bytes(length as usize + 2)?;
                 let mut data = vec![0; length as usize + 2];
                 reader
                     .read_exact(&mut data)
@@ -301,7 +376,12 @@ where
                 if length < 0 || length as usize > MAX_RESP_ARRAY_LENGTH {
                     return Err(format!("invalid RESP map length: {length}"));
                 }
-                let mut entries = Vec::with_capacity(std::cmp::min(length as usize, 1024));
+                let length = length as usize;
+                let child_nodes = length
+                    .checked_mul(2)
+                    .ok_or_else(|| "RESP map length overflow".to_string())?;
+                budget.reserve_elements(child_nodes)?;
+                let mut entries = Vec::with_capacity(length);
                 for _ in 0..length {
                     let key = read_value_budgeted(reader, depth + 1, budget).await?;
                     let value = read_value_budgeted(reader, depth + 1, budget).await?;
@@ -314,7 +394,9 @@ where
                 if length < 0 || length as usize > MAX_RESP_ARRAY_LENGTH {
                     return Err(format!("invalid RESP aggregate length: {length}"));
                 }
-                let mut values = Vec::with_capacity(std::cmp::min(length as usize, 1024));
+                let length = length as usize;
+                budget.reserve_elements(length)?;
+                let mut values = Vec::with_capacity(length);
                 for _ in 0..length {
                     values.push(read_value_budgeted(reader, depth + 1, budget).await?);
                 }
@@ -498,7 +580,7 @@ mod tests {
             .await
             .unwrap();
         let mut out = Vec::new();
-        encode_value(&value, &mut out);
+        encode_value(&value, &mut out, MAX_RESPONSE_BYTES).unwrap();
         assert_eq!(out, input);
     }
 
@@ -572,6 +654,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rejects_large_declared_aggregates_before_allocating_or_reading_children() {
+        let input = format!("*{}\r\n", MAX_RESP_ARRAY_LENGTH + 1);
+        let mut reader = BufReader::new(input.as_bytes());
+        let mut budget = ResponseBudget::default();
+        let error = read_value_budgeted(&mut reader, 0, &mut budget)
+            .await
+            .unwrap_err();
+        assert!(error.contains("invalid RESP array length"));
+        assert_eq!(budget.nodes_used(), 1);
+        assert_eq!(budget.elements_used(), 0);
+    }
+
+    #[tokio::test]
+    async fn decoded_element_budget_rejects_many_empty_values_from_the_header() {
+        let mut input = b"*1000\r\n".to_vec();
+        for _ in 0..1000 {
+            input.extend_from_slice(b"$0\r\n\r\n");
+        }
+
+        let mut reader = BufReader::new(&input[..]);
+        let mut budget = ResponseBudget::with_limits(input.len(), 2000, 64);
+        let error = read_value_budgeted(&mut reader, 0, &mut budget)
+            .await
+            .unwrap_err();
+        assert!(error.contains("decoded-element budget"));
+        assert_eq!(budget.nodes_used(), 1);
+        assert_eq!(budget.elements_used(), 0);
+    }
+
+    #[tokio::test]
+    async fn decoded_node_budget_bounds_deeply_nested_empty_aggregates() {
+        let mut input = Vec::new();
+        for _ in 0..32 {
+            input.extend_from_slice(b"*1\r\n");
+        }
+        input.extend_from_slice(b"*0\r\n");
+
+        let mut reader = BufReader::new(&input[..]);
+        let mut budget = ResponseBudget::with_limits(input.len(), 8, 64);
+        let error = read_value_budgeted(&mut reader, 0, &mut budget)
+            .await
+            .unwrap_err();
+        assert!(error.contains("decoded-node budget"));
+        assert_eq!(budget.nodes_used(), 8);
+        assert!(budget.elements_used() <= 8);
+    }
+
+    #[test]
+    fn re_encoding_never_grows_beyond_its_output_budget() {
+        let value = RespValue::Bulk(Some(vec![b'x'; 1024]));
+        let mut out = Vec::new();
+        let error = encode_value(&value, &mut out, 128).unwrap_err();
+        assert!(error.contains("output budget"));
+        assert!(out.len() <= 128);
+    }
+
+    #[tokio::test]
     async fn execute_within_applies_the_requested_budget() {
         let upstream = crate::testing::MockFerrite::start().await;
         let addr = upstream.addr();
@@ -602,7 +741,7 @@ mod tests {
             .unwrap();
 
         let mut out = Vec::new();
-        encode_value(&value, &mut out);
+        encode_value(&value, &mut out, MAX_RESPONSE_BYTES).unwrap();
         assert_eq!(out, input, "RESP3 replies must be forwarded unchanged");
 
         assert_eq!(
@@ -620,7 +759,7 @@ mod tests {
             .unwrap();
 
         let mut out = Vec::new();
-        encode_value(&value, &mut out);
+        encode_value(&value, &mut out, MAX_RESPONSE_BYTES).unwrap();
         assert_eq!(out, input);
         assert_eq!(
             to_json(value).unwrap(),
