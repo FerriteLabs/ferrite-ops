@@ -10,7 +10,7 @@ source "${HERE}/lib/harness.sh"
 
 assert_contains "$AUDIT_CONTENT" "| F-18 |" "AUDIT.md records the Moonshot finding"
 assert_contains "$AUDIT_CONTENT" "| F-19 |" "AUDIT.md records the Playground finding"
-for finding in F-20 F-21 F-22 F-23 F-24 F-25 F-26 F-27 F-28 F-29 F-30 F-35 F-36 F-37 F-38 F-39 F-40; do
+for finding in F-20 F-21 F-22 F-23 F-24 F-25 F-26 F-27 F-28 F-29 F-30 F-35 F-36 F-37 F-38 F-39 F-40 F-49 F-50 F-51 F-52 F-53; do
   assert_contains "$AUDIT_CONTENT" "| ${finding} |" \
     "AUDIT.md records final-review finding ${finding} as fixed"
 done
@@ -30,6 +30,14 @@ assert_contains "$AUDIT_CONTENT" "compact typed base64 data" \
   "AUDIT.md records bounded binary HTTP conversion"
 assert_contains "$AUDIT_CONTENT" "default SELECT/HELLO state" \
   "AUDIT.md records terminal proxy state-loss handling"
+assert_contains "$AUDIT_CONTENT" "ferrite-ops-v0.4.0" \
+  "AUDIT.md records immutable production ops revisions"
+assert_contains "$AUDIT_CONTENT" "prereleases leave" \
+  "AUDIT.md records stable-only RPM synchronization"
+assert_contains "$AUDIT_CONTENT" "ferrite-cli -p 6380 PING" \
+  "AUDIT.md records direct internal container health"
+assert_contains "$AUDIT_CONTENT" "answers \`409\` for \`SELECT\`" \
+  "AUDIT.md records stateless HTTP SELECT rejection"
 assert_not_contains "$AUDIT_CONTENT" "executes against the actual Ferrite RESP child on \`0.0.0.0:6379\`" \
   "AUDIT.md no longer claims the Ferrite child owns the public RESP port"
 assert_contains "$AUDIT_CONTENT" 'publishes `0.4.0`, `0.4`, `0`, and' \

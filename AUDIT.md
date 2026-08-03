@@ -57,6 +57,11 @@
 | F-46 | P1 | Release registry | `release.yml` bundled the GHCR and Docker Hub images into one unconditional `docker/metadata-action` call, so Docker Hub tags were generated (and pushing them attempted) even when the `DOCKERHUB_ENABLED` repository variable was unset/false and the adjacent Docker Hub login step never ran. | Fixed; GHCR login and metadata/tags remain always-on. One eligibility step requires `DOCKERHUB_ENABLED == 'true'` plus non-empty Docker Hub username and token before either Docker Hub login or metadata extraction can run, and a dedicated combine step merges the always-present GHCR outputs with optional Docker Hub tags before `docker/build-push-action`. A disabled/missing variable or either missing credential therefore produces zero Docker Hub tags and no Docker Hub push attempt. `tests/test_release_workflows.sh` statically asserts the shared eligibility gate and functionally replays disabled, missing-variable, missing-credential, and fully configured cases plus the combined tag output |
 | F-47 | P2 | GitOps registry consistency | `gitops/kustomize/base/statefulset.yaml` pinned the active Ferrite image to the Docker Hub repository (`ferritelabs/ferrite`), the only active deployment target still defaulting to the optional Docker Hub registry instead of the always-authenticated GHCR the Helm charts and quickstart Compose already use. | Fixed; the base StatefulSet now pins `ghcr.io/ferritelabs/ferrite:0.4.0`, so the Kustomize deployment path no longer depends on Docker Hub being enabled. `version-sync.yml`, `tests/test_active_release_versions.sh`, and `tests/test_release_workflows.sh` are updated to preserve the `ghcr.io/ferritelabs/ferrite` repository and only advance its version tag on every release |
 | F-48 | P0 | Custom config override default | `docker/docker-compose.custom-config.yml`'s opt-in override defaulted to mounting `${FERRITE_CONFIG:-./ferrite.example.toml}` — the same invalid public example F-17/F-45 already removed as the *default* Compose file's mount — so the one documented way to opt in to a custom config still silently loaded a config the packaged binary is not guaranteed to accept. | Fixed; the override now defaults to `${FERRITE_CONFIG:-./ferrite.toml}`, a path that does not exist unless the user creates it. `docker-compose.yml`, `docker/docker-compose.custom-config.yml`, and `README.md` no longer instruct `cp ferrite.example.toml ferrite.toml`; instead they document generating a version-valid config with the exact image's own `ferrite init --minimal --force`, then rewriting its loopback-only binds for container reachability, mirroring the same generate-then-rewrite approach the Dockerfile's `runtime-config` stage already uses internally. New `tests/test_custom_config_override.sh` builds the image, generates and rewrites a config with `ferrite init`, starts the real `ferrite` service through the documented override with that generated config, and proves the container becomes healthy, answers `ferrite-cli PING` with `PONG`, and is running with the exact byte-identical generated config (not the image's own built-in default) |
+| F-49 | P0 | Immutable GitOps revision | Production Argo CD and Flux pointed at the old core-style `v0.4.0` tag, whose existing ferrite-ops object predates the synchronized chart state, and no workflow created a repository-specific immutable revision after merge. | Fixed; production uses `ferrite-ops-v0.4.0`, version sync advances `ferrite-ops-v${VERSION}`, and a least-privilege main-push workflow validates canonical metadata/charts/deployment pins before creating and pushing a non-overwritable annotated tag at the merged commit |
+| F-50 | P1 | Flux image registry | Base, staging, and production Flux values used the optional Docker Hub repository while other active deployments standardized on GHCR. | Fixed; all Flux manifests use `ghcr.io/ferritelabs/ferrite`, production image-tag synchronization preserves that repository, and static/YAML/rendered/drift tests cover it |
+| F-51 | P1 | RPM prereleases | Version sync accepted prerelease SemVer and wrote the hyphenated value directly into RPM `Version`, which is not the repository's RPM versioning policy. | Fixed; stable `x.y.z` releases update `Version` and reset `Release` to `1%{?dist}`, while prereleases explicitly skip the RPM spec byte-for-byte; stable and `0.5.0-rc.1` functional replays pass |
+| F-52 | P1 | Playground container health | `Dockerfile.playground` health depended on `/api/health`, so saturation of the public HTTP/backend path could mark a healthy private Ferrite child unhealthy. | Fixed; the image healthcheck executes `ferrite-cli -p 6380 PING` directly against the loopback child, removes the curl-only runtime dependency, and a real-image saturation probe proves the internal check still returns `PONG` when all public HTTP connection slots are occupied |
+| F-53 | P1 | HTTP database selection | `/api/execute` allowed `SELECT` even though every HTTP command uses a new backend connection, so success falsely implied database selection would persist. | Fixed; HTTP `SELECT` returns `409` with a stateless-HTTP explanation before forwarding, while one persistent public RESP connection retains `SELECT` state and a fresh RESP connection remains on database 0 |
 
 ## D-01 Resolution
 
@@ -135,6 +140,25 @@ image; `tests/test_helm_charts.sh` renders the default, an explicit override, an
 v0.3.0 defaults. Historical changelogs, migration notes, package changelogs, and explicit version-scoped
 compatibility guards remain intentionally unchanged.
 
+## Immutable Ops Release and Packaging Resolution
+
+- Production Argo CD and Flux source revisions use the repository-specific immutable
+  `ferrite-ops-v0.4.0` tag convention; neither production manifest follows `main` or `HEAD`.
+- `.github/workflows/tag-ops-release.yml` runs only on relevant pushes to `main`, requests only
+  `contents: write`, validates `active-release.env`, all Dockerfile version/checksum defaults, both
+  chart app versions, and production GitOps source/image pins, then creates an annotated
+  `ferrite-ops-v${VERSION}` at the exact merged commit. It checks local and remote refs first and never
+  force-tags or force-pushes.
+- `tests/test_ops_release_tag_workflow.sh` statically verifies triggers/permissions/no-force behavior,
+  extracts and functionally replays both workflow scripts against a temporary bare remote, verifies the
+  tag is annotated and points at the merged commit, proves a remote duplicate is refused, and proves
+  chart drift blocks tagging. `actionlint` accepts the workflow.
+- Every Flux base/staging/production manifest uses `ghcr.io/ferritelabs/ferrite`; production keeps the
+  active image tag and immutable ops revision synchronized. `tests/test_flux_manifests.sh` performs
+  static checks, parses every multi-document manifest, and renders the chart with the production image.
+- RPM updates are stable-only: `x.y.z` updates `Version` and resets `Release`, while prereleases leave
+  the spec unchanged and log the skip. The active stable spec now tracks `0.4.0`.
+
 ## Release Registry and Custom Config Resolution (this change)
 
 GHCR is now the always-on, authenticated registry for every release; Docker Hub is strictly optional:
@@ -208,7 +232,9 @@ Lifecycle and administrative safety:
   duplicate-option bypasses such as `XREAD STREAMS COUNT ...`;
 - ordinary Redis-compatible commands and the public port are preserved: a rejection does not close
   the connection and subsequent `SET`/`GET` succeed;
-- `/api/execute` applies the identical policy and answers `403` for refused commands;
+- `/api/execute` applies the shared command policy and answers `403` for refused commands; it
+  additionally answers `409` for `SELECT` because HTTP requests are stateless/new-connection, while
+  persistent public RESP connections retain allowed database selection;
 - any Ferrite child exit that the launcher did not initiate is an error, including `exit(0)`;
 - the proxy bounds request line length, per-argument and total request size, argument count,
   concurrent connections, client idle time, and response-write time;
@@ -217,8 +243,9 @@ Lifecycle and administrative safety:
 - one launcher-owned 32-permit semaphore limits aggregate Ferrite backend work across public RESP
   commands and HTTP execute/key-detail/health requests; acquisition never waits, overload returns
   HTTP `429` or a RESP error without forwarding, and health deliberately follows the same simple
-  fail-fast rule so a saturated pool cannot deadlock a probe. RESP permits remain held until the
-  bounded response write completes or its strict two-second deadline expires;
+  fail-fast rule so the API cannot deadlock. Container health is independent of this public path and
+  probes the private child directly with `ferrite-cli -p 6380 PING`. RESP permits remain held until
+  the bounded response write completes or its strict two-second deadline expires;
 - HTTP accepts are limited to 32 live connections rather than only limiting handler execution. Each
   accepted HTTP connection owns its permit for its full lifetime and expires after 30 seconds;
 - HTTP and RESP service tasks have explicit single ownership: a selected completed handle is removed
@@ -259,7 +286,7 @@ Request memory bounds:
 
 ## Runtime Verification Completed
 
-- 74 `playground-launcher` unit tests pass (`cargo test`), run from `tests/run.sh` via
+- 76 `playground-launcher` unit tests pass (`cargo test`), run from `tests/run.sh` via
   `tests/test_playground_launcher_unit.sh` and from a dedicated CI job, including a slow-partial-client
   test proving a stalled declared bulk is disconnected and its request-byte budget reservation is
   released at the read deadline, and a concurrent-declared-bulk test proving the shared budget caps
@@ -279,6 +306,11 @@ Request memory bounds:
   and returned v0.4.0 over a random published 8080 port.
 - Bidirectional runtime tests proved RESP writes are visible through HTTP key detail and HTTP command writes
   are visible through the public RESP port.
+- Runtime saturation fills every public HTTP connection slot: a new `/api/health` request times out
+  while the image's exact internal `ferrite-cli -p 6380 PING` health command still returns `PONG`.
+- HTTP `SELECT` is rejected with `409` and a stateless-request explanation; a persistent public RESP
+  session successfully selects database 5 across `SET`/`GET`, while a fresh connection remains on
+  database 0.
 - Playground process inspection showed the launcher supervising the Ferrite child; plain `docker stop`
   (without a timeout override) completed before Docker's default SIGKILL deadline, the container exited
   with code 0, and no child/container process leaked.

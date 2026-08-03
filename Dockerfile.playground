@@ -96,9 +96,9 @@ FROM debian:bookworm-slim AS runtime
 # pinned/overridden value inside this stage.
 ARG FERRITE_VERSION
 
-# CA roots and runtime OpenSSL linkage, plus curl for the real HTTP healthcheck.
+# CA roots and runtime OpenSSL linkage.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates curl libssl3 \
+    && apt-get install -y --no-install-recommends ca-certificates libssl3 \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /app/target/release/ferrite /usr/local/bin/ferrite
@@ -118,9 +118,10 @@ ENV RUST_LOG=ferrite=info \
 # public RESP proxy (the Ferrite child itself is only bound to 127.0.0.1:6380).
 EXPOSE 8080 6379
 
-# Probe the actual RESP-backed HTTP endpoint served by the launcher.
+# Probe the Ferrite child directly on its private loopback port. Public
+# HTTP/RESP saturation must not make the container appear unhealthy.
 HEALTHCHECK --interval=30s --timeout=3s --retries=3 \
-    CMD curl --fail --silent --show-error http://127.0.0.1:8080/api/health >/dev/null || exit 1
+    CMD ["/usr/local/bin/ferrite-cli", "-p", "6380", "PING"]
 
 USER ferrite
 

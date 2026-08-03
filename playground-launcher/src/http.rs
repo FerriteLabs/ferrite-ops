@@ -242,6 +242,18 @@ async fn execute(State(state): State<AppState>, Json(request): Json<ExecuteReque
         Err(error) => return api_response(StatusCode::BAD_REQUEST, ApiResponse::error(error)),
     };
 
+    if arguments
+        .first()
+        .is_some_and(|command| command.eq_ignore_ascii_case("SELECT"))
+    {
+        return api_response(
+            StatusCode::CONFLICT,
+            ApiResponse::error(
+                "SELECT is not available through stateless HTTP requests; use one persistent public RESP connection to retain database selection",
+            ),
+        );
+    }
+
     let decision = policy::classify_arguments(&arguments);
     if !decision.is_allowed() {
         return api_response(
@@ -559,6 +571,20 @@ mod tests {
             upstream.received_commands().await,
             vec!["PING", "ECHO", "SET", "GET", "LRANGE", "XRANGE"]
         );
+    }
+
+    #[tokio::test]
+    async fn rejects_select_over_stateless_http_without_forwarding() {
+        let upstream = MockFerrite::start().await;
+        let state = state(&upstream, "test");
+
+        let (status, body) = call(state, execute_request("select 5")).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["success"], json!(false));
+        let error = body["error"].as_str().unwrap();
+        assert!(error.contains("stateless HTTP"));
+        assert!(error.contains("persistent public RESP"));
+        assert!(upstream.received_commands().await.is_empty());
     }
 
     #[tokio::test]

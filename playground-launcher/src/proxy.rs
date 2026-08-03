@@ -761,6 +761,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn preserves_select_state_on_a_persistent_public_resp_connection() {
+        let upstream = MockFerrite::start().await;
+        let addr = start_proxy(upstream.leaked_addr()).await;
+        let mut client = crate::testing::RespClient::connect(&addr).await;
+
+        assert_eq!(
+            client.command(&["SELECT", "5"]).await,
+            RespValue::Simple("OK".into())
+        );
+        assert_eq!(
+            client
+                .command(&["SET", "selected-key", "selected-value"])
+                .await,
+            RespValue::Simple("OK".into())
+        );
+        assert_eq!(
+            client.command(&["GET", "selected-key"]).await,
+            RespValue::Bulk(Some(b"selected-value".to_vec()))
+        );
+
+        let commands = upstream.session_commands().await;
+        assert!(commands.iter().any(|command| {
+            command.name == "SET"
+                && command.arguments == ["selected-key", "selected-value"]
+                && command.database == 5
+        }));
+        assert!(commands.iter().any(|command| {
+            command.name == "GET" && command.arguments == ["selected-key"] && command.database == 5
+        }));
+    }
+
+    #[tokio::test]
     async fn oversized_reply_closes_a_selected_client_without_resetting_to_database_zero() {
         let upstream = MockFerrite::start().await;
         upstream

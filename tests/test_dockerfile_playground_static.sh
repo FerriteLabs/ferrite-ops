@@ -49,13 +49,20 @@ fi
 assert_eq 0 "$INVALID_COPY_SYNTAX" "no COPY/ADD instruction embeds shell operators (||, &&, redirection)"
 
 # 3. The repository-owned launcher must provide its own RESP-backed HTTP
-#    server and the healthcheck must probe its real HTTP endpoint.
+#    server, while container health probes the private Ferrite child directly
+#    so public HTTP/RESP saturation cannot create a false unhealthy result.
 assert_contains "$CONTENT" "HEALTHCHECK" "Dockerfile.playground defines a HEALTHCHECK"
 RUNTIME_STAGE_BODY="$(sed -n '/^FROM debian:bookworm-slim AS runtime$/,$p' "$DOCKERFILE")"
 assert_contains "$CONTENT" "COPY playground-launcher /app/playground-launcher" "builder includes the repository-owned runtime launcher"
 assert_contains "$CONTENT" "--manifest-path /app/playground-launcher/Cargo.toml" "builder compiles the launcher crate against fetched source"
 assert_contains "$RUNTIME_STAGE_BODY" "ferrite-playground-launcher" "runtime stage includes the compiled launcher"
-assert_contains "$RUNTIME_STAGE_BODY" "curl --fail --silent --show-error http://127.0.0.1:8080/api/health" "HEALTHCHECK probes the actual playground HTTP endpoint"
+assert_contains "$RUNTIME_STAGE_BODY" \
+  'CMD ["/usr/local/bin/ferrite-cli", "-p", "6380", "PING"]' \
+  "HEALTHCHECK probes the internal loopback Ferrite child directly"
+assert_not_contains "$RUNTIME_STAGE_BODY" "http://127.0.0.1:8080/api/health" \
+  "HEALTHCHECK is independent of the saturable public HTTP service"
+assert_not_contains "$RUNTIME_STAGE_BODY" "apt-get install -y --no-install-recommends ca-certificates curl" \
+  "runtime image no longer installs curl solely for health checking"
 INVALID_HEALTHCHECK=0
 if grep -A2 '^HEALTHCHECK' "$DOCKERFILE" | grep -E 'CMD\s*\[.*\]\s*(\|\||&&)' >/dev/null; then
   INVALID_HEALTHCHECK=1
@@ -122,6 +129,8 @@ assert_not_contains "$SUPERVISOR_CONTENT" '"0.0.0.0"' "Ferrite child is never bo
 assert_contains "$PROXY_CONTENT" 'PUBLIC_RESP_ADDR: &str = "0.0.0.0:6379"' "launcher owns the public Redis-compatible port 6379"
 assert_contains "$PROXY_CONTENT" "policy::classify_bytes" "public RESP proxy classifies every command before forwarding"
 assert_contains "$HTTP_CONTENT" "policy::classify_arguments" "HTTP /api/execute classifies every command with the same policy"
+assert_contains "$HTTP_CONTENT" "SELECT is not available through stateless HTTP requests" \
+  "HTTP /api/execute clearly rejects connection-scoped SELECT"
 assert_contains "$POLICY_CONTENT" "const POLICIES:" "shared command policy is an explicit allowlist"
 assert_contains "$POLICY_CONTENT" "the command is not on the explicit safe-command allowlist" \
   "commands outside the explicit allowlist are rejected by default"

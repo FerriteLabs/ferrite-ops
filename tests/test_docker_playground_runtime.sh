@@ -29,8 +29,18 @@ IMAGE_TAG="ferrite-ops-playground-runtime:$$"
 CONTAINER_ID=""
 BUILD_LOG="$(mktemp)"
 RUN_LOG="$(mktemp)"
+SATURATION_FDS=()
+
+release_saturation_connections() {
+  local fd
+  for fd in "${SATURATION_FDS[@]}"; do
+    exec {fd}>&-
+  done
+  SATURATION_FDS=()
+}
 
 cleanup() {
+  release_saturation_connections
   if [[ -n "$CONTAINER_ID" ]]; then
     docker rm -f "$CONTAINER_ID" >/dev/null 2>&1 || true
   fi
@@ -61,6 +71,31 @@ resp_cmd() {
   else
     printf '%s' "${line1#[-+:]}"
   fi
+}
+
+resp_select_session() {
+  local host="$1" port="$2" fd line reply output=""
+  exec {fd}<>"/dev/tcp/${host}/${port}" || return 1
+  {
+    printf '*2\r\n$6\r\nSELECT\r\n$1\r\n5\r\n'
+    printf '*3\r\n$3\r\nSET\r\n$12\r\nselected-key\r\n$14\r\nselected-value\r\n'
+    printf '*2\r\n$3\r\nGET\r\n$12\r\nselected-key\r\n'
+  } >&"${fd}"
+
+  for _ in 1 2 3; do
+    IFS=$'\r' read -r -t 5 line <&"${fd}" || break
+    case "$line" in
+      +*|-*|:*) reply="${line#?}" ;;
+      \$-1) reply="nil" ;;
+      \$*)
+        IFS=$'\r' read -r -t 5 reply <&"${fd}" || reply=""
+        ;;
+      *) reply="$line" ;;
+    esac
+    output+="${reply}|"
+  done
+  exec {fd}>&-
+  printf '%s' "${output%|}"
 }
 
 if docker build -f "${REPO_ROOT}/Dockerfile.playground" -t "$IMAGE_TAG" "$REPO_ROOT" \
@@ -98,6 +133,31 @@ assert_contains "$HEALTH" '"success":true' "HTTP health succeeds only after the 
 assert_contains "$HEALTH" "\"version\":\"${EXPECTED_VERSION}\"" \
   "HTTP health reports the active Ferrite version"
 
+# Fill every public HTTP connection slot with an incomplete request. The exact
+# Docker HEALTHCHECK command must still reach the private Ferrite child even
+# while a new public HTTP health request cannot be accepted.
+for _ in $(seq 1 40); do
+  if exec {fd}<>"/dev/tcp/127.0.0.1/${HTTP_PORT}"; then
+    printf 'POST /api/execute HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: 65536\r\n\r\n{' \
+      >&"${fd}" || true
+    SATURATION_FDS+=("$fd")
+  fi
+done
+sleep 1
+SATURATED_HTTP_CODE="$(curl -sS --max-time 1 -o /dev/null -w '%{http_code}' \
+  "http://127.0.0.1:${HTTP_PORT}/api/health" 2>/dev/null || true)"
+assert_eq "000" "$SATURATED_HTTP_CODE" \
+  "public HTTP health endpoint is unavailable when all public connections are saturated"
+INTERNAL_HEALTH="$(docker exec "$CONTAINER_ID" \
+  /usr/local/bin/ferrite-cli -p 6380 PING 2>/dev/null || true)"
+assert_eq "PONG" "$INTERNAL_HEALTH" \
+  "internal ferrite-cli health probe succeeds despite public HTTP saturation"
+HEALTHCHECK_TEST="$(docker inspect --format='{{json .Config.Healthcheck.Test}}' \
+  "$CONTAINER_ID" 2>/dev/null || true)"
+assert_contains "$HEALTHCHECK_TEST" '"/usr/local/bin/ferrite-cli","-p","6380","PING"' \
+  "running image healthcheck is the direct internal Ferrite probe"
+release_saturation_connections
+
 INDEX="$(curl -fsS --max-time 5 "http://127.0.0.1:${HTTP_PORT}/" 2>/dev/null || true)"
 assert_contains "$INDEX" 'id="command-form"' "root serves an interactive command form"
 assert_contains "$INDEX" 'fetch("/api/execute"' "interactive page submits commands to the JSON API"
@@ -119,6 +179,26 @@ assert_contains "$HTTP_SET" '"data":"OK"' "HTTP execute returns Ferrite's real R
 
 RESP_GET="$(resp_cmd 127.0.0.1 "$RESP_PORT" GET from-http 2>/dev/null || true)"
 assert_eq "visible-over-resp" "$RESP_GET" "data written through HTTP is visible through public RESP"
+
+# HTTP requests create a fresh backend connection for every command, so
+# connection-scoped SELECT is rejected rather than pretending its state will
+# survive. The persistent public RESP proxy continues to support SELECT.
+HTTP_SELECT="$(curl -s --max-time 5 -o /dev/stdout -w '\n%{http_code}' -X POST \
+  -H 'content-type: application/json' \
+  --data '{"command":"SELECT 5"}' \
+  "http://127.0.0.1:${HTTP_PORT}/api/execute" 2>/dev/null || true)"
+assert_contains "$HTTP_SELECT" '409' "HTTP SELECT is rejected with a clear 4xx response"
+assert_contains "$HTTP_SELECT" 'stateless HTTP' \
+  "HTTP SELECT explains that request state cannot persist"
+assert_contains "$HTTP_SELECT" 'persistent public RESP' \
+  "HTTP SELECT directs clients to the stateful RESP endpoint"
+
+RESP_SELECT_OUTPUT="$(resp_select_session 127.0.0.1 "$RESP_PORT" 2>/dev/null || true)"
+assert_eq "OK|OK|selected-value" "$RESP_SELECT_OUTPUT" \
+  "SELECT state persists across commands on one public RESP connection"
+DEFAULT_DATABASE_VALUE="$(resp_cmd 127.0.0.1 "$RESP_PORT" GET selected-key 2>/dev/null || true)"
+assert_not_contains "$DEFAULT_DATABASE_VALUE" "selected-value" \
+  "a fresh public RESP connection remains in database zero"
 
 # --- RESP3 compatibility ------------------------------------------------------
 # Clients may negotiate RESP3 with HELLO 3 on the public port; the launcher's
