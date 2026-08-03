@@ -9,6 +9,10 @@
 # --build-arg FERRITE_SOURCE_URL=... (e.g. to build from a fork or a local
 # mirror) without changing the FERRITE_VERSION default.
 # Override at build time: docker build --build-arg FERRITE_VERSION=0.4.0
+#   --build-arg FERRITE_SOURCE_SHA256=<sha256 of that version's tarball>
+# FERRITE_SOURCE_SHA256 is required: any override of FERRITE_VERSION and/or
+# FERRITE_SOURCE_URL must be paired with the matching tarball's SHA256, or
+# the build fails during the `source` stage (see below).
 ARG FERRITE_VERSION=0.3.0
 FROM rust:1.95-slim-bookworm AS chef
 
@@ -27,13 +31,29 @@ FROM chef AS source
 ARG FERRITE_VERSION
 ARG FERRITE_SOURCE_URL=https://github.com/FerriteLabs/ferrite/archive/refs/tags/v${FERRITE_VERSION}.tar.gz
 
+# SHA256 of the fetched source tarball. Required and verified before
+# extraction: a build with a missing, empty, or mismatched value fails
+# loudly rather than silently trusting an unverified download. The
+# default below is the real, verified SHA256 of the default
+# FERRITE_VERSION's tarball (v0.3.0) at the URL above. Any override of
+# FERRITE_VERSION and/or FERRITE_SOURCE_URL (e.g. a fork, a newer release,
+# or a local mirror) must also pass a matching --build-arg
+# FERRITE_SOURCE_SHA256=<sha256 of that exact tarball> — the v0.3.0
+# default will not match a different tarball and the build will fail.
+ARG FERRITE_SOURCE_SHA256=42cc9cd06b85fac0a09d6e1770d3eda61375324211be168dfb6dc7eab5825979
+
 # The upstream source ships a dev-convenience .cargo/config.toml that pins
 # a clang+mold linker for faster local rebuilds. Per that file's own
 # comment it is not meant to affect CI/release builds, but Cargo applies
 # it regardless of profile, and this minimal image intentionally doesn't
 # install clang/mold. It is removed below so the container build uses the
 # default toolchain linker (gcc, already present in this image).
-RUN curl -fsSL "$FERRITE_SOURCE_URL" -o /tmp/ferrite-src.tar.gz \
+RUN if [ -z "$FERRITE_SOURCE_SHA256" ]; then \
+        echo "error: FERRITE_SOURCE_SHA256 build-arg is required to verify the fetched Ferrite source tarball; refusing to build without it." >&2; \
+        exit 1; \
+    fi \
+    && curl -fsSL "$FERRITE_SOURCE_URL" -o /tmp/ferrite-src.tar.gz \
+    && echo "${FERRITE_SOURCE_SHA256}  /tmp/ferrite-src.tar.gz" | sha256sum -c - \
     && mkdir -p /app \
     && tar -xzf /tmp/ferrite-src.tar.gz -C /app --strip-components=1 \
     && rm -f /tmp/ferrite-src.tar.gz \

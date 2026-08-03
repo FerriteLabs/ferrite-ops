@@ -124,4 +124,26 @@ if [[ -f "$EXAMPLE_TOML" ]]; then
     "ferrite.example.toml keeps its documented 127.0.0.1 default for server and metrics binds"
 fi
 
+# 11. Source integrity: FERRITE_SOURCE_SHA256 must be declared, default to
+#     the verified v0.3.0 tarball digest, and be checked before extraction
+#     (i.e. the sha256sum verification must appear before the `tar`
+#     extraction step in the source stage).
+EXPECTED_SHA256="42cc9cd06b85fac0a09d6e1770d3eda61375324211be168dfb6dc7eab5825979"
+ACTUAL_SHA256_DEFAULT="$(grep -oE '^ARG FERRITE_SOURCE_SHA256=[0-9a-fA-F]+' "$DOCKERFILE" | head -1 | cut -d= -f2)"
+assert_eq "$EXPECTED_SHA256" "${ACTUAL_SHA256_DEFAULT:-}" \
+  "ARG FERRITE_SOURCE_SHA256 defaults to the verified v0.3.0 tarball SHA256"
+
+SOURCE_STAGE_BODY="$(sed -n '/^FROM chef AS source$/,/^FROM chef AS planner$/p' "$DOCKERFILE")"
+assert_contains "$SOURCE_STAGE_BODY" "sha256sum -c -" \
+  "source stage verifies the fetched tarball with sha256sum"
+assert_contains "$SOURCE_STAGE_BODY" 'if [ -z "$FERRITE_SOURCE_SHA256" ]' \
+  "source stage refuses to build when FERRITE_SOURCE_SHA256 is empty (required, not optional)"
+
+SHA_CHECK_LINE="$(grep -n 'sha256sum -c -' "$DOCKERFILE" | head -1 | cut -d: -f1)"
+TAR_EXTRACT_LINE="$(grep -n 'tar -xzf /tmp/ferrite-src.tar.gz' "$DOCKERFILE" | head -1 | cut -d: -f1)"
+if [[ -n "$SHA_CHECK_LINE" && -n "$TAR_EXTRACT_LINE" ]]; then
+  assert_true "$( [[ "$SHA_CHECK_LINE" -lt "$TAR_EXTRACT_LINE" ]]; echo $? )" \
+    "checksum verification happens before tarball extraction"
+fi
+
 harness_summary
