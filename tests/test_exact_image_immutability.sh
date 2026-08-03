@@ -141,6 +141,7 @@ if [ "${1:-}" = "buildx" ] && [ "${2:-}" = "imagetools" ] && [ "${3:-}" = "inspe
 fi
 
 if [ "${1:-}" = "buildx" ] && [ "${2:-}" = "imagetools" ] && [ "${3:-}" = "create" ]; then
+  ORIGINAL_ARGS="$*"
   shift 3
   TAGS=()
   SOURCE_REF=""
@@ -156,7 +157,7 @@ if [ "${1:-}" = "buildx" ] && [ "${2:-}" = "imagetools" ] && [ "${3:-}" = "creat
     mv "${REGISTRY_MANIFEST}.tmp" "$REGISTRY_MANIFEST"
     printf '%s %s created created\n' "$full_tag" "$DIGEST" >> "$REGISTRY_MANIFEST"
   done
-  printf '%s\n' "$*" >> "$DOCKER_LOG"
+  printf '%s\n' "$ORIGINAL_ARGS" >> "$DOCKER_LOG"
   exit 0
 fi
 
@@ -363,6 +364,20 @@ if run_promote_exact "0.7.1" "sha256:${ONES}" "true" "${TMP}/dockerhub_match.out
     "a matching Docker Hub exact tag remains untouched (idempotent)"
 else
   harness_fail "promote-exact unexpectedly failed with a matching Docker Hub tag: $(cat "${TMP}/dockerhub_match.out")"
+fi
+
+# --- Docker Hub: idempotent GHCR retry can backfill a missing mirror -------
+: > "$REGISTRY_MANIFEST"
+manifest_set "${GHCR_IMAGE}:0.7.2" "sha256:${ONES}" "0.7.2" "$ZERO"
+if run_promote_exact "0.7.2" "sha256:${ONES}" "true" "${TMP}/dockerhub_backfill.out"; then
+  assert_eq "sha256:${ONES}" "$(manifest_digest_of "${DOCKERHUB_IMAGE}:0.7.2")" \
+    "an idempotent GHCR retry backfills a missing Docker Hub exact tag"
+  assert_eq \
+    "buildx imagetools create --tag ${DOCKERHUB_IMAGE}:0.7.2 ${GHCR_IMAGE}@sha256:${ONES}" \
+    "$(cat "$DOCKER_LOG")" \
+    "Docker Hub backfill copies only from the verified GHCR digest"
+else
+  harness_fail "promote-exact could not backfill a missing Docker Hub tag from verified GHCR: $(cat "${TMP}/dockerhub_backfill.out")"
 fi
 
 # --- Invalid inputs are rejected defensively --------------------------------

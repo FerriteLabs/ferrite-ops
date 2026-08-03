@@ -567,24 +567,27 @@ which would incorrectly skip a legitimate backport to an older series.
   ONLY place that ever creates or touches the exact version tag: it re-checks immediately beforehand
   whether the exact tag already exists on GHCR and, independently, on the optional Docker Hub mirror — a
   match is left untouched (idempotent no-op), and a tag pointing at a *different* digest is refused
-  outright on EITHER registry rather than overwritten. Because promote-exact runs only after every prior
-  job has succeeded, a failed run can never leave an unverified exact tag behind: the exact tag is the last
-  thing this workflow ever writes, not the first. The throwaway candidate tag is intentionally left in the
-  registry as a harmless, clearly-named artifact; registry-level retention/cleanup of `candidate-*` tags
-  is a documented follow-up rather than implemented here, since it is a registry-hygiene concern, not a
-  correctness gap — a candidate tag is never treated as, confused with, or promotable in place of, an
-  exact release tag.
+  outright on EITHER registry rather than overwritten. Docker Hub promotion always copies from the
+  signed, metadata-verified GHCR digest, so an idempotent retry can safely backfill a mirror that was
+  disabled during the original release without assuming that digest already exists in Docker Hub.
+  Because promote-exact runs only after every prior job has succeeded, a failed run can never leave an
+  unverified exact tag behind: the exact tag is the last thing this workflow ever writes, not the first.
+  The throwaway candidate tag is intentionally left in the registry as a harmless, clearly-named artifact;
+  registry-level retention/cleanup of `candidate-*` tags is a documented follow-up rather than implemented
+  here, since it is a registry-hygiene concern, not a correctness gap — a candidate tag is never treated
+  as, confused with, or promotable in place of, an exact release tag.
 - `promote-stable` now independently resolves and gates each of `latest`, `<major>`, and `<major>.<minor>`
   against its OWN currently promoted version (`Resolve current per-tag promoted versions` /
   `Promote floating tags to this digest`, replacing the previous single bundled `latest`-only gate).
   A backport release (e.g. `1.9.1` published after `2.0.0`) now correctly leaves `latest` alone (`1.9.1` <
   `2.0.0`) while still independently advancing `1` and `1.9` because `1.9.1` is newer than whatever they
   currently point at.
-- `tests/test_exact_image_immutability.sh` (38 checks) functionally replays `check_existing` (first
+- `tests/test_exact_image_immutability.sh` (40 checks) functionally replays `check_existing` (first
   publish, verified idempotent match, mismatched version/checksum labels, an unsigned existing tag) and
   `promote-exact` (first publish, idempotent retry, a simulated concurrent same-version run, a digest
-  mismatch on GHCR and independently on Docker Hub, a matching Docker Hub tag, and invalid
-  version/digest input) against a stateful fake registry and fake `cosign`.
+  mismatch on GHCR and independently on Docker Hub, a matching Docker Hub tag, a missing Docker Hub tag
+  backfilled from verified GHCR, and invalid version/digest input) against a stateful fake registry and
+  fake `cosign`.
   `tests/test_release_promotion.sh` (32 checks) is rewritten for independent per-tag gating and adds the
   exact 1.9.1-after-2.0.0 backport scenario, proving `latest` is skipped while `1` and `1.9` still advance.
   `tests/test_release_workflows.sh` is updated throughout for the candidate-tag build target.

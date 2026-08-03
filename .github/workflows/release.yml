@@ -580,7 +580,7 @@ jobs:
           # fatal on both registries — Docker Hub must never overwrite a
           # different existing digest either.
           promote_exact_tag() {
-            local image="$1" required="$2"
+            local image="$1" source_image="$2" required="$3"
             local err_log existing_digest
             err_log="$(mktemp)"
             if existing_digest="$(docker buildx imagetools inspect "${image}:${VERSION}" --format '{{json .Manifest}}' 2>"$err_log" | jq -r '.digest // empty')" \
@@ -595,8 +595,8 @@ jobs:
             fi
             if grep -qiE 'not found|manifest unknown|no such manifest|MANIFEST_UNKNOWN' "$err_log"; then
               rm -f "$err_log"
-              echo "::notice::Promoting ${image}:${VERSION} -> ${DIGEST}"
-              docker buildx imagetools create --tag "${image}:${VERSION}" "${image}@${DIGEST}"
+              echo "::notice::Promoting ${image}:${VERSION} -> ${DIGEST} from verified source ${source_image}@${DIGEST}"
+              docker buildx imagetools create --tag "${image}:${VERSION}" "${source_image}@${DIGEST}"
               return 0
             fi
             echo "::error::Could not determine whether ${image}:${VERSION} already exists:"
@@ -609,10 +609,13 @@ jobs:
             return 0
           }
 
-          promote_exact_tag "$GHCR_IMAGE" true
+          promote_exact_tag "$GHCR_IMAGE" "$GHCR_IMAGE" true
 
           if [ "$DOCKERHUB_ENABLED" = "true" ]; then
-            promote_exact_tag "$DOCKERHUB_IMAGE" false
+            # GHCR is the signed, metadata-verified source of truth. Copying
+            # from it also lets an idempotent retry safely backfill Docker
+            # Hub when that mirror was disabled during the original release.
+            promote_exact_tag "$DOCKERHUB_IMAGE" "$GHCR_IMAGE" false
           fi
 
           echo "::notice::Exact version tag ${VERSION} is now published and verified at ${DIGEST}."
