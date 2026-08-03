@@ -79,17 +79,17 @@ async fn run() -> Result<(), String> {
     };
 
     let (http_shutdown_tx, http_shutdown_rx) = oneshot::channel::<()>();
-    let mut http_server: JoinHandle<Result<(), String>> = tokio::spawn(async move {
+    let mut http_server: Option<JoinHandle<Result<(), String>>> = Some(tokio::spawn(async move {
         axum::serve(http_listener, http::router(state))
             .with_graceful_shutdown(async {
                 let _ = http_shutdown_rx.await;
             })
             .await
             .map_err(|error| format!("HTTP playground server failed: {error}"))
-    });
+    }));
 
     let (proxy_shutdown_tx, proxy_shutdown_rx) = oneshot::channel::<()>();
-    let mut resp_proxy: JoinHandle<Result<(), String>> = tokio::spawn(async move {
+    let mut resp_proxy: Option<JoinHandle<Result<(), String>>> = Some(tokio::spawn(async move {
         proxy::serve(
             proxy_listener,
             supervisor::INTERNAL_RESP_ADDR,
@@ -97,7 +97,7 @@ async fn run() -> Result<(), String> {
             proxy_shutdown_rx,
         )
         .await
-    });
+    }));
 
     eprintln!(
         "Ferrite Playground ready: HTTP {}, public RESP {} (Ferrite child on {})",
@@ -124,21 +124,23 @@ async fn run() -> Result<(), String> {
                 Err(error) => Err(error),
             }
         }
-        result = &mut resp_proxy => {
+        result = resp_proxy.as_mut().expect("RESP proxy task is present") => {
+            resp_proxy.take();
             supervisor::stop(&mut ferrite).await;
-            match result {
-                Ok(Ok(())) => Err("public RESP proxy exited unexpectedly".to_string()),
-                Ok(Err(error)) => Err(error),
-                Err(error) => Err(format!("public RESP proxy task failed: {error}")),
-            }
+            unexpected_service_result(
+                result,
+                "public RESP proxy exited unexpectedly",
+                "public RESP proxy",
+            )
         }
-        result = &mut http_server => {
+        result = http_server.as_mut().expect("HTTP server task is present") => {
+            http_server.take();
             supervisor::stop(&mut ferrite).await;
-            match result {
-                Ok(Ok(())) => Err("HTTP playground server exited unexpectedly".to_string()),
-                Ok(Err(error)) => Err(error),
-                Err(error) => Err(format!("HTTP playground task failed: {error}")),
-            }
+            unexpected_service_result(
+                result,
+                "HTTP playground server exited unexpectedly",
+                "HTTP playground",
+            )
         }
     };
 
@@ -153,18 +155,35 @@ async fn run() -> Result<(), String> {
 }
 
 async fn join_service(
-    service: &mut JoinHandle<Result<(), String>>,
+    service: &mut Option<JoinHandle<Result<(), String>>>,
     grace: Duration,
     name: &str,
 ) -> Result<(), String> {
-    match timeout(grace, &mut *service).await {
+    let Some(mut service) = service.take() else {
+        return Ok(());
+    };
+
+    match timeout(grace, &mut service).await {
         Ok(Ok(result)) => result,
         Ok(Err(error)) if error.is_cancelled() => Ok(()),
         Ok(Err(error)) => Err(format!("{name} task failed: {error}")),
         Err(_) => {
             service.abort();
+            let _ = service.await;
             Err(format!("timed out waiting for {name} shutdown"))
         }
+    }
+}
+
+fn unexpected_service_result(
+    result: Result<Result<(), String>, tokio::task::JoinError>,
+    unexpected_exit: &str,
+    task_name: &str,
+) -> Result<(), String> {
+    match result {
+        Ok(Ok(())) => Err(unexpected_exit.to_string()),
+        Ok(Err(error)) => Err(error),
+        Err(error) => Err(format!("{task_name} task failed: {error}")),
     }
 }
 
@@ -188,4 +207,74 @@ async fn shutdown_signal() -> Result<(), String> {
     tokio::signal::ctrl_c()
         .await
         .map_err(|error| format!("failed to wait for Ctrl-C: {error}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn cleanup_consumes_a_service_handle_only_once() {
+        let mut service = Some(tokio::spawn(async { Ok(()) }));
+        assert!(
+            join_service(&mut service, Duration::from_secs(1), "test service")
+                .await
+                .is_ok()
+        );
+        assert!(service.is_none());
+        assert!(
+            join_service(&mut service, Duration::from_secs(1), "test service")
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn selected_service_errors_are_preserved_without_polling_again() {
+        let mut service = Some(tokio::spawn(async {
+            Err("original service error".to_string())
+        }));
+        let result = service.as_mut().expect("service exists").await;
+        service.take();
+
+        assert_eq!(
+            unexpected_service_result(
+                result,
+                "public RESP proxy exited unexpectedly",
+                "public RESP proxy",
+            )
+            .unwrap_err(),
+            "original service error"
+        );
+        assert!(
+            join_service(&mut service, Duration::from_millis(10), "public RESP proxy")
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn unexpected_clean_http_and_resp_exits_keep_the_service_name() {
+        let http = tokio::spawn(async { Ok(()) }).await;
+        let resp = tokio::spawn(async { Ok(()) }).await;
+
+        assert_eq!(
+            unexpected_service_result(
+                http,
+                "HTTP playground server exited unexpectedly",
+                "HTTP playground",
+            )
+            .unwrap_err(),
+            "HTTP playground server exited unexpectedly"
+        );
+        assert_eq!(
+            unexpected_service_result(
+                resp,
+                "public RESP proxy exited unexpectedly",
+                "public RESP proxy",
+            )
+            .unwrap_err(),
+            "public RESP proxy exited unexpectedly"
+        );
+    }
 }
