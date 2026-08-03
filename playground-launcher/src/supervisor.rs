@@ -129,6 +129,24 @@ pub async fn stop_with_timeout(child: &mut Child, grace: Duration) -> Result<Exi
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Stdio;
+    use tokio::io::{AsyncBufReadExt, BufReader};
+
+    #[cfg(unix)]
+    async fn spawn_ready_signal_test_child(trap: &str) -> Child {
+        let script = format!("trap '{trap}' TERM; printf 'ready\\n'; while :; do :; done");
+        let mut child = Command::new("sh")
+            .args(["-c", &script])
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let stdout = child.stdout.take().expect("test child stdout is piped");
+        let mut stdout = BufReader::new(stdout);
+        let mut ready = String::new();
+        stdout.read_line(&mut ready).await.unwrap();
+        assert_eq!(ready, "ready\n");
+        child
+    }
 
     #[test]
     fn child_is_bound_to_the_internal_loopback_port_only() {
@@ -160,12 +178,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn sends_sigterm_and_reaps_cooperative_child() {
-        let mut child = Command::new("sh")
-            .args(["-c", "trap 'exit 0' TERM; while :; do :; done"])
-            .spawn()
-            .unwrap();
-        // Give the shell time to install its trap even on a loaded machine.
-        sleep(Duration::from_millis(250)).await;
+        let mut child = spawn_ready_signal_test_child("exit 0").await;
 
         let status = stop_with_timeout(&mut child, Duration::from_secs(1))
             .await
@@ -177,12 +190,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn escalates_to_sigkill_and_reaps_uncooperative_child() {
-        let mut child = Command::new("sh")
-            .args(["-c", "trap '' TERM; while :; do :; done"])
-            .spawn()
-            .unwrap();
-        // Give the shell time to install its trap even on a loaded machine.
-        sleep(Duration::from_millis(250)).await;
+        let mut child = spawn_ready_signal_test_child("").await;
 
         let status = timeout(
             Duration::from_secs(1),
