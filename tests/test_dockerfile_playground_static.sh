@@ -45,18 +45,14 @@ if grep -E '^\s*(COPY|ADD)\s.*(\|\||&&|[0-9]?>)' "$DOCKERFILE" >/dev/null; then
 fi
 assert_eq 0 "$INVALID_COPY_SYNTAX" "no COPY/ADD instruction embeds shell operators (||, &&, redirection)"
 
-# 3. HEALTHCHECK must still be present and functional. The pinned v0.3.0
-#    executable does not serve the previously assumed studio HTTP endpoint,
-#    so probe the actual RESP service using the CLI built from the same
-#    verified source instead of depending on curl or a nonexistent route.
+# 3. The repository-owned launcher must build against ferrite-studio from the
+#    fetched source and the healthcheck must probe its real HTTP endpoint.
 assert_contains "$CONTENT" "HEALTHCHECK" "Dockerfile.playground defines a HEALTHCHECK"
 RUNTIME_STAGE_BODY="$(sed -n '/^FROM debian:bookworm-slim AS runtime$/,$p' "$DOCKERFILE")"
-assert_contains "$CONTENT" "--features ferrite-studio" "builder enables the playground's ferrite-studio dependency directly"
-assert_contains "$CONTENT" "--bin ferrite --bin ferrite-cli" "builder produces ferrite-cli alongside the server for the runtime healthcheck"
-assert_not_contains "$CONTENT" "2>/dev/null ||" "builder does not hide feature-build errors behind a silent fallback"
-assert_contains "$RUNTIME_STAGE_BODY" "COPY --from=builder /app/target/release/ferrite-cli" "runtime stage includes the healthcheck client built from the same source"
-assert_contains "$RUNTIME_STAGE_BODY" "CMD ferrite-cli PING || exit 1" "HEALTHCHECK probes the actual RESP service rather than an unavailable HTTP endpoint"
-assert_not_contains "$RUNTIME_STAGE_BODY" "localhost:8080/api/v1/health" "HEALTHCHECK does not assume an HTTP endpoint absent from pinned Ferrite v0.3.0"
+assert_contains "$CONTENT" "COPY playground-launcher /app/playground-launcher" "builder includes the repository-owned runtime launcher"
+assert_contains "$CONTENT" "--manifest-path /app/playground-launcher/Cargo.toml" "builder compiles the launcher crate against fetched source"
+assert_contains "$RUNTIME_STAGE_BODY" "ferrite-playground-launcher" "runtime stage includes the compiled launcher"
+assert_contains "$RUNTIME_STAGE_BODY" "curl --fail --silent --show-error http://127.0.0.1:8080/api/health" "HEALTHCHECK probes the actual Studio HTTP endpoint"
 INVALID_HEALTHCHECK=0
 if grep -A2 '^HEALTHCHECK' "$DOCKERFILE" | grep -E 'CMD\s*\[.*\]\s*(\|\||&&)' >/dev/null; then
   INVALID_HEALTHCHECK=1
@@ -90,18 +86,23 @@ assert_contains "$BUILDER_STAGE_FROM" "bookworm" "builder base stage is Debian b
 assert_contains "$RUNTIME_STAGE_FROM" "bookworm" "runtime stage is Debian bookworm (glibc), matching the builder's ABI"
 assert_not_contains "$CONTENT" "FROM alpine" "no build stage uses an Alpine (musl) base image"
 
-# 7. Reachability: the RESP port must not be left on its loopback-only
-#    built-in default (127.0.0.1) — the same class of defect as F-13,
-#    since this Dockerfile passes no config file at all.
-assert_contains "$CONTENT" "FERRITE_BIND=0.0.0.0" "playground's Redis-compatible port is bound to 0.0.0.0, reachable through Docker's published-port mapping"
-assert_contains "$CONTENT" "FERRITE_STUDIO_HOST=0.0.0.0" "playground's studio HTTP port remains bound to 0.0.0.0"
+# 7. Reachability and lifecycle are owned by the launcher rather than unused
+#    environment variables that the upstream executable does not consume.
+LAUNCHER="${REPO_ROOT}/playground-launcher/src/main.rs"
+LAUNCHER_CONTENT="$(cat "$LAUNCHER")"
+assert_contains "$LAUNCHER_CONTENT" 'host: "0.0.0.0".to_string()' "Studio HTTP binds to 0.0.0.0"
+assert_contains "$LAUNCHER_CONTENT" '"--bind"' "launcher explicitly configures the RESP bind address"
+assert_contains "$LAUNCHER_CONTENT" '"0.0.0.0"' "RESP server binds to 0.0.0.0"
+assert_contains "$LAUNCHER_CONTENT" '"6379"' "RESP server listens on port 6379"
+assert_contains "$LAUNCHER_CONTENT" "shutdown_signal" "launcher handles process shutdown signals"
+assert_contains "$LAUNCHER_CONTENT" "stop_child" "launcher cleans up the RESP child process"
+assert_not_contains "$RUNTIME_STAGE_BODY" "FERRITE_STUDIO_ENABLED" "runtime does not rely on unused Studio environment variables"
+assert_not_contains "$RUNTIME_STAGE_BODY" "FERRITE_STUDIO_HOST" "runtime does not rely on an unused Studio host environment variable"
 
-# 8. Distinct purpose preserved: playground-specific ports, entrypoint,
-#    default command, and version default are unchanged.
+# 8. Distinct purpose preserved: image name, ports, and version metadata remain.
 assert_contains "$CONTENT" "EXPOSE 8080 6379" "Dockerfile.playground still exposes both the studio (8080) and Redis-compatible (6379) ports"
-assert_contains "$CONTENT" 'ENTRYPOINT ["ferrite"]' "Dockerfile.playground entrypoint is unchanged"
-assert_contains "$CONTENT" 'CMD ["--port", "6379"]' "Dockerfile.playground default CMD is unchanged"
-assert_contains "$CONTENT" "FERRITE_STUDIO_ENABLED=true" "Dockerfile.playground still enables ferrite-studio"
+assert_contains "$CONTENT" 'ENTRYPOINT ["/usr/local/bin/ferrite-playground-launcher"]' "Dockerfile.playground starts the dual-service launcher"
+assert_contains "$CONTENT" "USER ferrite" "playground runs as an unprivileged user"
 assert_contains "$CONTENT" 'org.opencontainers.image.title="Ferrite Playground"' "Dockerfile.playground keeps its distinct image title"
 assert_contains "$RUNTIME_STAGE_BODY" 'org.opencontainers.image.version="${FERRITE_VERSION}"' "playground image keeps its pinned/overridden version label"
 

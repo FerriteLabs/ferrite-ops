@@ -1,0 +1,11 @@
+[package]
+name = "ferrite-playground-launcher"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+ferrite-studio = { path = "../crates/ferrite-studio" }
+tokio = { version = "1.48", features = ["macros", "process", "rt-multi-thread", "signal", "time"] }
+
+[workspace]

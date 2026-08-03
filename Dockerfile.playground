@@ -70,17 +70,21 @@ RUN rm -f rust-toolchain rust-toolchain.toml \
 # ---------- Build stage ----------
 FROM source AS builder
 
-# Build the playground server binary with the optional ferrite-studio
-# dependency enabled directly, plus ferrite-cli for the runtime healthcheck.
-# The upstream aggregate "experimental" feature also enables unrelated,
-# currently non-buildable v0.3.0 enterprise/Kubernetes handlers; enabling
-# only the feature this image actually needs keeps its purpose explicit.
-# Fail loudly rather than silently falling back to a plain build.
-RUN cargo build --release --features ferrite-studio \
-    --bin ferrite --bin ferrite-cli
+# Build the RESP server and CLI from the fetched, verified Ferrite source.
+RUN cargo build --release --bin ferrite --bin ferrite-cli
 
-# Verify both binaries were built
-RUN ls -lh /app/target/release/ferrite /app/target/release/ferrite-cli
+# The repository-owned launcher directly depends on ferrite-studio from the
+# fetched v0.4.0 source tree. It supervises both the embedded Studio HTTP
+# server and the Ferrite RESP child process.
+COPY playground-launcher /app/playground-launcher
+RUN CARGO_TARGET_DIR=/app/target cargo build --release \
+    --manifest-path /app/playground-launcher/Cargo.toml
+
+# Verify all runtime binaries were built.
+RUN ls -lh \
+    /app/target/release/ferrite \
+    /app/target/release/ferrite-cli \
+    /app/target/release/ferrite-playground-launcher
 
 # ---------- Runtime stage ----------
 FROM debian:bookworm-slim AS runtime
@@ -89,34 +93,32 @@ FROM debian:bookworm-slim AS runtime
 # pinned/overridden value inside this stage.
 ARG FERRITE_VERSION
 
-# CA roots for outbound TLS connections.
+# CA roots and runtime OpenSSL linkage, plus curl for the real HTTP healthcheck.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates \
+    && apt-get install -y --no-install-recommends ca-certificates curl libssl3 \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /app/target/release/ferrite /usr/local/bin/ferrite
 COPY --from=builder /app/target/release/ferrite-cli /usr/local/bin/ferrite-cli
+COPY --from=builder /app/target/release/ferrite-playground-launcher /usr/local/bin/ferrite-playground-launcher
 
-# Playground configuration
-ENV FERRITE_STUDIO_ENABLED=true
-ENV FERRITE_STUDIO_PORT=8080
-ENV FERRITE_STUDIO_HOST=0.0.0.0
-ENV FERRITE_STUDIO_AUTH=false
-ENV FERRITE_STUDIO_CORS=true
-ENV FERRITE_PORT=6379
-ENV FERRITE_BIND=0.0.0.0
+# Run both services as the same unprivileged user and keep RESP data writable.
+RUN groupadd --gid 1000 ferrite \
+    && useradd --uid 1000 --gid ferrite --no-create-home --shell /bin/sh ferrite \
+    && mkdir -p /var/lib/ferrite/data \
+    && chown -R ferrite:ferrite /var/lib/ferrite
+
 ENV RUST_LOG=ferrite=info
 
 EXPOSE 8080 6379
 
-# Ferrite v0.3.0 exposes the RESP service but does not wire the studio HTTP
-# health endpoint into the executable yet. Probe the real service shipped by
-# this image rather than assuming an unavailable HTTP endpoint or host curl.
+# Probe the actual Studio endpoint served by the repository-owned launcher.
 HEALTHCHECK --interval=30s --timeout=3s --retries=3 \
-    CMD ferrite-cli PING || exit 1
+    CMD curl --fail --silent --show-error http://127.0.0.1:8080/api/health >/dev/null || exit 1
 
-ENTRYPOINT ["ferrite"]
-CMD ["--port", "6379"]
+USER ferrite
+
+ENTRYPOINT ["/usr/local/bin/ferrite-playground-launcher"]
 
 # Build information labels
 LABEL org.opencontainers.image.title="Ferrite Playground"
