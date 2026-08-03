@@ -39,6 +39,10 @@
 | F-28 | P2 | Release tags | `docker/metadata-action` could still add its implicit `latest` tag outside the explicit stable gate. | Fixed; `latest=false` plus functional per-trigger assertions on the effective published tag set |
 | F-30 | P1 | Playground RESP3 | The launcher's decoder understood RESP2 only, so a client that negotiated RESP3 with `HELLO 3` on the public port broke on the first map/set/double reply. | Fixed; every RESP3 type is decoded, re-encoded byte-for-byte, and converted to JSON |
 | F-29 | P2 | Sidecar image | `sidecar.image.tag` defaulted to the floating `latest`, so a synchronized chart appVersion did not move the injected Ferrite image. | Fixed; the default is empty and the helper falls back to `.Chart.AppVersion` |
+| F-31 | P0 | Playground command policy | Ferrite v0.4.0 dotted and root/subcommand forms such as `MIGRATE.START` could bypass an exact-name-only denylist, and outward/topology/code-execution families were incomplete. | Fixed; one delimiter-aware argv policy covers exact roots and dotted descendants consistently over HTTP and RESP |
+| F-32 | P1 | Playground decoded memory | Wire bytes bounded payload data but did not bound decoded RESP node/element overhead, and aggregate declarations allowed up to one million elements. | Fixed; independent decoded-node/element budgets are charged before allocation, aggregate size is 4,096, and re-encoding has a hard output ceiling |
+| F-33 | P1 | Playground concurrency | HTTP and RESP could independently create backend work without one total operation limit. | Fixed; one launcher-owned 32-permit semaphore is shared by public RESP and HTTP execute/key-detail/health, with non-blocking overload responses |
+| F-34 | P1 | Playground task lifecycle | A service `JoinHandle` selected after completion was polled again during common cleanup, which can panic and hide the original exit error. | Fixed; optional handles are taken exactly once, timeout aborts are reaped, and selected errors are preserved |
 
 ## D-01 Resolution
 
@@ -107,12 +111,15 @@ Lifecycle and administrative safety:
 - the launcher owns `0.0.0.0:6379`, decodes RESP array and inline commands, classifies each one, and
   forwards only approved commands to the child, re-encoding the real reply byte-for-byte;
 - `policy` rejects at minimum `SHUTDOWN`, `DEBUG`, `MODULE`, `ACL`, `CONFIG`, `SAVE`, `BGSAVE`,
-  `BGREWRITEAOF`, `REPLICAOF`, and `SLAVEOF`, plus the other unauthenticated-playground lifecycle
-  commands `CLIENT`, `CLUSTER`, `FAILOVER`, `FLUSHALL`, `FLUSHDB`, `FUNCTION`, `SCRIPT`, `EVAL`
-  family, `MIGRATE`, `MONITOR`, `RESET`, `RESTORE`, `SWAPDB`, `SYNC`, `PSYNC`, `SLOWLOG`, `LATENCY`,
-  `PFDEBUG`, and `PFSELFTEST`; commands that cannot return a single bounded reply (`SUBSCRIBE`
-  family, the blocking `B*` commands, `WAIT`/`WAITAOF`) are refused with a distinct, non-security
-  message;
+  `BGREWRITEAOF`, `REPLICAOF`, and `SLAVEOF`, plus the Ferrite v0.4.0 privileged, outward-facing,
+  topology-changing, and arbitrary-code families. Matching is case-insensitive and delimiter-aware:
+  a family blocks both `FAMILY SUBCOMMAND` and exact `FAMILY.*` descendants without loosely blocking
+  names such as `FAMILYX`. This includes `MIGRATE.*`, `MULTICLOUD.*`, `S3.*`, `CLOUD.*`,
+  `FEDERATION.*`, `REPLICATE.*`, cluster/replication lifecycle, WASM/Forge/FAAS/function execution,
+  triggers, pipelines, marketplace installs, chaos/scaling/edge/proxy/protocol management, and
+  configuration/admin mutation. Commands that cannot return one bounded reply (`SUBSCRIBE` family,
+  blocking `B*` commands, `WAIT`/`WAITAOF`, or `XREAD* ... BLOCK`) and whole-dataset enumeration/sort
+  commands are refused with a distinct, non-security message;
 - ordinary Redis-compatible commands and the public port are preserved: a rejection does not close
   the connection and subsequent `SET`/`GET` succeed;
 - `/api/execute` applies the identical policy and answers `403` for refused commands;
@@ -121,12 +128,21 @@ Lifecycle and administrative safety:
   concurrent connections, and client idle time;
 - RESP2 and RESP3 are both preserved: `HELLO 3` and every RESP3 reply type (`_`, `#`, `,`, `(`,
   `!`, `=`, `%`, `~`, `>`) are decoded, charged to the response budget, and re-encoded unchanged.
+- one launcher-owned 32-permit semaphore limits aggregate Ferrite backend work across public RESP
+  commands and HTTP execute/key-detail/health requests; acquisition never waits, overload returns
+  HTTP `429` or a RESP error without forwarding, and health deliberately follows the same simple
+  fail-fast rule so a saturated pool cannot deadlock a probe;
+- HTTP and RESP service tasks have explicit single ownership: a selected completed handle is removed
+  before common cleanup, remaining handles are taken once, and timed-out aborts are awaited.
 
 Response and resource bounds:
 
 - a cumulative `ResponseBudget` charges every header line and payload byte of one reply (8 MiB by
-  default, 1 MiB for key detail), so a reply built from many small elements is bounded too, and the
-  only decode entry point is the budgeted one;
+  default, 1 MiB for key detail), plus at most 8,192 decoded values and 8,192 aggregate child slots;
+  aggregate declarations are limited to 4,096 entries and charged before vector allocation, so
+  empty-element and deeply nested replies cannot consume unbounded object overhead;
+- re-encoding is fallible and checks every append against the 8 MiB public output ceiling, so a
+  decoded reply cannot grow an unbounded forwarding buffer;
 - an over-budget reply drops the desynchronized upstream connection, returns an error, and the
   client's next command is served normally;
 - key detail is bounded per type — `GETRANGE` with `STRLEN` for strings, 100-element `LRANGE`,
@@ -136,7 +152,7 @@ Response and resource bounds:
 
 ## Runtime Verification Completed
 
-- 49 `playground-launcher` unit tests pass (`cargo test`), run from `tests/run.sh` via
+- 61 `playground-launcher` unit tests pass (`cargo test`), run from `tests/run.sh` via
   `tests/test_playground_launcher_unit.sh` and from a dedicated CI job.
 - The exact Playground image build, start, and probe suite passes: `SHUTDOWN` is refused with `403`
   over HTTP and with a policy error on the public RESP port, the container stays up, `SET`/`GET`
