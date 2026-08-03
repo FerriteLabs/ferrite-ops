@@ -61,11 +61,8 @@ jobs:
             SHA256=$(curl -sL "$TARBALL_URL" | shasum -a 256 | awk '{print $1}')
           fi
 
-          {
-            echo "version=${VERSION}"
-            echo "tag=${TAG}"
-            echo "sha256=${SHA256}"
-          } >> "$GITHUB_OUTPUT"
+          printf 'version=%s\ntag=%s\nsha256=%s\n' \
+            "$VERSION" "$TAG" "$SHA256" >> "$GITHUB_OUTPUT"
 
           echo "::notice::Release v${VERSION} (SHA256: ${SHA256})"
 
