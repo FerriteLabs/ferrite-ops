@@ -6,7 +6,7 @@
 
 use std::sync::Arc;
 
-use axum::extract::{DefaultBodyLimit, Path, Query, State};
+use axum::extract::{DefaultBodyLimit, Path, State};
 use axum::http::StatusCode;
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
@@ -31,13 +31,6 @@ pub struct AppState {
 #[derive(Debug, Deserialize)]
 pub struct ExecuteRequest {
     command: String,
-}
-
-/// Optional pagination for cursor-scanned key types (sets and hashes).
-#[derive(Debug, Default, Deserialize)]
-pub struct KeyDetailQuery {
-    #[serde(default)]
-    cursor: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -145,11 +138,7 @@ async fn execute(State(state): State<AppState>, Json(request): Json<ExecuteReque
     }
 }
 
-async fn key_detail(
-    State(state): State<AppState>,
-    Path(key): Path<String>,
-    Query(query): Query<KeyDetailQuery>,
-) -> Response {
+async fn key_detail(State(state): State<AppState>, Path(key): Path<String>) -> Response {
     if key.is_empty() {
         return api_response(
             StatusCode::BAD_REQUEST,
@@ -157,19 +146,12 @@ async fn key_detail(
         );
     }
 
-    let cursor = query
-        .cursor
-        .unwrap_or_else(|| keys::CURSOR_COMPLETE.to_string());
-    if let Err(error) = keys::validate_cursor(&cursor) {
-        return api_response(StatusCode::BAD_REQUEST, ApiResponse::error(error));
-    }
-
     let _permit = match try_backend_permit(&state) {
         Some(permit) => permit,
         None => return backend_busy_response(),
     };
 
-    match keys::detail(&state.resp_addr, &key, &cursor).await {
+    match keys::detail(&state.resp_addr, &key).await {
         Ok(Some(detail)) => api_response(StatusCode::OK, ApiResponse::ok(detail)),
         Ok(None) => api_response(StatusCode::NOT_FOUND, ApiResponse::error("Key not found")),
         Err(error) => api_response(
@@ -317,6 +299,13 @@ mod tests {
             "XADD stream MAXLEN = 100 LIMIT 10 * field value",
             "XADD stream 18446744073709551615-18446744073709551615 field value",
             "SETBIT bitmap 4294967288 1",
+            "SCAN 0 COUNT 100",
+            "SSCAN set 0 COUNT 100",
+            "HSCAN hash 0 COUNT 100",
+            "ZSCAN zset 0 COUNT 100",
+            "XREAD COUNT 10 STREAMS stream 0-0",
+            "XREAD STREAMS COUNT 10 stream 0-0",
+            "XREADGROUP GROUP group consumer COUNT 10 STREAMS stream >",
         ] {
             let (status, body) = call(state.clone(), execute_request(command)).await;
             assert_eq!(status, StatusCode::FORBIDDEN, "{command} must be forbidden");
@@ -382,7 +371,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn key_detail_is_bounded_and_paginated() {
+    async fn hash_key_detail_omits_values_without_scanning() {
         let upstream = MockFerrite::start().await;
         let values: Vec<(String, String)> = (0..150)
             .map(|index| (format!("field-{index:03}"), format!("value-{index}")))
@@ -397,26 +386,15 @@ mod tests {
         let (status, body) = call(state.clone(), request).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["data"]["length"], json!(150));
-        assert_eq!(body["data"]["returned"], json!(100));
+        assert_eq!(body["data"]["returned"], json!(0));
         assert_eq!(body["data"]["truncated"], json!(true));
-        let cursor = body["data"]["cursor"].as_str().unwrap().to_string();
-
-        let request = Request::builder()
-            .uri(format!("/api/keys/detail/big-hash?cursor={cursor}"))
-            .body(Body::empty())
-            .unwrap();
-        let (status, body) = call(state.clone(), request).await;
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(body["data"]["returned"], json!(50));
-        assert_eq!(body["data"]["truncated"], json!(false));
-
-        let request = Request::builder()
-            .uri("/api/keys/detail/big-hash?cursor=not-a-cursor")
-            .body(Body::empty())
-            .unwrap();
-        let (status, body) = call(state, request).await;
-        assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(body["success"], json!(false));
+        assert_eq!(body["data"]["value"], json!(null));
+        assert_eq!(body["data"]["value_omitted"], json!(true));
+        assert!(body["data"]["detail"].as_str().unwrap().contains("HSCAN"));
+        assert_eq!(
+            upstream.received_commands().await,
+            vec!["TYPE", "TTL", "HLEN"]
+        );
     }
 
     #[tokio::test]

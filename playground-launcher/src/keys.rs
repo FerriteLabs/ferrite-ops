@@ -2,10 +2,10 @@
 //!
 //! Key detail never issues an unbounded collection read (`LRANGE 0 -1`,
 //! `SMEMBERS`, `HGETALL`, `ZRANGE 0 -1`, unbounded `XRANGE`, or a whole-value
-//! `GET`). Every type is read through a bounded range, a bounded cursor scan,
-//! or a bounded count, and the response reports the collection's real total,
-//! whether the returned page was truncated, and — for cursor-scanned types —
-//! the cursor needed to continue.
+//! `GET`). List, sorted-set, and stream values use bounded ranges. Set and
+//! hash values are deliberately omitted because Ferrite v0.4.0 does not
+//! effectively bound its cursor scans; their type, TTL, and length remain
+//! available.
 
 use serde_json::{json, Value};
 
@@ -17,28 +17,8 @@ pub const PAGE_LIMIT: i64 = 100;
 pub const STRING_PREVIEW_BYTES: i64 = 4096;
 /// Cumulative response budget for one key-detail RESP command.
 pub const KEY_DETAIL_RESPONSE_BYTES: usize = 1024 * 1024;
-/// Cursor value that means "iteration finished" in Redis SCAN semantics.
-pub const CURSOR_COMPLETE: &str = "0";
-
-/// A validated SCAN cursor. Cursors come from untrusted query strings, so only
-/// non-negative integers are accepted and forwarded to Ferrite.
-pub fn validate_cursor(cursor: &str) -> Result<String, String> {
-    let cursor = cursor.trim();
-    if cursor.is_empty() {
-        return Ok(CURSOR_COMPLETE.to_string());
-    }
-    if !cursor.bytes().all(|byte| byte.is_ascii_digit()) {
-        return Err("cursor must be a non-negative integer".to_string());
-    }
-    cursor
-        .parse::<u64>()
-        .map(|cursor| cursor.to_string())
-        .map_err(|_| "cursor must be a non-negative integer".to_string())
-}
-
 /// Read a bounded view of one key.
-pub async fn detail(addr: &str, key: &str, cursor: &str) -> Result<Option<Value>, String> {
-    let cursor = validate_cursor(cursor)?;
+pub async fn detail(addr: &str, key: &str) -> Result<Option<Value>, String> {
     let key_type = resp::as_string(execute(addr, &["TYPE", key]).await?, "TYPE")?;
     if key_type == "none" {
         return Ok(None);
@@ -49,8 +29,14 @@ pub async fn detail(addr: &str, key: &str, cursor: &str) -> Result<Option<Value>
         "string" => string_page(addr, key).await?,
         "list" => list_page(addr, key).await?,
         "zset" => zset_page(addr, key).await?,
-        "set" => set_page(addr, key, &cursor).await?,
-        "hash" => hash_page(addr, key, &cursor).await?,
+        "set" => omitted_page(
+            resp::as_integer(execute(addr, &["SCARD", key]).await?, "SCARD")?,
+            "set values are omitted because SSCAN is not effectively bounded in Ferrite v0.4.0",
+        ),
+        "hash" => omitted_page(
+            resp::as_integer(execute(addr, &["HLEN", key]).await?, "HLEN")?,
+            "hash values are omitted because HSCAN is not effectively bounded in Ferrite v0.4.0",
+        ),
         "stream" => stream_page(addr, key).await?,
         other => {
             return Err(format!(
@@ -68,7 +54,9 @@ pub async fn detail(addr: &str, key: &str, cursor: &str) -> Result<Option<Value>
         "limit": page.limit,
         "truncated": page.truncated,
         "cursor": page.next_cursor,
-        "value": page.value
+        "value": page.value,
+        "value_omitted": page.value_omitted,
+        "detail": page.detail
     })))
 }
 
@@ -82,8 +70,10 @@ struct Page {
     /// The bound applied to this page.
     limit: i64,
     truncated: bool,
-    /// Cursor to continue a scan, or `null` for non-scanned types.
+    /// Reserved for response compatibility; always `null`.
     next_cursor: Value,
+    value_omitted: bool,
+    detail: Value,
 }
 
 impl Page {
@@ -95,7 +85,22 @@ impl Page {
             limit,
             truncated: total > returned,
             next_cursor: Value::Null,
+            value_omitted: false,
+            detail: Value::String("bounded value preview".to_string()),
         }
+    }
+}
+
+fn omitted_page(total: i64, reason: &str) -> Page {
+    Page {
+        value: Value::Null,
+        total,
+        returned: 0,
+        limit: 0,
+        truncated: total > 0,
+        next_cursor: Value::Null,
+        value_omitted: true,
+        detail: Value::String(reason.to_string()),
     }
 }
 
@@ -142,54 +147,6 @@ async fn stream_page(addr: &str, key: &str) -> Result<Page, String> {
     Ok(Page::bounded(value, total, returned, PAGE_LIMIT))
 }
 
-async fn set_page(addr: &str, key: &str, cursor: &str) -> Result<Page, String> {
-    let total = resp::as_integer(execute(addr, &["SCARD", key]).await?, "SCARD")?;
-    let count = PAGE_LIMIT.to_string();
-    // SSCAN, never SMEMBERS: a set may hold far more members than one page.
-    let reply = execute(addr, &["SSCAN", key, cursor, "COUNT", &count]).await?;
-    let (next_cursor, elements) = scan_reply(reply, "SSCAN")?;
-    let returned = array_len(&elements);
-    Ok(scan_page(elements, total, returned, next_cursor))
-}
-
-async fn hash_page(addr: &str, key: &str, cursor: &str) -> Result<Page, String> {
-    let total = resp::as_integer(execute(addr, &["HLEN", key]).await?, "HLEN")?;
-    let count = PAGE_LIMIT.to_string();
-    // HSCAN, never HGETALL.
-    let reply = execute(addr, &["HSCAN", key, cursor, "COUNT", &count]).await?;
-    let (next_cursor, elements) = scan_reply(reply, "HSCAN")?;
-    // HSCAN returns a flat field/value sequence.
-    let returned = array_len(&elements) / 2;
-    Ok(scan_page(elements, total, returned, next_cursor))
-}
-
-fn scan_page(value: Value, total: i64, returned: i64, next_cursor: String) -> Page {
-    let complete = next_cursor == CURSOR_COMPLETE;
-    Page {
-        value,
-        total,
-        returned,
-        limit: PAGE_LIMIT,
-        // A scan is truncated whenever iteration has not finished, even if
-        // this page happened to return every element seen so far.
-        truncated: !complete,
-        next_cursor: Value::String(next_cursor),
-    }
-}
-
-/// Split a SCAN-family reply into its cursor and its element array.
-fn scan_reply(value: RespValue, command: &str) -> Result<(String, Value), String> {
-    match value {
-        RespValue::Array(Some(mut parts)) if parts.len() == 2 => {
-            let elements = resp::to_json(parts.pop().expect("two-element scan reply"))?;
-            let cursor = resp::as_string(parts.pop().expect("two-element scan reply"), command)?;
-            Ok((cursor, elements))
-        }
-        RespValue::Error(error) => Err(error),
-        other => Err(format!("{command} returned unexpected response: {other:?}")),
-    }
-}
-
 fn array_len(value: &Value) -> i64 {
     match value {
         Value::Array(values) => values.len() as i64,
@@ -203,23 +160,10 @@ mod tests {
     use super::*;
     use crate::testing::MockFerrite;
 
-    #[test]
-    fn validates_untrusted_cursors() {
-        assert_eq!(validate_cursor("0").unwrap(), "0");
-        assert_eq!(validate_cursor(" 42 ").unwrap(), "42");
-        assert_eq!(validate_cursor("").unwrap(), "0");
-        assert!(validate_cursor("-1").is_err());
-        assert!(validate_cursor("MATCH *").is_err());
-        assert!(validate_cursor("0x10").is_err());
-    }
-
     #[tokio::test]
     async fn missing_keys_report_no_detail() {
         let upstream = MockFerrite::start().await;
-        assert!(detail(&upstream.addr(), "absent", "0")
-            .await
-            .unwrap()
-            .is_none());
+        assert!(detail(&upstream.addr(), "absent").await.unwrap().is_none());
     }
 
     #[tokio::test]
@@ -228,7 +172,7 @@ mod tests {
         let value = "s".repeat(STRING_PREVIEW_BYTES as usize + 500);
         upstream.seed_string("big-string", &value).await;
 
-        let detail = detail(&upstream.addr(), "big-string", "0")
+        let detail = detail(&upstream.addr(), "big-string")
             .await
             .unwrap()
             .unwrap();
@@ -251,10 +195,7 @@ mod tests {
         let values: Vec<String> = (0..250).map(|index| format!("item-{index}")).collect();
         upstream.seed_list("big-list", values).await;
 
-        let detail = detail(&upstream.addr(), "big-list", "0")
-            .await
-            .unwrap()
-            .unwrap();
+        let detail = detail(&upstream.addr(), "big-list").await.unwrap().unwrap();
         assert_eq!(detail["length"], json!(250));
         assert_eq!(detail["returned"], json!(PAGE_LIMIT));
         assert_eq!(detail["limit"], json!(PAGE_LIMIT));
@@ -271,10 +212,7 @@ mod tests {
             .collect();
         upstream.seed_zset("big-zset", values).await;
 
-        let detail = detail(&upstream.addr(), "big-zset", "0")
-            .await
-            .unwrap()
-            .unwrap();
+        let detail = detail(&upstream.addr(), "big-zset").await.unwrap().unwrap();
         assert_eq!(detail["length"], json!(150));
         assert_eq!(detail["returned"], json!(PAGE_LIMIT));
         assert_eq!(detail["truncated"], json!(true));
@@ -283,63 +221,39 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sets_are_cursor_scanned_and_expose_the_next_cursor() {
+    async fn sets_report_metadata_without_scanning_values() {
         let upstream = MockFerrite::start().await;
         let values: Vec<String> = (0..150).map(|index| format!("member-{index:03}")).collect();
         upstream.seed_set("big-set", values).await;
 
-        let first = detail(&upstream.addr(), "big-set", "0")
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(first["length"], json!(150));
-        assert_eq!(first["returned"], json!(PAGE_LIMIT));
-        assert_eq!(first["truncated"], json!(true));
-        let cursor = first["cursor"].as_str().unwrap().to_string();
-        assert_ne!(cursor, CURSOR_COMPLETE);
-
-        let second = detail(&upstream.addr(), "big-set", &cursor)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(second["returned"], json!(50));
-        assert_eq!(second["truncated"], json!(false));
-        assert_eq!(second["cursor"], json!(CURSOR_COMPLETE));
+        let detail = detail(&upstream.addr(), "big-set").await.unwrap().unwrap();
+        assert_eq!(detail["length"], json!(150));
+        assert_eq!(detail["returned"], json!(0));
+        assert_eq!(detail["value"], json!(null));
+        assert_eq!(detail["value_omitted"], json!(true));
+        assert!(detail["detail"].as_str().unwrap().contains("SSCAN"));
 
         let commands = upstream.received_commands().await;
-        assert!(commands.contains(&"SSCAN".to_string()));
-        assert!(!commands.contains(&"SMEMBERS".to_string()));
+        assert_eq!(commands, vec!["TYPE", "TTL", "SCARD"]);
     }
 
     #[tokio::test]
-    async fn hashes_are_cursor_scanned_rather_than_read_whole() {
+    async fn hashes_report_metadata_without_scanning_values() {
         let upstream = MockFerrite::start().await;
         let values: Vec<(String, String)> = (0..150)
             .map(|index| (format!("field-{index:03}"), format!("value-{index}")))
             .collect();
         upstream.seed_hash("big-hash", values).await;
 
-        let first = detail(&upstream.addr(), "big-hash", "0")
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(first["length"], json!(150));
-        assert_eq!(first["returned"], json!(PAGE_LIMIT));
-        assert_eq!(first["truncated"], json!(true));
-        // A flat field/value sequence for the returned page.
-        assert_eq!(first["value"].as_array().unwrap().len(), 200);
-
-        let cursor = first["cursor"].as_str().unwrap().to_string();
-        let second = detail(&upstream.addr(), "big-hash", &cursor)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(second["returned"], json!(50));
-        assert_eq!(second["cursor"], json!(CURSOR_COMPLETE));
+        let detail = detail(&upstream.addr(), "big-hash").await.unwrap().unwrap();
+        assert_eq!(detail["length"], json!(150));
+        assert_eq!(detail["returned"], json!(0));
+        assert_eq!(detail["value"], json!(null));
+        assert_eq!(detail["value_omitted"], json!(true));
+        assert!(detail["detail"].as_str().unwrap().contains("HSCAN"));
 
         let commands = upstream.received_commands().await;
-        assert!(commands.contains(&"HSCAN".to_string()));
-        assert!(!commands.contains(&"HGETALL".to_string()));
+        assert_eq!(commands, vec!["TYPE", "TTL", "HLEN"]);
     }
 
     #[tokio::test]
@@ -355,7 +269,7 @@ mod tests {
             .collect();
         upstream.seed_stream("big-stream", entries).await;
 
-        let detail = detail(&upstream.addr(), "big-stream", "0")
+        let detail = detail(&upstream.addr(), "big-stream")
             .await
             .unwrap()
             .unwrap();
@@ -372,20 +286,12 @@ mod tests {
             .seed_list("small-list", vec!["a".into(), "b".into()])
             .await;
 
-        let detail = detail(&upstream.addr(), "small-list", "0")
+        let detail = detail(&upstream.addr(), "small-list")
             .await
             .unwrap()
             .unwrap();
         assert_eq!(detail["length"], json!(2));
         assert_eq!(detail["returned"], json!(2));
         assert_eq!(detail["truncated"], json!(false));
-    }
-
-    #[tokio::test]
-    async fn invalid_cursors_are_rejected_before_reaching_ferrite() {
-        let upstream = MockFerrite::start().await;
-        upstream.seed_set("set", vec!["a".into()]).await;
-        assert!(detail(&upstream.addr(), "set", "MATCH *").await.is_err());
-        assert!(upstream.received_commands().await.is_empty());
     }
 }

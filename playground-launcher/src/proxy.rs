@@ -422,6 +422,23 @@ mod tests {
                 "value",
             ],
             vec!["SETBIT", "bitmap", "4294967288", "1"],
+            vec!["SCAN", "0", "COUNT", "100"],
+            vec!["SSCAN", "set", "0", "COUNT", "100"],
+            vec!["HSCAN", "hash", "0", "COUNT", "100"],
+            vec!["ZSCAN", "zset", "0", "COUNT", "100"],
+            vec!["XREAD", "COUNT", "10", "STREAMS", "stream", "0-0"],
+            vec!["XREAD", "STREAMS", "COUNT", "10", "stream", "0-0"],
+            vec![
+                "XREADGROUP",
+                "GROUP",
+                "group",
+                "consumer",
+                "COUNT",
+                "10",
+                "STREAMS",
+                "stream",
+                ">",
+            ],
         ] {
             let reply = client.command(&command).await;
             match reply {

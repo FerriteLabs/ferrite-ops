@@ -54,7 +54,6 @@ const POLICIES: &[CommandPolicy] = &[
     ),
     policy(&["COPY"], &["COPY", "source", "destination"], copy),
     policy(&["RANDOMKEY"], &["RANDOMKEY"], exact::<0>),
-    policy(&["SCAN"], &["SCAN", "0", "COUNT", "100"], scan),
     policy(&["GET", "GETDEL"], &["GET", "key"], exact::<1>),
     policy(&["GETEX"], &["GETEX", "key", "EX", "60"], between::<1, 3>),
     policy(&["SET", "SETNX"], &["SET", "key", "value"], between::<2, 8>),
@@ -102,11 +101,6 @@ const POLICIES: &[CommandPolicy] = &[
         &["HRANDFIELD"],
         &["HRANDFIELD", "hash", "10"],
         random_member,
-    ),
-    policy(
-        &["HSCAN"],
-        &["HSCAN", "hash", "0", "COUNT", "100"],
-        keyed_scan,
     ),
     policy(
         &["LPUSH", "LPUSHX", "RPUSH", "RPUSHX"],
@@ -160,11 +154,6 @@ const POLICIES: &[CommandPolicy] = &[
         &["SRANDMEMBER", "set", "10"],
         random_member,
     ),
-    policy(
-        &["SSCAN"],
-        &["SSCAN", "set", "0", "COUNT", "100"],
-        keyed_scan,
-    ),
     policy(&["ZADD"], &["ZADD", "zset", "1", "member"], zadd),
     policy(&["ZCARD"], &["ZCARD", "zset"], exact::<1>),
     policy(
@@ -217,11 +206,6 @@ const POLICIES: &[CommandPolicy] = &[
         &["ZRANDMEMBER", "zset", "10"],
         random_member,
     ),
-    policy(
-        &["ZSCAN"],
-        &["ZSCAN", "zset", "0", "COUNT", "100"],
-        keyed_scan,
-    ),
     policy(&["XADD"], &["XADD", "stream", "*", "field", "value"], xadd),
     policy(&["XDEL"], &["XDEL", "stream", "1-0"], keyed_items),
     policy(&["XLEN"], &["XLEN", "stream"], exact::<1>),
@@ -229,11 +213,6 @@ const POLICIES: &[CommandPolicy] = &[
         &["XRANGE", "XREVRANGE"],
         &["XRANGE", "stream", "-", "+", "COUNT", "100"],
         stream_range,
-    ),
-    policy(
-        &["XREAD"],
-        &["XREAD", "COUNT", "100", "STREAMS", "stream", "0-0"],
-        stream_read,
     ),
     policy(&["XTRIM"], &["XTRIM", "stream", "MAXLEN", "100"], xtrim),
     policy(&["PFADD"], &["PFADD", "hll", "element"], keyed_items),
@@ -584,30 +563,6 @@ fn bounded_range(start: &str, stop: &str, limit: u64, label: &str) -> Result<(),
     Ok(())
 }
 
-fn scan(arguments: &[String]) -> Result<(), String> {
-    if !(3..=7).contains(&arguments.len()) {
-        return Err(format!(
-            "COUNT is required and must be at most {MAX_COLLECTION_PAGE}"
-        ));
-    }
-    validate_scan_options(&arguments[1..])
-}
-
-fn keyed_scan(arguments: &[String]) -> Result<(), String> {
-    if !(4..=8).contains(&arguments.len()) {
-        return Err(format!(
-            "COUNT is required and must be at most {MAX_COLLECTION_PAGE}"
-        ));
-    }
-    validate_scan_options(&arguments[2..])
-}
-
-fn validate_scan_options(options: &[String]) -> Result<(), String> {
-    let count = unique_option_value(options, "COUNT")?
-        .ok_or_else(|| format!("COUNT is required and must be at most {MAX_COLLECTION_PAGE}"))?;
-    bounded_positive_count(count)
-}
-
 fn limited_sorted_range(arguments: &[String]) -> Result<(), String> {
     between::<6, 7>(arguments)?;
     let limit_index = arguments
@@ -791,45 +746,6 @@ fn stream_range(arguments: &[String]) -> Result<(), String> {
     bounded_positive_count(&arguments[4])
 }
 
-fn stream_read(arguments: &[String]) -> Result<(), String> {
-    if arguments.iter().any(|argument| argument == "BLOCK") {
-        return Err("blocking reads are not permitted".to_string());
-    }
-    let count = unique_option_value(arguments, "COUNT")?
-        .ok_or_else(|| format!("COUNT is required and must be at most {MAX_COLLECTION_PAGE}"))?;
-    bounded_positive_count(count)?;
-
-    let streams = arguments
-        .iter()
-        .position(|argument| argument == "STREAMS")
-        .ok_or_else(|| "STREAMS is required".to_string())?;
-    let tail = arguments.len().saturating_sub(streams + 1);
-    if tail < 2 || !tail.is_multiple_of(2) || tail / 2 > MAX_MULTI_ITEMS {
-        return Err(format!(
-            "requires matching key/id pairs for at most {MAX_MULTI_ITEMS} streams"
-        ));
-    }
-    Ok(())
-}
-
-fn unique_option_value<'a>(
-    arguments: &'a [String],
-    option: &str,
-) -> Result<Option<&'a str>, String> {
-    let matches = arguments
-        .iter()
-        .enumerate()
-        .filter_map(|(index, argument)| (argument == option).then_some(index))
-        .collect::<Vec<_>>();
-    if matches.len() > 1 {
-        return Err(format!("{option} may be specified only once"));
-    }
-    Ok(matches
-        .first()
-        .and_then(|index| arguments.get(index + 1))
-        .map(String::as_str))
-}
-
 fn bounded_positive_count(value: &str) -> Result<(), String> {
     let count = parse_u64(value, "COUNT")?;
     if (1..=MAX_COLLECTION_PAGE as u64).contains(&count) {
@@ -902,12 +818,9 @@ mod tests {
             &["HMGET", "hash", "one", "two"],
             &["LRANGE", "list", "0", "99"],
             &["LRANGE", "list", "-100", "-1"],
-            &["SSCAN", "set", "0", "COUNT", "100"],
             &["ZRANGE", "zset", "0", "99", "WITHSCORES"],
-            &["ZSCAN", "zset", "0", "MATCH", "*", "COUNT", "50"],
             &["XRANGE", "stream", "-", "+", "COUNT", "100"],
             &["XREVRANGE", "stream", "+", "-", "COUNT", "1"],
-            &["XREAD", "COUNT", "10", "STREAMS", "events", "0-0"],
             &["XTRIM", "stream", "MAXLEN", "~", "100", "LIMIT", "100"],
         ] {
             assert_allowed(arguments);
@@ -927,6 +840,23 @@ mod tests {
             &["HVALS", "hash"],
             &["SMEMBERS", "set"],
             &["KEYS", "*"],
+            &["SCAN", "0", "COUNT", "100"],
+            &["HSCAN", "hash", "0", "COUNT", "100"],
+            &["SSCAN", "set", "0", "COUNT", "100"],
+            &["ZSCAN", "zset", "0", "COUNT", "100"],
+            &["XREAD", "COUNT", "10", "STREAMS", "events", "0-0"],
+            &["XREAD", "STREAMS", "COUNT", "10", "events", "0-0"],
+            &[
+                "XREADGROUP",
+                "GROUP",
+                "group",
+                "consumer",
+                "COUNT",
+                "10",
+                "STREAMS",
+                "events",
+                ">",
+            ],
             &["SUBSCRIBE", "channel"],
             &["MULTI"],
             &["MOCKARRAY", "10", "10"],
@@ -973,29 +903,13 @@ mod tests {
     }
 
     #[test]
-    fn requires_bounded_stream_and_scan_counts() {
+    fn requires_bounded_stream_ranges() {
         for arguments in [
             &["XRANGE", "stream", "-", "+"][..],
             &["XRANGE", "stream", "-", "+", "COUNT", "101"],
             &["XREVRANGE", "stream", "+", "-", "COUNT", "0"],
-            &["SCAN", "0"],
-            &["SCAN", "0", "COUNT", "101"],
-            &["HSCAN", "hash", "0", "MATCH", "*"],
-            &["SSCAN", "set", "0", "COUNT", "0"],
-            &["ZSCAN", "zset", "0", "COUNT", "1000"],
-            &["XREAD", "STREAMS", "stream", "0-0"],
-            &[
-                "XREAD", "COUNT", "10", "BLOCK", "1000", "STREAMS", "stream", "0-0",
-            ],
         ] {
-            assert_rejected(
-                arguments,
-                if arguments.contains(&"BLOCK") {
-                    "blocking"
-                } else {
-                    "COUNT"
-                },
-            );
+            assert_rejected(arguments, "COUNT");
         }
     }
 
@@ -1088,14 +1002,15 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_count_options_cannot_bypass_bounds() {
+    fn removed_scan_and_stream_read_commands_cannot_bypass_the_allowlist() {
         for arguments in [
             &["SCAN", "0", "COUNT", "10", "COUNT", "1000000"][..],
             &[
                 "XREAD", "COUNT", "10", "COUNT", "1000000", "STREAMS", "stream", "0-0",
             ],
+            &["XREAD", "STREAMS", "COUNT", "10", "stream", "0-0"],
         ] {
-            assert_rejected(arguments, "only once");
+            assert_rejected(arguments, "explicit safe-command allowlist");
         }
     }
 
