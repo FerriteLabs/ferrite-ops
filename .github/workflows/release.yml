@@ -18,6 +18,20 @@ on:
 # the same `ferrite-release` repository_dispatch event core emits — keeping
 # exactly one workflow responsible for that comprehensive update instead of
 # a second, partial chart-only bump racing it.
+#
+# Release model (two decoupled phases):
+#   1. build-and-push — builds the multi-arch image and pushes ONLY the exact,
+#      immutable version tag (e.g. `0.4.1`) plus its digest. Exact tags are
+#      unique per version, so this expensive multi-arch build is NOT serialized
+#      and many releases can build concurrently without racing each other.
+#   2. promote-stable — a cheap, serialized digest-promotion job that advances
+#      the floating `latest`, `<major>`, and `<major>.<minor>` tags to the
+#      freshly built digest with `docker buildx imagetools`, but only when the
+#      candidate is >= the current promoted stable version (read from
+#      trustworthy registry metadata, never from workflow input). This prevents
+#      an older, retried, or out-of-order stable release from overwriting the
+#      floating tags, while remaining compatible with imagetools/cosign because
+#      promotion only adds tags to the already-signed digest.
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository_owner }}/ferrite
@@ -36,6 +50,10 @@ jobs:
       digest: ${{ steps.build.outputs.digest }}
       image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
       version: ${{ steps.release_meta.outputs.version }}
+      major: ${{ steps.release_meta.outputs.major }}
+      major_minor: ${{ steps.release_meta.outputs.major_minor }}
+      stable: ${{ steps.release_meta.outputs.stable }}
+      dockerhub_enabled: ${{ steps.dockerhub.outputs.enabled }}
     steps:
       - uses: actions/checkout@v4
 
@@ -158,12 +176,13 @@ jobs:
             echo "FERRITE_BUILD_ARGS_EOF"
           } >> "$GITHUB_OUTPUT"
 
-      # Every published tag is derived from the normalized release_meta
-      # outputs above, for every trigger. `latest=false` disables the action's
-      # own automatic latest tag, so `latest` is published only by the
-      # explicit, stable-gated entry below and a prerelease can never become
-      # `latest`. GHCR metadata/tags/push always run: GHCR is the always-on,
-      # authenticated registry for every release.
+      # The build below publishes ONLY the exact, immutable version tag for
+      # every trigger and every release channel (stable or prerelease). The
+      # floating `latest`, `<major>`, and `<major>.<minor>` tags are NOT built
+      # here — they are advanced separately by the serialized promote-stable
+      # job, and only when this release is the newest promoted stable version.
+      # `latest=false` disables the action's own implicit latest tag so a build
+      # can never publish a floating tag out of band.
       - name: Extract metadata (tags, labels) — GHCR
         id: meta
         uses: docker/metadata-action@v5
@@ -173,9 +192,6 @@ jobs:
             latest=false
           tags: |
             type=raw,value=${{ steps.release_meta.outputs.version }}
-            type=raw,value=${{ steps.release_meta.outputs.major_minor }},enable=${{ steps.release_meta.outputs.stable == 'true' }}
-            type=raw,value=${{ steps.release_meta.outputs.major }},enable=${{ steps.release_meta.outputs.stable == 'true' }}
-            type=raw,value=latest,enable=${{ steps.release_meta.outputs.stable == 'true' }}
 
       # Docker Hub is optional: this step (and therefore every Docker Hub
       # tag) only runs when the repository variable DOCKERHUB_ENABLED is
@@ -194,9 +210,6 @@ jobs:
             latest=false
           tags: |
             type=raw,value=${{ steps.release_meta.outputs.version }}
-            type=raw,value=${{ steps.release_meta.outputs.major_minor }},enable=${{ steps.release_meta.outputs.stable == 'true' }}
-            type=raw,value=${{ steps.release_meta.outputs.major }},enable=${{ steps.release_meta.outputs.stable == 'true' }}
-            type=raw,value=latest,enable=${{ steps.release_meta.outputs.stable == 'true' }}
 
       # Combine the always-on GHCR tags/labels with the optional Docker Hub
       # tags (empty when meta_dockerhub did not run) into the single tag/
@@ -341,3 +354,133 @@ jobs:
             (echo "Smoke test failed: PING did not return PONG" && exit 1)
           echo "Smoke test passed"
           docker stop ferrite-smoke
+
+  # ── Serialized floating-tag promotion ────────────────────────────────────────
+  # Advances the floating `latest`, `<major>`, and `<major>.<minor>` tags to
+  # this release's digest — but only for stable releases, and only when this
+  # release is >= the current promoted stable version. The concurrency group
+  # serializes promotions across all release runs so a read-compare-write can
+  # never race; combined with the >= gate below, an older, retried, or
+  # out-of-order stable release can never regress a floating tag. Prereleases
+  # are published as exact tags only and never reach this job.
+  promote-stable:
+    name: Promote Floating Tags
+    runs-on: ubuntu-latest
+    needs: [build-and-push, verify, smoke-test]
+    if: needs.build-and-push.outputs.stable == 'true'
+    permissions:
+      contents: read
+      packages: write
+    concurrency:
+      group: ferrite-floating-tag-promotion
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        if: needs.build-and-push.outputs.dockerhub_enabled == 'true'
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # The current promoted stable version is whatever `latest` currently
+      # points at. Read its baked-in version label directly from the registry
+      # (trustworthy registry metadata) — never from workflow input, which a
+      # client payload could forge. A missing `latest` means this is the first
+      # promotion; any other read failure aborts rather than promoting blindly.
+      - name: Resolve current promoted stable version
+        id: current
+        env:
+          GHCR_IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+        run: |
+          set -euo pipefail
+
+          CURRENT=""
+          ERR_LOG="$(mktemp)"
+          trap 'rm -f "$ERR_LOG"' EXIT
+          if RAW="$(docker buildx imagetools inspect "${GHCR_IMAGE}:latest" \
+            --format '{{json .Image}}' 2>"$ERR_LOG")"; then
+            # `.Image` is a single config object for a single-arch image, or a
+            # map of platform -> config for a multi-arch image. Read the
+            # org.opencontainers.image.version label from either shape.
+            CURRENT="$(printf '%s' "$RAW" | jq -r '
+              if type == "object" and has("config") then
+                (.config.Labels["org.opencontainers.image.version"] // "")
+              elif type == "object" then
+                ([.[] | .config.Labels["org.opencontainers.image.version"] // empty] | (.[0] // ""))
+              else "" end')"
+            if [ -z "$CURRENT" ]; then
+              echo "::error::latest exists but exposes no readable version label; refusing to promote blindly"
+              exit 1
+            fi
+            if ! printf '%s\n' "$CURRENT" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+              echo "::error::latest reports a non-stable version label: ${CURRENT}"
+              exit 1
+            fi
+            echo "::notice::Current promoted stable version is ${CURRENT}"
+          elif grep -qiE 'not found|manifest unknown|no such manifest|MANIFEST_UNKNOWN' "$ERR_LOG"; then
+            echo "::notice::No existing latest tag; treating this as the first promotion."
+          else
+            echo "::error::Could not determine the current promoted stable version:"
+            cat "$ERR_LOG" >&2
+            exit 1
+          fi
+
+          echo "version=${CURRENT}" >> "$GITHUB_OUTPUT"
+
+      # Add the floating tags to the already-built, already-signed digest with
+      # imagetools (no rebuild). Because the tags reference the exact same
+      # digest, the existing cosign signature and attestations remain valid for
+      # them. Skips cleanly when the candidate is older than the current
+      # promoted stable version, so a late release never regresses `latest`.
+      - name: Promote floating tags to this digest
+        env:
+          CANDIDATE: ${{ needs.build-and-push.outputs.version }}
+          CURRENT_PROMOTED: ${{ steps.current.outputs.version }}
+          MAJOR: ${{ needs.build-and-push.outputs.major }}
+          MAJOR_MINOR: ${{ needs.build-and-push.outputs.major_minor }}
+          DIGEST: ${{ needs.build-and-push.outputs.digest }}
+          GHCR_IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          DOCKERHUB_IMAGE: ${{ env.DOCKERHUB_IMAGE }}
+          DOCKERHUB_ENABLED: ${{ needs.build-and-push.outputs.dockerhub_enabled }}
+          ORDER_SCRIPT: scripts/release-ordering.sh
+        run: |
+          set -euo pipefail
+
+          if ! printf '%s\n' "$CANDIDATE" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::Refusing to promote a non-stable candidate: ${CANDIDATE}"
+            exit 1
+          fi
+
+          if [ -n "$CURRENT_PROMOTED" ] && ! bash "$ORDER_SCRIPT" ge "$CANDIDATE" "$CURRENT_PROMOTED"; then
+            echo "::notice::Skipping floating-tag promotion: candidate ${CANDIDATE} is older than the current promoted stable version ${CURRENT_PROMOTED}."
+            exit 0
+          fi
+
+          promote_registry() {
+            local image="$1"
+            echo "::notice::Promoting latest/${MAJOR}/${MAJOR_MINOR} -> ${image}@${DIGEST}"
+            docker buildx imagetools create \
+              --tag "${image}:latest" \
+              --tag "${image}:${MAJOR}" \
+              --tag "${image}:${MAJOR_MINOR}" \
+              "${image}@${DIGEST}"
+          }
+
+          promote_registry "$GHCR_IMAGE"
+          if [ "$DOCKERHUB_ENABLED" = "true" ]; then
+            promote_registry "$DOCKERHUB_IMAGE"
+          fi
+
+          echo "::notice::Floating tags now point at ${CANDIDATE} (${DIGEST})."

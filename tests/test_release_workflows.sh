@@ -36,7 +36,7 @@ EXPECTED_VERSION="$(sed -n 's/^FERRITE_VERSION=//p' "$ACTIVE_RELEASE")"
 EXPECTED_SHA256="$(sed -n 's/^FERRITE_SOURCE_SHA256=//p' "$ACTIVE_RELEASE")"
 EXPECTED_MAJOR="${EXPECTED_VERSION%%.*}"
 EXPECTED_MAJOR_MINOR="${EXPECTED_VERSION%.*}"
-EXPECTED_TAG_SET="${EXPECTED_MAJOR} ${EXPECTED_MAJOR_MINOR} ${EXPECTED_VERSION} latest"
+EXPECTED_TAG_SET="${EXPECTED_VERSION}"
 RELEASE_CONTENT="$(cat "$RELEASE_YML")"
 VERSION_SYNC_CONTENT="$(cat "$VERSION_SYNC_YML")"
 ORCHESTRATION_CONTENT="$(cat "$ORCHESTRATION_YML")"
@@ -62,12 +62,26 @@ assert_contains "$RELEASE_CONTENT" "default: 'v${EXPECTED_VERSION}'" \
   "release.yml's workflow_dispatch default matches active-release.env"
 assert_contains "$RELEASE_CONTENT" 'type=raw,value=${{ steps.release_meta.outputs.version }}' \
   "release.yml tags every trigger with the normalized exact semver"
-assert_contains "$RELEASE_CONTENT" 'type=raw,value=${{ steps.release_meta.outputs.major_minor }}' \
-  "release.yml derives the normalized major.minor tag from release_meta"
-assert_contains "$RELEASE_CONTENT" 'type=raw,value=${{ steps.release_meta.outputs.major }}' \
-  "release.yml derives the normalized major tag from release_meta"
-assert_contains "$RELEASE_CONTENT" 'type=raw,value=latest,enable=${{ steps.release_meta.outputs.stable == '\''true'\'' }}' \
-  "release.yml publishes latest only for stable semver releases"
+assert_not_contains "$RELEASE_CONTENT" 'type=raw,value=latest' \
+  "release.yml never bakes a floating latest tag into the exact-version build"
+assert_not_contains "$RELEASE_CONTENT" 'type=raw,value=${{ steps.release_meta.outputs.major_minor }}' \
+  "release.yml no longer builds the floating major.minor tag inline; promotion advances it"
+assert_not_contains "$RELEASE_CONTENT" 'type=raw,value=${{ steps.release_meta.outputs.major }}' \
+  "release.yml no longer builds the floating major tag inline; promotion advances it"
+assert_contains "$RELEASE_CONTENT" "promote-stable:" \
+  "release.yml defines a dedicated floating-tag promotion job"
+assert_contains "$RELEASE_CONTENT" "if: needs.build-and-push.outputs.stable == 'true'" \
+  "release.yml promotes floating tags only for stable releases; prereleases stay exact-only"
+assert_contains "$RELEASE_CONTENT" "group: ferrite-floating-tag-promotion" \
+  "release.yml serializes floating-tag promotion so concurrent releases cannot race"
+assert_contains "$RELEASE_CONTENT" "cancel-in-progress: false" \
+  "release.yml queues rather than cancels serialized promotions"
+assert_contains "$RELEASE_CONTENT" "docker buildx imagetools create" \
+  "release.yml promotes floating tags by adding them to the signed digest (imagetools/cosign compatible)"
+assert_contains "$RELEASE_CONTENT" "scripts/release-ordering.sh" \
+  "release.yml gates floating-tag promotion on the shared SemVer ordering guard"
+assert_contains "$RELEASE_CONTENT" "Resolve current promoted stable version" \
+  "release.yml reads the current promoted version from registry metadata, not workflow input"
 assert_not_contains "$RELEASE_CONTENT" 'type=raw,value=${{ inputs.tag }}' \
   "workflow_dispatch does not publish an unnormalized raw v-prefixed tag"
 assert_contains "$RELEASE_CONTENT" "latest=false" \
@@ -305,9 +319,6 @@ if release_index >= metadata_index:
 metadata_tags = next(s["with"]["tags"] for s in steps if s.get("id") == "meta")
 required_tags = [
     "type=raw,value=${{ steps.release_meta.outputs.version }}",
-    "type=raw,value=${{ steps.release_meta.outputs.major_minor }}",
-    "type=raw,value=${{ steps.release_meta.outputs.major }}",
-    "type=raw,value=latest,enable=${{ steps.release_meta.outputs.stable == 'true' }}",
 ]
 missing_tags = [tag for tag in required_tags if tag not in metadata_tags]
 if missing_tags:
