@@ -247,6 +247,27 @@ Request memory bounds:
   is exceeded, and remain bounded under concurrent requests. SELECT and RESP3/HELLO state-loss regression
   tests prove a public client is closed rather than silently reconnected on database 0 or RESP2.
 
+## Final Verification Pass (this change)
+
+- `cargo test` for `playground-launcher`: 74/74 pass, including the new request-byte-budget tests.
+- `bash tests/run.sh`: 21/21 suites pass (added `tests/test_default_compose_config.sh`).
+- `shellcheck --severity=warning` over `scripts/*.sh` and `tests/*.sh`: clean, matching CI's own gate.
+- `actionlint` over every workflow in `.github/workflows/`: clean.
+- `helm lint` and `helm template` for both `charts/ferrite` and `charts/ferrite-sidecar`: clean;
+  `tests/test_helm_charts.sh`: 12/12 pass.
+- `docker compose config` resolves cleanly for the default, quickstart, Moonshot, TLS-override,
+  HA (standalone), custom-config-override, and monitoring Compose files.
+- Exact image/runtime probes (local builds, no `--no-cache` unless noted): the primary image reports
+  `ferrite 0.4.0` / `ferrite-cli 0.4.0`, answers `PONG`, becomes `healthy`, and its config is generated
+  by `ferrite init`; the Moonshot image answers `PONG`, serves `FN.HELP`, and reports
+  `FERRITE_COMPILED_FEATURES=forge-runtime`; the Playground image (rebuilt with `--no-cache` to confirm
+  the new request-byte-budget code is actually compiled in, verified via the extracted binary's
+  strings) serves `/api/health`, proxies `SET`/`GET` over the public RESP port, and becomes `healthy`.
+  The real `docker-compose.quickstart.yml` `ferrite` service, run against a locally built image tagged
+  to match its `ghcr.io/ferritelabs/ferrite:0.4.0` reference (the actual published tag was not
+  pullable from this environment — `manifest unknown`), becomes `healthy` via the fixed
+  `ferrite-cli PING` check and the full quickstart demo container completes successfully end to end.
+
 ## Deferred Items
 
 | ID | Description | Reason deferred |
