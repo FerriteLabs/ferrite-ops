@@ -1,4 +1,4 @@
-#!/usr/bin/env sh
+#!/usr/bin/env bash
 # Ferrite Restore Script
 #
 # Restores Ferrite data from a backup archive.
@@ -140,11 +140,18 @@ STAGE_DIR="${TMP_DIR}/restore"
 mkdir -p "$STAGE_DIR"
 tar "$EXTRACT_FLAGS" "$BACKUP_FILE" -C "$STAGE_DIR"
 
-# Find the backup content directory (may be nested in a named directory)
+# Find the backup content directory (may be nested in a named directory).
+# `-f` does not work with a glob that expands to more than one match (it is
+# passed as multiple arguments to `[`, which errors out) or to zero matches
+# (the literal, unexpanded pattern is tested, which is also just false) --
+# use a loop so both cases are handled explicitly and deterministically.
 CONTENT_DIR="$STAGE_DIR"
-if [ -f "$STAGE_DIR"/ferrite-backup-*/backup-metadata.json ] 2>/dev/null; then
-    CONTENT_DIR="$(dirname "$STAGE_DIR"/ferrite-backup-*/backup-metadata.json)"
-fi
+for candidate in "$STAGE_DIR"/ferrite-backup-*/backup-metadata.json; do
+    if [ -f "$candidate" ]; then
+        CONTENT_DIR="$(dirname "$candidate")"
+        break
+    fi
+done
 
 # Display backup metadata if available
 if [ -f "$CONTENT_DIR/backup-metadata.json" ]; then

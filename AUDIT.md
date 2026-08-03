@@ -23,20 +23,20 @@ listed for completeness and explicitly deferred — no code changes were made fo
 | F-08 | P2 | `scripts/backup.sh` (177 lines), `scripts/restore.sh` (294 lines), `scripts/cost-estimate.sh` (151 lines) | Only shell scripts over the 150-line threshold. Reviewed for SRP violations — see "Cohesive Long Units" below. No high-confidence SRP violation found; not refactored. | No action (by design) |
 | F-09 | P3 | naming scan | Searched all shell scripts for `Manager`/`Helper`/`Utils`/`Service`/`Handler` symbol names (functions, files). Only prose matches found (e.g. "connection handler" in an issue-template string, "Helper to check a version" comment, "package-manager" GitHub topic) — no actual function/file names follow these patterns; bash scripts here use verb-based function names (`log`, `cleanup`, `usage`). No violation. | No action |
 | F-10 | P0 | Linux-only code in the fetched `FerriteLabs/ferrite` v0.3.0 source | End-to-end image verification exposed two default-release compile defects: the optional `io_uring` module is compiled while its Cargo feature is disabled, and Linux-only eBPF fields are appended to immutable vectors. | Fixed in the isolated Docker build context with version-gated compatibility edits; no sibling or upstream repository is modified |
-| F-11 | P3 (informational) | `scripts/backup.sh`, `scripts/restore.sh`, `scripts/cost-estimate.sh` | Pre-existing ShellCheck warnings/errors (`SC3040`, `SC2034`, `SC2144`) reproduced identically on pre-audit commit `69b90b7`; unrelated to this audit's P0/P1 scope. CI's `shellcheck` job (`scandir: scripts`) was already failing on `main` for these reasons before this branch existed. | Documented, not fixed (out of scope) |
+| F-11 | P3 (informational) | `scripts/backup.sh`, `scripts/restore.sh`, `scripts/cost-estimate.sh` | Pre-existing ShellCheck warnings/errors (`SC3040`, `SC2034`, `SC2144`), reproduced identically on pre-audit commit `69b90b7`. `backup.sh`/`restore.sh` declared `#!/usr/bin/env sh` while using the bash-only `set -o pipefail` (`SC3040`); `restore.sh` used `-f` against an unexpanded multi-match glob to locate the extracted backup content directory (`SC2144`); `cost-estimate.sh` declared `REGION=""` but never wired the documented `--region` flag into argument parsing (`SC2034`). | Fixed |
 
-## Note: Pre-Existing, Unrelated ShellCheck Findings (F-11, out of scope)
+## Note: Previously Pre-Existing ShellCheck Findings (F-11, now fixed)
 
-Running `shellcheck --severity=warning scripts/*.sh` (i.e., the same invocation as CI's `shellcheck` job)
-surfaces pre-existing issues in three files this audit deliberately left untouched (see "Cohesive Long Units"
-below): `scripts/backup.sh:23` and `scripts/restore.sh:22` (`SC3040`, `pipefail` under `#!/usr/bin/env sh`),
-`scripts/cost-estimate.sh:16` (`SC2034`, unused `REGION`), and `scripts/restore.sh:145` (`SC2144`, `-f` used
-with a glob). Verified these are **not introduced by this pass** — they reproduce identically on the
-pre-audit commit (`69b90b7`). They are out of this audit's explicit P0/P1 scope (not related to the
-`smoke_test.sh`/`Dockerfile`/CI-verification findings this task targeted) and fixing them would mean editing
-scripts this audit otherwise found cohesive and intentionally left alone. Flagged here only so CI's
-`shellcheck` job's pass/fail status isn't misattributed to this branch's changes — that job's `scandir:
-scripts` was already failing on `main` before this audit for these unrelated reasons. Left unfixed.
+`shellcheck --severity=warning scripts/*.sh` (i.e., the same invocation as CI's `shellcheck` job) used to
+surface three pre-existing issues, reproduced identically on pre-audit commit `69b90b7` and confirmed
+unrelated to this audit's original P0/P1 scope: `scripts/backup.sh:23` and `scripts/restore.sh:22`
+(`SC3040`, `pipefail` under `#!/usr/bin/env sh`), `scripts/cost-estimate.sh:16` (`SC2034`, unused `REGION`),
+and `scripts/restore.sh:145` (`SC2144`, `-f` used with a glob). These have since been fixed: `backup.sh`/
+`restore.sh` now use `#!/usr/bin/env bash` (matching every other script under `scripts/`, and making the
+existing `pipefail` valid); `restore.sh`'s backup-content-directory discovery now uses an explicit `for`
+loop instead of `-f` against a glob (correct for zero, one, or multiple matches); `cost-estimate.sh` now
+parses and reports the `--region` flag its own usage text already documented. Regression coverage added in
+`tests/test_ops_scripts_static.sh`. `shellcheck --severity=warning scripts/*.sh` now exits 0.
 
 ## Detailed Findings
 

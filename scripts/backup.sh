@@ -1,4 +1,4 @@
-#!/usr/bin/env sh
+#!/usr/bin/env bash
 # Ferrite Backup Script
 #
 # Creates compressed backups of Ferrite checkpoint and AOF files.
