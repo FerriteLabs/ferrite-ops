@@ -48,7 +48,7 @@ assert_contains "$RELEASE_CONTENT" "github.event.client_payload.version" \
   "release.yml derives the version from repository_dispatch client_payload.version"
 assert_contains "$RELEASE_CONTENT" "inputs.tag" \
   "release.yml derives the version from the workflow_dispatch input"
-assert_contains "$RELEASE_CONTENT" "default: 'v0.3.0'" \
+assert_contains "$RELEASE_CONTENT" "default: 'v0.4.0'" \
   "release.yml's workflow_dispatch default is a concrete semver release"
 
 # --- Static checks: version-sync.yml ----------------------------------------
@@ -126,23 +126,23 @@ run_case() {
   )
 }
 
-if run_case "push_tag" push "" "" "v0.3.0" >"${EXTRACT_DIR}/log_push_tag.txt" 2>&1; then
+if run_case "push_tag" push "" "" "v0.4.0" >"${EXTRACT_DIR}/log_push_tag.txt" 2>&1; then
   OUT="$(cat "${EXTRACT_DIR}/output_push_tag.txt")"
-  assert_contains "$OUT" "version=0.3.0" "push-tag case derives version=0.3.0 from GITHUB_REF_NAME"
-  assert_contains "$OUT" "FERRITE_VERSION=0.3.0" "push-tag case emits FERRITE_VERSION build-arg"
-  assert_contains "$OUT" "FERRITE_SOURCE_SHA256=42cc9cd06b85fac0a09d6e1770d3eda61375324211be168dfb6dc7eab5825979" \
-    "push-tag case computes the correct real SHA256 for the v0.3.0 tarball"
+  assert_contains "$OUT" "version=0.4.0" "push-tag case derives version=0.4.0 from GITHUB_REF_NAME"
+  assert_contains "$OUT" "FERRITE_VERSION=0.4.0" "push-tag case emits FERRITE_VERSION build-arg"
+  assert_contains "$OUT" "FERRITE_SOURCE_SHA256=b4db8cc8eb0d3c2cef4a019a47d550c347df69fb8a4f77550c814fae463005cf" \
+    "push-tag case computes the correct real SHA256 for the v0.4.0 tarball"
 else
   harness_fail "push-tag case unexpectedly failed: $(cat "${EXTRACT_DIR}/log_push_tag.txt")"
 fi
 
-if run_case "workflow_dispatch" workflow_dispatch "" "v0.3.0" >"${EXTRACT_DIR}/log_workflow_dispatch.txt" 2>&1; then
+if run_case "workflow_dispatch" workflow_dispatch "" "v0.4.0" >"${EXTRACT_DIR}/log_workflow_dispatch.txt" 2>&1; then
   OUT="$(cat "${EXTRACT_DIR}/output_workflow_dispatch.txt")"
-  assert_contains "$OUT" "version=0.3.0" \
-    "workflow_dispatch derives version=0.3.0 from its version tag input"
-  assert_contains "$OUT" "FERRITE_VERSION=0.3.0" \
+  assert_contains "$OUT" "version=0.4.0" \
+    "workflow_dispatch derives version=0.4.0 from its version tag input"
+  assert_contains "$OUT" "FERRITE_VERSION=0.4.0" \
     "workflow_dispatch emits an explicit FERRITE_VERSION build-arg"
-  assert_contains "$OUT" "FERRITE_SOURCE_SHA256=42cc9cd06b85fac0a09d6e1770d3eda61375324211be168dfb6dc7eab5825979" \
+  assert_contains "$OUT" "FERRITE_SOURCE_SHA256=b4db8cc8eb0d3c2cef4a019a47d550c347df69fb8a4f77550c814fae463005cf" \
     "workflow_dispatch computes and emits the matching source checksum"
 else
   harness_fail "workflow_dispatch case unexpectedly failed: $(cat "${EXTRACT_DIR}/log_workflow_dispatch.txt")"

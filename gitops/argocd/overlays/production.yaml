@@ -20,7 +20,7 @@ spec:
   source:
     repoURL: https://github.com/ferritelabs/ferrite-ops.git
     # Pin to a release tag in production — never use HEAD.
-    targetRevision: v0.3.0
+    targetRevision: v0.4.0
     path: charts/ferrite
     helm:
       releaseName: ferrite
@@ -29,7 +29,7 @@ spec:
         - values-ha.yaml
       parameters:
         - name: image.tag
-          value: "0.3.0"
+          value: "0.4.0"
         - name: replicaCount
           value: "3"
         - name: resources.requests.cpu

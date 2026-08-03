@@ -9,7 +9,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'New version to sync (e.g. 0.3.1)'
+        description: 'New version to sync (e.g. 0.4.1)'
         required: true
       sha256:
         description: 'Source tarball SHA256 (optional — computed automatically if empty)'
@@ -40,7 +40,7 @@ jobs:
           else
             VERSION="${{ inputs.version }}"
           fi
-          # Accept either "v0.3.1" or "0.3.1".
+          # Accept either "v0.4.1" or "0.4.1".
           VERSION="${VERSION#v}"
 
           if [ -z "$VERSION" ]; then

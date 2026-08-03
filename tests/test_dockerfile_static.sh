@@ -67,11 +67,11 @@ assert_contains "$CONTENT" "github.com/FerriteLabs/ferrite" "Dockerfile's defaul
 
 # 6. FERRITE_VERSION default must not be silently bumped by future edits.
 ACTUAL_DEFAULT="$(grep -oE '^ARG FERRITE_VERSION=[0-9A-Za-z.+-]+' "$DOCKERFILE" | head -1 | cut -d= -f2)"
-assert_eq "0.3.0" "${ACTUAL_DEFAULT:-}" "ARG FERRITE_VERSION default is preserved at 0.3.0"
+assert_eq "0.4.0" "${ACTUAL_DEFAULT:-}" "ARG FERRITE_VERSION defaults to the current Ferrite release 0.4.0"
 assert_contains "$CONTENT" "rm -f rust-toolchain rust-toolchain.toml" \
   "fetched contributor toolchain cannot override the Docker build toolchain"
 assert_contains "$CONTENT" 'if [ "$FERRITE_VERSION" = "0.3.0" ]' \
-  "v0.3.0 source compatibility fix is scoped to the default release"
+  "legacy v0.3.0 source compatibility fix remains scoped to that explicit override"
 assert_contains "$CONTENT" 'feature = "io-uring"' \
   "v0.3.0 Linux io_uring module follows its optional Cargo feature"
 assert_contains "$CONTENT" 'let mut fields = vec!' \
@@ -140,13 +140,13 @@ if [[ -f "$EXAMPLE_TOML" ]]; then
 fi
 
 # 11. Source integrity: FERRITE_SOURCE_SHA256 must be declared, default to
-#     the verified v0.3.0 tarball digest, and be checked before extraction
+#     the verified v0.4.0 tarball digest, and be checked before extraction
 #     (i.e. the sha256sum verification must appear before the `tar`
 #     extraction step in the source stage).
-EXPECTED_SHA256="42cc9cd06b85fac0a09d6e1770d3eda61375324211be168dfb6dc7eab5825979"
+EXPECTED_SHA256="b4db8cc8eb0d3c2cef4a019a47d550c347df69fb8a4f77550c814fae463005cf"
 ACTUAL_SHA256_DEFAULT="$(grep -oE '^ARG FERRITE_SOURCE_SHA256=[0-9a-fA-F]+' "$DOCKERFILE" | head -1 | cut -d= -f2)"
 assert_eq "$EXPECTED_SHA256" "${ACTUAL_SHA256_DEFAULT:-}" \
-  "ARG FERRITE_SOURCE_SHA256 defaults to the verified v0.3.0 tarball SHA256"
+  "ARG FERRITE_SOURCE_SHA256 defaults to the verified v0.4.0 tarball SHA256"
 
 SOURCE_STAGE_BODY="$(sed -n '/^FROM chef AS source$/,/^FROM chef AS planner$/p' "$DOCKERFILE")"
 assert_contains "$SOURCE_STAGE_BODY" "sha256sum -c -" \

@@ -8,9 +8,9 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Ferrite release version (e.g. v0.3.0 or 0.3.0)'
+        description: 'Ferrite release version (e.g. v0.4.0 or 0.4.0)'
         required: true
-        default: 'v0.3.0'
+        default: 'v0.4.0'
 
 env:
   REGISTRY: ghcr.io
@@ -89,7 +89,7 @@ jobs:
               ;;
           esac
 
-          # Tags/payloads may use either "v0.3.0" or "0.3.0"; normalize.
+          # Tags/payloads may use either "v0.4.0" or "0.4.0"; normalize.
           VERSION="${RAW_VERSION#v}"
 
           if [ -z "$VERSION" ]; then

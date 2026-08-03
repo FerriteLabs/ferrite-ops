@@ -13,7 +13,7 @@
 # FERRITE_SOURCE_SHA256 is required: any override of FERRITE_VERSION and/or
 # FERRITE_SOURCE_URL must be paired with the matching tarball's SHA256, or
 # the build fails during the `source` stage (see below).
-ARG FERRITE_VERSION=0.3.0
+ARG FERRITE_VERSION=0.4.0
 FROM rust:1.95-slim-bookworm AS chef
 
 # Install cargo-chef for caching dependencies, plus curl/ca-certificates to
@@ -35,12 +35,12 @@ ARG FERRITE_SOURCE_URL=https://github.com/FerriteLabs/ferrite/archive/refs/tags/
 # extraction: a build with a missing, empty, or mismatched value fails
 # loudly rather than silently trusting an unverified download. The
 # default below is the real, verified SHA256 of the default
-# FERRITE_VERSION's tarball (v0.3.0) at the URL above. Any override of
+# FERRITE_VERSION's tarball (v0.4.0) at the URL above. Any override of
 # FERRITE_VERSION and/or FERRITE_SOURCE_URL (e.g. a fork, a newer release,
 # or a local mirror) must also pass a matching --build-arg
-# FERRITE_SOURCE_SHA256=<sha256 of that exact tarball> — the v0.3.0
+# FERRITE_SOURCE_SHA256=<sha256 of that exact tarball> — the v0.4.0
 # default will not match a different tarball and the build will fail.
-ARG FERRITE_SOURCE_SHA256=42cc9cd06b85fac0a09d6e1770d3eda61375324211be168dfb6dc7eab5825979
+ARG FERRITE_SOURCE_SHA256=b4db8cc8eb0d3c2cef4a019a47d550c347df69fb8a4f77550c814fae463005cf
 
 # The upstream source ships a dev-convenience .cargo/config.toml that pins
 # a clang+mold linker for faster local rebuilds. Per that file's own
@@ -89,9 +89,8 @@ RUN cargo chef cook --release --recipe-path recipe.json
 COPY --from=source /app /app
 
 # Preserve the Dockerfile's explicit Rust toolchain instead of allowing the
-# fetched contributor toolchain file to replace it. Ferrite v0.3.0 also
-# exposes its Linux io_uring implementation when the optional feature is
-# disabled; gate that module consistently with the declared Cargo feature.
+# fetched contributor toolchain file to replace it. Keep the compatibility
+# edits below only for explicit legacy v0.3.0 override builds.
 ARG FERRITE_VERSION
 RUN rm -f rust-toolchain rust-toolchain.toml \
     && if [ "$FERRITE_VERSION" = "0.3.0" ]; then \
@@ -122,7 +121,7 @@ RUN ls -lh /app/target/release/ferrite /app/target/release/ferrite-cli
 #   2. Loadability (F-17): the packaged ferrite.example.toml documents
 #      `max_memory = "1GB"` (a quoted string) and
 #      `eviction_policy = "noeviction"` — neither of which the real
-#      v0.3.0 binary's config parser actually accepts (it wants a raw
+#      legacy v0.3.0 binary's config parser actually accepts (it wants a raw
 #      byte count and the hyphenated "no-eviction"/omitted-default,
 #      respectively). Rather than special-case those values by hand
 #      (fragile, and drifts the moment the example or parser changes

@@ -10,7 +10,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'Release version (e.g. 0.3.0)'
+        description: 'Release version (e.g. 0.4.0)'
         required: true
       sha256:
         description: 'Source tarball SHA256 (optional — computed automatically if empty)'

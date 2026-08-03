@@ -4,9 +4,9 @@ description: A Helm chart for deploying Ferrite - a high-performance, tiered-sto
 
 type: application
 
-version: 0.3.0
+version: 0.4.0
 
-appVersion: "0.3.0"
+appVersion: "0.4.0"
 
 kubeVersion: ">=1.23.0-0"
 

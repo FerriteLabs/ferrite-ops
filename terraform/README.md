@@ -20,7 +20,7 @@ module "ferrite" {
   name               = "ferrite-prod"
   vpc_id             = "vpc-abc123"
   subnet_ids         = ["subnet-1", "subnet-2"]
-  ferrite_version    = "0.3.0"
+  ferrite_version    = "0.4.0"
   cpu                = 2048
   memory             = 4096
   desired_count      = 2
@@ -36,7 +36,7 @@ module "ferrite" {
 
   cluster_name    = "my-cluster"
   namespace       = "ferrite"
-  ferrite_version = "0.3.0"
+  ferrite_version = "0.4.0"
   replica_count   = 3
   storage_size    = "50Gi"
   enable_ha       = true

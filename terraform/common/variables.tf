@@ -3,7 +3,7 @@
 variable "ferrite_version" {
   description = "Ferrite Docker image tag"
   type        = string
-  default     = "0.3.0"
+  default     = "0.4.0"
 }
 
 variable "ferrite_image" {
