@@ -84,4 +84,44 @@ assert_contains "$CONTENT" "EXPOSE 6379" "Dockerfile still exposes the Redis-com
 assert_contains "$CONTENT" "EXPOSE 9090" "Dockerfile still exposes the metrics port 9090"
 assert_contains "$CONTENT" 'ENTRYPOINT ["/usr/local/bin/ferrite"]' "Dockerfile entrypoint is unchanged"
 
+# 8. Runtime stage must use a glibc-based (Debian) image, not Alpine
+#    (musl), to match the glibc ABI of the `rust:1.95-slim-bookworm`
+#    builder stage. Building with a Debian/glibc toolchain and then running
+#    under an Alpine/musl runtime is an ABI mismatch that risks a missing
+#    dynamic linker/library failure at container startup.
+RUNTIME_STAGE_FROM="$(grep -E '^FROM .* AS runtime$' "$DOCKERFILE" | head -1)"
+assert_contains "$RUNTIME_STAGE_FROM" "debian" "runtime stage is based on a Debian (glibc) image"
+assert_not_contains "$CONTENT" "FROM alpine" "no build stage uses an Alpine (musl) base image"
+
+# 9. The non-root UID 1000 contract must be preserved regardless of which
+#    user-management tool (Alpine's adduser vs. Debian's useradd/groupadd)
+#    is used to create it.
+assert_contains "$CONTENT" "1000" "runtime stage still creates its non-root user with UID/GID 1000"
+assert_contains "$CONTENT" "USER ferrite" "runtime stage still switches to the non-root 'ferrite' user"
+
+# 10. Container reachability: the runtime's default config must be a
+#     generated, container-specific copy with server/metrics binds
+#     rewritten to 0.0.0.0 — never a verbatim copy of the loopback-only
+#     public example (which is unreachable through Docker's published-port
+#     mapping) — and the public example file itself must be untouched.
+assert_contains "$CONTENT" "AS runtime-config" \
+  "Dockerfile has a dedicated stage that generates the container runtime config"
+assert_contains "$CONTENT" 'sed ' \
+  "runtime config generation uses a sed transform rather than a verbatim copy"
+assert_contains "$CONTENT" 'bind = "0.0.0.0"' \
+  "runtime config generation targets a 0.0.0.0 bind replacement"
+assert_contains "$CONTENT" "COPY --from=runtime-config" \
+  "final runtime stage copies the generated config from the runtime-config stage"
+assert_not_contains "$CONTENT" 'COPY --chown=ferrite:ferrite ferrite.example.toml /etc/ferrite/ferrite.toml' \
+  "final runtime stage no longer copies the public example verbatim as the container default"
+
+# The public example file's own default (127.0.0.1, correct for local/native
+# installs) must remain unmodified by this audit's container-reachability fix.
+EXAMPLE_TOML="${REPO_ROOT}/ferrite.example.toml"
+if [[ -f "$EXAMPLE_TOML" ]]; then
+  EXAMPLE_BIND_COUNT="$(grep -c '^bind = "127\.0\.0\.1"$' "$EXAMPLE_TOML" || true)"
+  assert_eq "2" "${EXAMPLE_BIND_COUNT:-0}" \
+    "ferrite.example.toml keeps its documented 127.0.0.1 default for server and metrics binds"
+fi
+
 harness_summary

@@ -23,6 +23,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: docker build -t ferrite:test .
+      # Post-build runtime test: proves the compiled binary actually
+      # executes under the runtime image's C library (glibc/Debian). This
+      # is the cheapest possible check that would have caught a
+      # builder/runtime ABI mismatch (e.g. glibc binaries on an Alpine/musl
+      # runtime failing at startup with a missing dynamic linker error).
+      - name: Verify runtime image executes (ABI compatibility)
+        run: |
+          docker run --rm ferrite:test --version
+          docker run --rm --entrypoint /usr/local/bin/ferrite-cli ferrite:test --version
 
   helm:
     name: Helm Lint
