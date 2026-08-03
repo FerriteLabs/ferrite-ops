@@ -76,8 +76,10 @@ assert_not_contains "$RELEASE_CONTENT" "bump-chart" \
   "release.yml no longer runs its own competing chart-only bump job"
 assert_not_contains "$RELEASE_CONTENT" "charts/ferrite" \
   "release.yml does not touch chart files; version-sync.yml is the single workflow that does"
-assert_contains "$ORCHESTRATION_CONTENT" "charts/ferrite-sidecar/Chart.yaml" \
-  "release-orchestration.yml updates the sidecar chart appVersion"
+assert_not_contains "$ORCHESTRATION_CONTENT" "charts/ferrite" \
+  "release-orchestration.yml leaves every ferrite-ops version pin to version-sync.yml"
+assert_not_contains "$ORCHESTRATION_CONTENT" "update-ops:" \
+  "release-orchestration.yml no longer opens a competing ferrite-ops version PR"
 
 # --- Static checks: version-sync.yml ----------------------------------------
 for dockerfile in Dockerfile Dockerfile.moonshot Dockerfile.playground; do
@@ -150,15 +152,15 @@ fi
 
 # version-sync.yml must be the workflow that reacts to the real
 # `ferrite-release` dispatch core emits (kept alongside `version-sync` only
-# for backward compatibility), and release.yml must no longer run a
-# competing job of its own that partially updates chart files.
+# for backward compatibility), and no other release workflow may run a
+# competing job that partially updates chart files.
 if command -v python3 >/dev/null 2>&1 &&
   python3 -c "import yaml" >/dev/null 2>&1 &&
-  python3 - "$VERSION_SYNC_YML" "$RELEASE_YML" <<'TRIGGERCHECK'
+  python3 - "$VERSION_SYNC_YML" "$RELEASE_YML" "$ORCHESTRATION_YML" <<'TRIGGERCHECK'
 import sys
 import yaml
 
-version_sync_path, release_path = sys.argv[1:]
+version_sync_path, release_path, orchestration_path = sys.argv[1:]
 
 with open(version_sync_path) as f:
     version_sync_doc = yaml.safe_load(f)
@@ -178,11 +180,23 @@ if "bump-chart" in release_doc.get("jobs", {}):
     raise SystemExit(
         "release.yml must not define its own competing chart-only bump job"
     )
+
+with open(orchestration_path) as f:
+    orchestration_doc = yaml.safe_load(f)
+if "update-ops" in orchestration_doc.get("jobs", {}):
+    raise SystemExit(
+        "release-orchestration.yml must not define a competing ferrite-ops update job"
+    )
+orchestration_text = open(orchestration_path).read()
+if "charts/ferrite" in orchestration_text:
+    raise SystemExit(
+        "release-orchestration.yml must leave chart updates to version-sync.yml"
+    )
 TRIGGERCHECK
 then
   harness_ok "version-sync.yml is the sole ferrite-release chart/Dockerfile/pin sync workflow"
 else
-  harness_fail "release.yml and version-sync.yml disagree on which workflow owns the ferrite-release sync"
+  harness_fail "release workflows disagree on which workflow owns the ferrite-release sync"
 fi
 
 # --- Static checks: ordinary CI/scan workflows retain pinned defaults -------
@@ -222,8 +236,7 @@ EXTRACT_LOG="${EXTRACT_DIR}/extract.log"
 if ! python3 - "$RELEASE_YML" "$VERSION_SYNC_YML" "$ORCHESTRATION_YML" \
   "$EXTRACT_DIR/release_meta.sh" "$EXTRACT_DIR/version_sync_meta.sh" \
   "$EXTRACT_DIR/orchestration_meta.sh" "$EXTRACT_DIR/update_dockerfiles.sh" \
-  "$EXTRACT_DIR/version_sync_chart.sh" \
-  "$EXTRACT_DIR/orchestration_chart.sh" "$EXTRACT_DIR/metadata_tags.txt" \
+  "$EXTRACT_DIR/version_sync_chart.sh" "$EXTRACT_DIR/metadata_tags.txt" \
   >"${EXTRACT_DIR}/extract.stdout" 2>"${EXTRACT_DIR}/extract.log" << 'PYEOF'
 import sys
 import yaml
@@ -237,7 +250,6 @@ import yaml
     orchestration_meta_out_path,
     sync_out_path,
     version_sync_chart_out_path,
-    orchestration_chart_out_path,
     metadata_tags_out_path,
 ) = sys.argv[1:]
 with open(release_yml_path) as f:
@@ -314,14 +326,6 @@ orchestration_meta_script = next(
 )
 with open(orchestration_meta_out_path, "w") as f:
     f.write(orchestration_meta_script)
-
-orchestration_chart_script = next(
-    s["run"]
-    for s in orchestration_doc["jobs"]["update-ops"]["steps"]
-    if s.get("name") == "Update Helm Chart version"
-)
-with open(orchestration_chart_out_path, "w") as f:
-    f.write(orchestration_chart_script)
 PYEOF
 then
   harness_fail "release workflow extraction failed: $(cat "$EXTRACT_LOG")"
@@ -428,37 +432,6 @@ else
     "FERRITE_VERSION=${EXPECTED_VERSION}" \
     "structural drift leaves canonical metadata unchanged"
 fi
-
-# Replay the remaining chart release path. version-sync.yml's comprehensive
-# active-release transaction (exercised above via SYNC_SCRIPT) is the sole
-# path that bumps the primary chart's package version; release-orchestration.yml
-# separately updates chart appVersions when manually dispatched, and the
-# primary package follows the core release while the sidecar package version
-# remains independently versioned.
-# shellcheck disable=SC2043  # single-element on purpose: release_chart was
-# removed when release.yml's competing chart-only bump job was removed; kept
-# as a loop so a future additional chart-update path is easy to add back.
-for chart_path in orchestration_chart; do
-  CHART_DIR="${EXTRACT_DIR}/${chart_path}"
-  mkdir -p "${CHART_DIR}/charts/ferrite" "${CHART_DIR}/charts/ferrite-sidecar"
-  cp "${REPO_ROOT}/charts/ferrite/Chart.yaml" "${CHART_DIR}/charts/ferrite/Chart.yaml"
-  cp "${REPO_ROOT}/charts/ferrite-sidecar/Chart.yaml" \
-    "${CHART_DIR}/charts/ferrite-sidecar/Chart.yaml"
-
-  CHART_SCRIPT="$(cat "${EXTRACT_DIR}/${chart_path}.sh")"
-  if (cd "$CHART_DIR" && VERSION="9.8.7" bash -c "$CHART_SCRIPT"); then
-    assert_contains "$(cat "${CHART_DIR}/charts/ferrite/Chart.yaml")" "version: 9.8.7" \
-      "${chart_path} updates the primary chart package version"
-    assert_contains "$(cat "${CHART_DIR}/charts/ferrite/Chart.yaml")" 'appVersion: "9.8.7"' \
-      "${chart_path} updates the primary chart appVersion"
-    assert_contains "$(cat "${CHART_DIR}/charts/ferrite-sidecar/Chart.yaml")" 'appVersion: "9.8.7"' \
-      "${chart_path} updates the sidecar chart appVersion"
-    assert_contains "$(cat "${CHART_DIR}/charts/ferrite-sidecar/Chart.yaml")" "version: 0.2.0" \
-      "${chart_path} preserves the sidecar chart's independent package version"
-  else
-    harness_fail "${chart_path} chart update functional replay unexpectedly failed"
-  fi
-done
 
 # Resolve docker/metadata-action's tag template against the outputs a given
 # trigger actually produced, so the *effective* published tag set is asserted

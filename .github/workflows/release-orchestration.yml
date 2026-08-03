@@ -76,58 +76,10 @@ jobs:
 
           echo "::notice::Release v${VERSION} (SHA256: ${SHA256})"
 
-  # ── Step 2: Update Docker image and Helm chart ───────────────────────────────
-  update-ops:
-    name: Update ferrite-ops
-    needs: prepare
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-      pull-requests: write
-    steps:
-      - uses: actions/checkout@v4
+  # ferrite-ops version pins are updated exclusively by version-sync.yml,
+  # which handles this same ferrite-release dispatch as one atomic transaction.
 
-      - name: Update Helm Chart version
-        if: ${{ !(inputs.dry_run || false) }}
-        env:
-          VERSION: ${{ needs.prepare.outputs.version }}
-        run: |
-          set -euo pipefail
-          if ! printf '%s\n' "$VERSION" |
-            grep -qE '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?$'; then
-            echo "::error::Invalid normalized release version"
-            exit 1
-          fi
-          perl -pi -e "s/^version:.*/version: ${VERSION}/" charts/ferrite/Chart.yaml
-          perl -pi -e "s/^appVersion:.*/appVersion: \"${VERSION}\"/" charts/ferrite/Chart.yaml
-          perl -pi -e "s/^appVersion:.*/appVersion: \"${VERSION}\"/" charts/ferrite-sidecar/Chart.yaml
-          echo "Updated primary chart version/appVersion and sidecar appVersion to ${VERSION}"
-
-      - name: Create version bump PR
-        if: ${{ !(inputs.dry_run || false) }}
-        uses: peter-evans/create-pull-request@v6
-        with:
-          title: "chore: release v${{ needs.prepare.outputs.version }}"
-          body: |
-            Automated release coordination for Ferrite v${{ needs.prepare.outputs.version }}.
-
-            ## Changes
-            - Updated Helm chart version and appVersion to ${{ needs.prepare.outputs.version }}
-            - Updated sidecar chart appVersion to ${{ needs.prepare.outputs.version }} (package version unchanged)
-
-            _Triggered by [release orchestration](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})._
-          branch: "release/${{ needs.prepare.outputs.version }}"
-          labels: release
-          commit-message: "chore: bump to v${{ needs.prepare.outputs.version }}"
-
-      - name: Dry run log
-        if: ${{ inputs.dry_run || false }}
-        env:
-          VERSION: ${{ needs.prepare.outputs.version }}
-        run: |
-          echo "::notice::[DRY RUN] Would update primary chart version/appVersion and sidecar appVersion to v${VERSION}"
-
-  # ── Step 3: Trigger Homebrew formula update ──────────────────────────────────
+  # ── Step 2: Trigger Homebrew formula update ──────────────────────────────────
   update-homebrew:
     name: Update homebrew-tap
     needs: prepare
@@ -179,7 +131,7 @@ jobs:
         run: |
           echo "::notice::[DRY RUN] Would trigger homebrew-tap for v${VERSION}"
 
-  # ── Step 4: Trigger documentation site update ────────────────────────────────
+  # ── Step 3: Trigger documentation site update ────────────────────────────────
   update-docs:
     name: Update ferrite-docs
     needs: prepare
@@ -225,7 +177,7 @@ jobs:
         run: |
           echo "::notice::[DRY RUN] Would trigger ferrite-docs for v${VERSION}"
 
-  # ── Step 5: Trigger SDK and IDE extension updates ────────────────────────────
+  # ── Step 4: Trigger SDK and IDE extension updates ────────────────────────────
   update-sdks:
     name: Update SDKs & Extensions
     needs: prepare
@@ -296,10 +248,10 @@ jobs:
         run: |
           echo "::notice::[DRY RUN] Would trigger SDK updates for: vscode-ferrite, jetbrains-ferrite, ferrite-python-sdk, ferrite-go-sdk, ferrite-node-sdk, ferrite-java-sdk, ferrite-dotnet-sdk, ferrite-rust-sdk"
 
-  # ── Step 6: Run version sync check ──────────────────────────────────────────
+  # ── Step 5: Report orchestration results ────────────────────────────────────
   verify:
-    name: Version Sync Check
-    needs: [prepare, update-ops, update-homebrew, update-docs, update-sdks]
+    name: Orchestration Summary
+    needs: [prepare, update-homebrew, update-docs, update-sdks]
     if: always()
     runs-on: ubuntu-latest
     steps:
@@ -310,7 +262,6 @@ jobs:
           VERSION: ${{ needs.prepare.outputs.version }}
           SHA256: ${{ needs.prepare.outputs.sha256 }}
           DRY_RUN: ${{ inputs.dry_run || false }}
-          UPDATE_OPS_RESULT: ${{ needs.update-ops.result }}
           UPDATE_HOMEBREW_RESULT: ${{ needs.update-homebrew.result }}
           UPDATE_DOCS_RESULT: ${{ needs.update-docs.result }}
           UPDATE_SDKS_RESULT: ${{ needs.update-sdks.result }}
@@ -330,7 +281,6 @@ jobs:
             echo ""
             echo "| Repository | Status |"
             echo "|-----------|--------|"
-            echo "| ferrite-ops (Helm) | ${UPDATE_OPS_RESULT} |"
             echo "| homebrew-tap | ${UPDATE_HOMEBREW_RESULT} |"
             echo "| ferrite-docs | ${UPDATE_DOCS_RESULT} |"
             echo "| SDKs & Extensions | ${UPDATE_SDKS_RESULT} |"
