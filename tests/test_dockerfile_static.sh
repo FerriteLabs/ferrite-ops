@@ -70,8 +70,10 @@ ACTUAL_DEFAULT="$(grep -oE '^ARG FERRITE_VERSION=[0-9A-Za-z.+-]+' "$DOCKERFILE" 
 assert_eq "0.4.0" "${ACTUAL_DEFAULT:-}" "ARG FERRITE_VERSION defaults to the current Ferrite release 0.4.0"
 assert_contains "$CONTENT" "rm -f rust-toolchain rust-toolchain.toml" \
   "fetched contributor toolchain cannot override the Docker build toolchain"
-assert_contains "$CONTENT" 'if [ "$FERRITE_VERSION" = "0.3.0" ]' \
-  "legacy v0.3.0 source compatibility fix remains scoped to that explicit override"
+assert_contains "$CONTENT" '[ "$FERRITE_VERSION" = "0.4.0" ]' \
+  "v0.4.0 Linux io_uring compatibility gate is applied to the current release"
+assert_contains "$CONTENT" '[ "$FERRITE_VERSION" = "0.4.0" ]; then' \
+  "v0.4.0 Linux eBPF mutability compatibility fix is applied"
 assert_contains "$CONTENT" 'feature = "io-uring"' \
   "v0.3.0 Linux io_uring module follows its optional Cargo feature"
 assert_contains "$CONTENT" 'let mut fields = vec!' \

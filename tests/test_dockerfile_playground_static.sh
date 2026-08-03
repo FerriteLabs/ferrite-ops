@@ -76,12 +76,10 @@ assert_eq "$EXPECTED_SHA256" "${ACTUAL_SHA256_DEFAULT:-}" "ARG FERRITE_SOURCE_SH
 assert_contains "$CONTENT" "sha256sum -c -" "source stage verifies the fetched tarball with sha256sum"
 assert_contains "$CONTENT" 'if [ -z "$FERRITE_SOURCE_SHA256" ]' "source stage refuses to build when FERRITE_SOURCE_SHA256 is empty"
 
-# 5. Same v0.3.0 build-compatibility fix as the primary Dockerfile (F-10):
-#    this file fetches the identical source tarball and would hit the
-#    identical compile defects without it.
-assert_contains "$CONTENT" 'if [ "$FERRITE_VERSION" = "0.3.0" ]' "v0.3.0 source compatibility fix is scoped to the default release"
-assert_contains "$CONTENT" 'feature = "io-uring"' "v0.3.0 Linux io_uring module follows its optional Cargo feature"
-assert_contains "$CONTENT" 'let mut fields = vec!' "v0.3.0 Linux eBPF fields remain mutable when platform fields are appended"
+# 5. Same version-scoped build compatibility fixes as the primary Dockerfile.
+assert_contains "$CONTENT" '[ "$FERRITE_VERSION" = "0.4.0" ]' "v0.4.0 Linux io_uring compatibility gate is applied"
+assert_contains "$CONTENT" 'feature = "io-uring"' "Linux io_uring module follows its optional Cargo feature"
+assert_contains "$CONTENT" 'let mut fields = vec!' "v0.4.0 Linux eBPF fields remain mutable when platform fields are appended"
 
 # 6. ABI compatibility: builder and runtime stages must both be
 #    glibc-based (Debian), so the compiled binary's dynamic linkage

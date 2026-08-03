@@ -89,15 +89,18 @@ RUN cargo chef cook --release --recipe-path recipe.json
 COPY --from=source /app /app
 
 # Preserve the Dockerfile's explicit Rust toolchain instead of allowing the
-# fetched contributor toolchain file to replace it. Keep the compatibility
-# edits below only for explicit legacy v0.3.0 override builds.
+# fetched contributor toolchain file to replace it. Ferrite v0.3.0 and v0.4.0
+# expose the Linux io_uring module when the optional feature is disabled, so
+# gate it consistently. Both releases also need mutable Linux eBPF fields.
 ARG FERRITE_VERSION
 RUN rm -f rust-toolchain rust-toolchain.toml \
-    && if [ "$FERRITE_VERSION" = "0.3.0" ]; then \
+    && if [ "$FERRITE_VERSION" = "0.3.0" ] || [ "$FERRITE_VERSION" = "0.4.0" ]; then \
         sed -i \
           -e 's/#\[cfg(target_os = "linux")\]/#[cfg(all(target_os = "linux", feature = "io-uring"))]/g' \
           -e 's/#\[cfg(not(target_os = "linux"))\]/#[cfg(any(not(target_os = "linux"), not(feature = "io-uring")))]/g' \
           crates/ferrite-core/src/io/mod.rs; \
+    fi \
+    && if [ "$FERRITE_VERSION" = "0.3.0" ] || [ "$FERRITE_VERSION" = "0.4.0" ]; then \
         sed -i 's/let fields = vec!\[/let mut fields = vec![/g' \
           src/commands/handlers/ebpf.rs; \
     fi
