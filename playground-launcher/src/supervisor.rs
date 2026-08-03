@@ -21,7 +21,8 @@ pub const INTERNAL_RESP_ADDR: &str = "127.0.0.1:6380";
 pub const INTERNAL_RESP_BIND: &str = "127.0.0.1";
 pub const INTERNAL_RESP_PORT: &str = "6380";
 pub const DATA_DIR: &str = "/var/lib/ferrite/data";
-pub const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
+pub const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+pub const KILL_REAP_TIMEOUT: Duration = Duration::from_millis(500);
 pub const STARTUP_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Spawn the Ferrite child bound to the internal loopback port only.
@@ -112,9 +113,14 @@ pub async fn stop_with_timeout(child: &mut Child, grace: Duration) -> Result<Exi
             child
                 .start_kill()
                 .map_err(|error| format!("failed to SIGKILL Ferrite child {pid}: {error}"))?;
-            child
-                .wait()
+            timeout(KILL_REAP_TIMEOUT, child.wait())
                 .await
+                .map_err(|_| {
+                    format!(
+                        "timed out after {} seconds reaping Ferrite child {pid} after SIGKILL",
+                        KILL_REAP_TIMEOUT.as_secs_f64()
+                    )
+                })?
                 .map_err(|error| format!("failed to reap Ferrite child {pid}: {error}"))
         }
     }
@@ -133,6 +139,7 @@ mod tests {
             format!("{INTERNAL_RESP_BIND}:{INTERNAL_RESP_PORT}")
         );
         assert_ne!(INTERNAL_RESP_PORT, "6379");
+        assert_eq!(SHUTDOWN_TIMEOUT, Duration::from_secs(5));
     }
 
     #[cfg(unix)]
@@ -177,9 +184,13 @@ mod tests {
         // Give the shell time to install its trap even on a loaded machine.
         sleep(Duration::from_millis(250)).await;
 
-        let status = stop_with_timeout(&mut child, Duration::from_millis(100))
-            .await
-            .unwrap();
+        let status = timeout(
+            Duration::from_secs(1),
+            stop_with_timeout(&mut child, Duration::from_millis(100)),
+        )
+        .await
+        .expect("uncooperative child shutdown must remain bounded")
+        .unwrap();
         assert!(!status.success());
         assert!(child.try_wait().unwrap().is_some());
     }

@@ -27,8 +27,10 @@ use tokio::sync::{oneshot, Semaphore};
 use tokio::task::JoinHandle;
 use tokio::time::{timeout, Duration};
 
-const HTTP_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
-const PROXY_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
+const SERVICE_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
+const SERVICE_ABORT_REAP_TIMEOUT: Duration = Duration::from_millis(500);
+#[cfg(test)]
+const MAX_INTERNAL_SHUTDOWN_BUDGET: Duration = Duration::from_secs(7);
 const MAX_BACKEND_OPERATIONS: usize = 32;
 
 #[tokio::main]
@@ -146,12 +148,19 @@ async fn run() -> Result<(), String> {
 
     let _ = http_shutdown_tx.send(());
     let _ = proxy_shutdown_tx.send(());
-    let http_result =
-        join_service(&mut http_server, HTTP_SHUTDOWN_TIMEOUT, "HTTP playground").await;
-    let proxy_result =
-        join_service(&mut resp_proxy, PROXY_SHUTDOWN_TIMEOUT, "public RESP proxy").await;
+    let (http_result, proxy_result) = join_services(&mut http_server, &mut resp_proxy).await;
 
     outcome.and(http_result).and(proxy_result)
+}
+
+async fn join_services(
+    http_server: &mut Option<JoinHandle<Result<(), String>>>,
+    resp_proxy: &mut Option<JoinHandle<Result<(), String>>>,
+) -> (Result<(), String>, Result<(), String>) {
+    tokio::join!(
+        join_service(http_server, SERVICE_SHUTDOWN_TIMEOUT, "HTTP playground"),
+        join_service(resp_proxy, SERVICE_SHUTDOWN_TIMEOUT, "public RESP proxy")
+    )
 }
 
 async fn join_service(
@@ -169,7 +178,9 @@ async fn join_service(
         Ok(Err(error)) => Err(format!("{name} task failed: {error}")),
         Err(_) => {
             service.abort();
-            let _ = service.await;
+            let _ = timeout(SERVICE_ABORT_REAP_TIMEOUT, service)
+                .await
+                .map_err(|_| format!("timed out reaping aborted {name} task"))?;
             Err(format!("timed out waiting for {name} shutdown"))
         }
     }
@@ -227,6 +238,37 @@ mod tests {
                 .await
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn total_internal_shutdown_budget_stays_below_docker_default() {
+        assert_eq!(supervisor::SHUTDOWN_TIMEOUT, Duration::from_secs(5));
+        assert_eq!(
+            MAX_INTERNAL_SHUTDOWN_BUDGET,
+            supervisor::SHUTDOWN_TIMEOUT
+                + supervisor::KILL_REAP_TIMEOUT
+                + SERVICE_SHUTDOWN_TIMEOUT
+                + SERVICE_ABORT_REAP_TIMEOUT
+        );
+        assert!(MAX_INTERNAL_SHUTDOWN_BUDGET < Duration::from_secs(10));
+    }
+
+    #[tokio::test]
+    async fn remaining_service_tasks_are_joined_and_reaped_together() {
+        let mut http = Some(tokio::spawn(async {
+            std::future::pending::<Result<(), String>>().await
+        }));
+        let mut resp = Some(tokio::spawn(async {
+            std::future::pending::<Result<(), String>>().await
+        }));
+
+        let joined = timeout(Duration::from_secs(2), join_services(&mut http, &mut resp))
+            .await
+            .expect("parallel service cleanup must fit one service timeout plus abort reap");
+        assert!(joined.0.unwrap_err().contains("HTTP playground"));
+        assert!(joined.1.unwrap_err().contains("public RESP proxy"));
+        assert!(http.is_none());
+        assert!(resp.is_none());
     }
 
     #[tokio::test]

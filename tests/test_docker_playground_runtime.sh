@@ -252,10 +252,16 @@ CHILDREN_BEFORE="$(docker exec "$CONTAINER_ID" sh -c \
   2>/dev/null || true)"
 assert_contains "$CHILDREN_BEFORE" "(ferrite)" "launcher PID 1 supervises a Ferrite child before shutdown"
 
-if docker stop --time 15 "$CONTAINER_ID" >/dev/null 2>>"$RUN_LOG"; then
-  harness_ok "docker stop completes within the graceful shutdown bound"
+STOP_STARTED="$(date +%s)"
+if docker stop "$CONTAINER_ID" >/dev/null 2>>"$RUN_LOG"; then
+  STOP_ELAPSED=$(( $(date +%s) - STOP_STARTED ))
+  if [[ "$STOP_ELAPSED" -lt 10 ]]; then
+    harness_ok "plain docker stop completes before Docker's default SIGKILL deadline"
+  else
+    harness_fail "plain docker stop took ${STOP_ELAPSED}s (expected less than 10s)"
+  fi
 else
-  harness_fail "docker stop failed: $(tail -40 "$RUN_LOG")"
+  harness_fail "plain docker stop failed: $(tail -40 "$RUN_LOG")"
 fi
 
 RUNNING="$(docker inspect --format='{{.State.Running}}' "$CONTAINER_ID" 2>/dev/null || true)"
