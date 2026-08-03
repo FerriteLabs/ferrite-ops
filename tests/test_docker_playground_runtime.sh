@@ -116,6 +116,62 @@ assert_contains "$HTTP_SET" '"data":"OK"' "HTTP execute returns Ferrite's real R
 RESP_GET="$(resp_cmd 127.0.0.1 "$RESP_PORT" GET from-http 2>/dev/null || true)"
 assert_eq "visible-over-resp" "$RESP_GET" "data written through HTTP is visible through public RESP"
 
+# --- Playground lifecycle/admin policy -------------------------------------
+# The public RESP port is owned by the launcher's proxy, not by Ferrite, so
+# administrative/lifecycle commands must be refused on both entry points while
+# ordinary Redis-compatible commands keep working and the child stays alive.
+HTTP_SHUTDOWN="$(curl -s --max-time 5 -o /dev/stdout -w '\n%{http_code}' -X POST \
+  -H 'content-type: application/json' \
+  --data '{"command":"SHUTDOWN"}' \
+  "http://127.0.0.1:${HTTP_PORT}/api/execute" 2>/dev/null || true)"
+assert_contains "$HTTP_SHUTDOWN" '403' "HTTP execute refuses SHUTDOWN with a 403"
+assert_contains "$HTTP_SHUTDOWN" '"success":false' "HTTP SHUTDOWN is reported as a failure"
+assert_contains "$HTTP_SHUTDOWN" 'playground' "HTTP SHUTDOWN rejection explains the playground policy"
+
+for admin_command in DEBUG CONFIG MODULE ACL SAVE BGSAVE BGREWRITEAOF REPLICAOF; do
+  ADMIN_REPLY="$(curl -s --max-time 5 -X POST -H 'content-type: application/json' \
+    --data "{\"command\":\"${admin_command} HELP\"}" \
+    "http://127.0.0.1:${HTTP_PORT}/api/execute" 2>/dev/null || true)"
+  assert_contains "$ADMIN_REPLY" '"success":false' \
+    "HTTP execute refuses the administrative command ${admin_command}"
+done
+
+RESP_SHUTDOWN="$(resp_cmd 127.0.0.1 "$RESP_PORT" SHUTDOWN NOSAVE 2>/dev/null || true)"
+assert_contains "$RESP_SHUTDOWN" "playground" "public RESP port refuses SHUTDOWN with a policy error"
+
+RESP_CONFIG="$(resp_cmd 127.0.0.1 "$RESP_PORT" CONFIG SET appendonly yes 2>/dev/null || true)"
+assert_contains "$RESP_CONFIG" "playground" "public RESP port refuses CONFIG SET"
+
+sleep 1
+STILL_RUNNING="$(docker inspect --format='{{.State.Running}}' "$CONTAINER_ID" 2>/dev/null || true)"
+assert_eq "true" "$STILL_RUNNING" "container survives unauthenticated SHUTDOWN attempts"
+
+RESP_PING_AFTER="$(resp_cmd 127.0.0.1 "$RESP_PORT" PING 2>/dev/null || true)"
+assert_eq "PONG" "$RESP_PING_AFTER" "public RESP port still serves ordinary commands after refusals"
+
+RESP_SET_AFTER="$(resp_cmd 127.0.0.1 "$RESP_PORT" SET after-shutdown-attempt still-alive 2>/dev/null || true)"
+assert_eq "OK" "$RESP_SET_AFTER" "SET works through the public RESP port after refusals"
+RESP_GET_AFTER="$(resp_cmd 127.0.0.1 "$RESP_PORT" GET after-shutdown-attempt 2>/dev/null || true)"
+assert_eq "still-alive" "$RESP_GET_AFTER" "GET works through the public RESP port after refusals"
+
+HTTP_SET_AFTER="$(curl -fsS --max-time 5 -X POST -H 'content-type: application/json' \
+  --data '{"command":"SET http-after-shutdown still-alive"}' \
+  "http://127.0.0.1:${HTTP_PORT}/api/execute" 2>/dev/null || true)"
+assert_contains "$HTTP_SET_AFTER" '"data":"OK"' "SET works through HTTP after refusals"
+HTTP_GET_AFTER="$(curl -fsS --max-time 5 -X POST -H 'content-type: application/json' \
+  --data '{"command":"GET http-after-shutdown"}' \
+  "http://127.0.0.1:${HTTP_PORT}/api/execute" 2>/dev/null || true)"
+assert_contains "$HTTP_GET_AFTER" '"data":"still-alive"' "GET works through HTTP after refusals"
+
+# The Ferrite child must listen on the internal loopback port only; the
+# public port belongs to the launcher's policy-enforcing proxy.
+CHILD_CMDLINE="$(docker exec "$CONTAINER_ID" sh -c \
+  'for cmd in /proc/[0-9]*/cmdline; do tr "\0" " " < "$cmd"; echo; done' 2>/dev/null || true)"
+assert_contains "$CHILD_CMDLINE" "--bind 127.0.0.1 --port 6380" \
+  "Ferrite child is spawned on the internal loopback port 6380"
+assert_not_contains "$CHILD_CMDLINE" "--bind 0.0.0.0" \
+  "Ferrite child is never bound directly to a public address"
+
 CHILDREN_BEFORE="$(docker exec "$CONTAINER_ID" sh -c \
   'for stat in /proc/[0-9]*/stat; do set -- $(cat "$stat"); [ "${4:-}" = "1" ] && printf "%s\n" "${2:-}"; done' \
   2>/dev/null || true)"

@@ -88,24 +88,42 @@ assert_not_contains "$CONTENT" "FROM alpine" "no build stage uses an Alpine (mus
 
 # 7. Reachability and lifecycle are owned by the launcher rather than unused
 #    environment variables that the upstream executable does not consume.
-LAUNCHER="${REPO_ROOT}/playground-launcher/src/main.rs"
-LAUNCHER_CONTENT="$(cat "$LAUNCHER")"
+#    The launcher is split into single-responsibility modules, so the checks
+#    below scan the whole crate source rather than one file.
+LAUNCHER_SRC="${REPO_ROOT}/playground-launcher/src"
+LAUNCHER_CONTENT="$(cat "${LAUNCHER_SRC}"/*.rs)"
 MANIFEST_CONTENT="$(cat "${REPO_ROOT}/playground-launcher/Cargo.toml")"
 assert_contains "$LAUNCHER_CONTENT" 'const HTTP_ADDR: &str = "0.0.0.0:8080"' "playground HTTP binds to 0.0.0.0:8080"
 assert_contains "$LAUNCHER_CONTENT" '"--bind"' "launcher explicitly configures the RESP bind address"
-assert_contains "$LAUNCHER_CONTENT" '"0.0.0.0"' "RESP server binds to 0.0.0.0"
-assert_contains "$LAUNCHER_CONTENT" '"6379"' "RESP server listens on port 6379"
 assert_contains "$LAUNCHER_CONTENT" '"/api/execute"' "launcher exposes command execution over HTTP"
 assert_contains "$LAUNCHER_CONTENT" '"/api/keys/detail/{key}"' "launcher exposes real key detail over HTTP"
-assert_contains "$LAUNCHER_CONTENT" "execute_resp" "HTTP handlers execute commands through the RESP server"
+assert_contains "$LAUNCHER_CONTENT" "resp::execute" "HTTP handlers execute commands through the RESP server"
 assert_contains "$LAUNCHER_CONTENT" "INDEX_HTML" "launcher serves an interactive HTML page"
 assert_contains "$LAUNCHER_CONTENT" "shutdown_signal" "launcher handles process shutdown signals"
-assert_contains "$LAUNCHER_CONTENT" "stop_child" "launcher cleans up the RESP child process"
+assert_contains "$LAUNCHER_CONTENT" "supervisor::stop" "launcher cleans up the RESP child process"
 assert_contains "$LAUNCHER_CONTENT" "Signal::SIGTERM" "launcher forwards SIGTERM before escalating"
 assert_contains "$LAUNCHER_CONTENT" "start_kill" "launcher retains SIGKILL as bounded shutdown escalation"
 assert_not_contains "$MANIFEST_CONTENT" "ferrite-studio" "launcher no longer depends on placeholder ferrite-studio APIs"
 assert_not_contains "$RUNTIME_STAGE_BODY" "FERRITE_STUDIO_ENABLED" "runtime does not rely on unused Studio environment variables"
 assert_not_contains "$RUNTIME_STAGE_BODY" "FERRITE_STUDIO_HOST" "runtime does not rely on an unused Studio host environment variable"
+
+# 7b. The Ferrite child is never the public listener: it is bound to an
+#     internal loopback port, and the launcher owns the public RESP port with
+#     one shared command policy for both RESP and HTTP entry points.
+SUPERVISOR_CONTENT="$(cat "${LAUNCHER_SRC}/supervisor.rs")"
+PROXY_CONTENT="$(cat "${LAUNCHER_SRC}/proxy.rs")"
+POLICY_CONTENT="$(cat "${LAUNCHER_SRC}/policy.rs")"
+HTTP_CONTENT="$(cat "${LAUNCHER_SRC}/http.rs")"
+assert_contains "$SUPERVISOR_CONTENT" 'INTERNAL_RESP_BIND: &str = "127.0.0.1"' "Ferrite child binds to internal loopback only"
+assert_contains "$SUPERVISOR_CONTENT" 'INTERNAL_RESP_PORT: &str = "6380"' "Ferrite child listens on the internal port 6380"
+assert_not_contains "$SUPERVISOR_CONTENT" '"0.0.0.0"' "Ferrite child is never bound to a publicly reachable address"
+assert_contains "$PROXY_CONTENT" 'PUBLIC_RESP_ADDR: &str = "0.0.0.0:6379"' "launcher owns the public Redis-compatible port 6379"
+assert_contains "$PROXY_CONTENT" "policy::classify_bytes" "public RESP proxy classifies every command before forwarding"
+assert_contains "$HTTP_CONTENT" "policy::classify_arguments" "HTTP /api/execute classifies every command with the same policy"
+for admin_command in SHUTDOWN DEBUG MODULE ACL CONFIG SAVE BGSAVE BGREWRITEAOF REPLICAOF SLAVEOF; do
+  assert_contains "$POLICY_CONTENT" "\"${admin_command}\"" "shared command policy rejects ${admin_command}"
+done
+assert_contains "$LAUNCHER_CONTENT" "unexpected_exit_error" "any unsolicited Ferrite child exit is treated as a launcher error"
 
 # 8. Distinct purpose preserved: image name, ports, and version metadata remain.
 assert_contains "$CONTENT" "EXPOSE 8080 6379" "Dockerfile.playground still exposes both the studio (8080) and Redis-compatible (6379) ports"

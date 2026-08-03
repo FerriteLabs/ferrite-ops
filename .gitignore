@@ -8,6 +8,9 @@
 # Coverage
 coverage/
 
+# Rust build artifacts (playground-launcher crate)
+target/
+
 # Keep the repository's Bash test harness even when a user-level ignore file
 # excludes generic lib/ directories.
 !tests/lib/

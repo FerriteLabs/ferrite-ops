@@ -13,8 +13,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: azure/setup-helm@v3
+      # The playground launcher's unit tests run as part of tests/run.sh; the
+      # runner already ships a Rust toolchain, so no extra setup is needed.
       - name: Run self-contained test suite
         run: bash tests/run.sh
+
+  launcher:
+    name: Playground Launcher Unit Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run playground-launcher unit tests
+        run: cargo test --manifest-path playground-launcher/Cargo.toml
+      - name: Check playground-launcher formatting
+        run: cargo fmt --manifest-path playground-launcher/Cargo.toml --check
 
   docker:
     name: Docker Build
