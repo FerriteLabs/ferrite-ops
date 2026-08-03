@@ -76,8 +76,8 @@ assert_contains "$(cat "$FLUX")" "tag: \"${EXPECTED_VERSION}\"" \
 
 KUSTOMIZE_STATEFULSET="${REPO_ROOT}/gitops/kustomize/base/statefulset.yaml"
 assert_contains "$(cat "$KUSTOMIZE_STATEFULSET")" \
-  "image: ferritelabs/ferrite:${EXPECTED_VERSION}" \
-  "Kustomize base StatefulSet pins the active Ferrite image instead of a floating latest tag"
+  "image: ghcr.io/ferritelabs/ferrite:${EXPECTED_VERSION}" \
+  "Kustomize base StatefulSet pins the active Ferrite image from GHCR instead of a floating latest tag or optional Docker Hub"
 
 for terraform_file in \
   terraform/common/variables.tf \

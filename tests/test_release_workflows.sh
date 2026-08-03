@@ -72,6 +72,25 @@ assert_not_contains "$RELEASE_CONTENT" 'type=raw,value=${{ inputs.tag }}' \
   "workflow_dispatch does not publish an unnormalized raw v-prefixed tag"
 assert_contains "$RELEASE_CONTENT" "latest=false" \
   "release.yml disables docker/metadata-action's implicit latest tag"
+
+# --- Docker Hub is optional; GHCR is always published -----------------------
+assert_contains "$RELEASE_CONTENT" "id: meta_dockerhub" \
+  "release.yml extracts Docker Hub metadata as its own gated step"
+assert_contains "$RELEASE_CONTENT" "if: vars.DOCKERHUB_ENABLED == 'true'" \
+  "release.yml only runs Docker Hub metadata extraction when DOCKERHUB_ENABLED is true"
+assert_eq "2" "$(grep -c "if: vars.DOCKERHUB_ENABLED == 'true'" "$RELEASE_YML")" \
+  "release.yml gates both the Docker Hub login and metadata steps on the same DOCKERHUB_ENABLED condition"
+assert_not_contains "$RELEASE_CONTENT" '            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+            ${{ env.DOCKERHUB_IMAGE }}' \
+  "release.yml no longer bundles GHCR and Docker Hub into a single unconditional metadata-action images list"
+assert_contains "$RELEASE_CONTENT" "images: \${{ env.REGISTRY }}/\${{ env.IMAGE_NAME }}" \
+  "release.yml's GHCR metadata step targets only the GHCR image"
+assert_contains "$RELEASE_CONTENT" "images: \${{ env.DOCKERHUB_IMAGE }}" \
+  "release.yml's Docker Hub metadata step targets only the Docker Hub image"
+assert_contains "$RELEASE_CONTENT" "tags: \${{ steps.meta_combined.outputs.tags }}" \
+  "release.yml pushes the combined GHCR + optional Docker Hub tag set"
+assert_not_contains "$RELEASE_CONTENT" "tags: \${{ steps.meta.outputs.tags }}" \
+  "release.yml's build-push step no longer uses the raw GHCR-only meta step output directly"
 assert_not_contains "$RELEASE_CONTENT" "bump-chart" \
   "release.yml no longer runs its own competing chart-only bump job"
 assert_not_contains "$RELEASE_CONTENT" "charts/ferrite" \
@@ -237,6 +256,7 @@ if ! python3 - "$RELEASE_YML" "$VERSION_SYNC_YML" "$ORCHESTRATION_YML" \
   "$EXTRACT_DIR/release_meta.sh" "$EXTRACT_DIR/version_sync_meta.sh" \
   "$EXTRACT_DIR/orchestration_meta.sh" "$EXTRACT_DIR/update_dockerfiles.sh" \
   "$EXTRACT_DIR/version_sync_chart.sh" "$EXTRACT_DIR/metadata_tags.txt" \
+  "$EXTRACT_DIR/combine_tags.sh" \
   >"${EXTRACT_DIR}/extract.stdout" 2>"${EXTRACT_DIR}/extract.log" << 'PYEOF'
 import sys
 import yaml
@@ -251,6 +271,7 @@ import yaml
     sync_out_path,
     version_sync_chart_out_path,
     metadata_tags_out_path,
+    combine_tags_out_path,
 ) = sys.argv[1:]
 with open(release_yml_path) as f:
     doc = yaml.safe_load(f)
@@ -281,6 +302,32 @@ if "latest=false" not in metadata_flavor:
 
 with open(metadata_tags_out_path, "w") as f:
     f.write(metadata_tags)
+
+# Docker Hub metadata extraction must be conditional on DOCKERHUB_ENABLED,
+# target only the Docker Hub image, and use the same required tag template
+# as GHCR so a stable release publishes the same normalized tag set to
+# both registries when Docker Hub is actually enabled.
+dockerhub_step = next(s for s in steps if s.get("id") == "meta_dockerhub")
+if dockerhub_step.get("if") != "vars.DOCKERHUB_ENABLED == 'true'":
+    raise SystemExit("meta_dockerhub step must be gated on vars.DOCKERHUB_ENABLED == 'true'")
+if dockerhub_step["with"]["images"] != "${{ env.DOCKERHUB_IMAGE }}":
+    raise SystemExit("meta_dockerhub step must target only the Docker Hub image")
+dockerhub_tags = dockerhub_step["with"]["tags"]
+missing_dockerhub_tags = [tag for tag in required_tags if tag not in dockerhub_tags]
+if missing_dockerhub_tags:
+    raise SystemExit(f"Docker Hub metadata tags are missing normalized outputs: {missing_dockerhub_tags}")
+
+ghcr_step = next(s for s in steps if s.get("id") == "meta")
+if ghcr_step["with"]["images"] != "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}":
+    raise SystemExit("meta step must target only the GHCR image")
+
+combine_step = next(s for s in steps if s.get("id") == "meta_combined")
+with open(combine_tags_out_path, "w") as f:
+    f.write(combine_step["run"])
+
+build_step = next(s for s in steps if s.get("id") == "build")
+if build_step["with"]["tags"] != "${{ steps.meta_combined.outputs.tags }}":
+    raise SystemExit("build-and-push step must use the combined tag list, not the raw GHCR-only meta output")
 
 with open(release_out_path, "w") as f:
     f.write(script)
@@ -397,8 +444,8 @@ if (cd "$SYNC_DIR" && VERSION="$SYNC_VERSION" SHA256="$SYNC_SHA256" bash -c "$SY
   assert_contains "$(cat "${SYNC_DIR}/gitops/flux/overlays/production.yaml")" \
     "tag: v${SYNC_VERSION}" "version-sync functional replay updates Flux"
   assert_contains "$(cat "${SYNC_DIR}/gitops/kustomize/base/statefulset.yaml")" \
-    "image: ferritelabs/ferrite:${SYNC_VERSION}" \
-    "version-sync functional replay updates the Kustomize base StatefulSet image"
+    "image: ghcr.io/ferritelabs/ferrite:${SYNC_VERSION}" \
+    "version-sync functional replay updates the Kustomize base StatefulSet image tag while preserving its GHCR repository"
   for terraform_file in terraform/common/variables.tf terraform/aws-ecs/main.tf terraform/aws-eks/main.tf; do
     assert_contains "$(grep -A5 '^variable "ferrite_version"' "${SYNC_DIR}/${terraform_file}")" \
       "default     = \"${SYNC_VERSION}\"" \
@@ -552,6 +599,54 @@ else
     "an invalid semver version fails release.yml's derivation step with a clear error"
 fi
 
+# Functional replay of the "Combine registry tags and labels" step: prove
+# that an empty DOCKERHUB_TAGS (meta_dockerhub did not run, i.e.
+# DOCKERHUB_ENABLED is unset/false) yields a combined tag list containing
+# only the GHCR tags, and that a non-empty DOCKERHUB_TAGS (DOCKERHUB_ENABLED
+# is true) appends the Docker Hub tags alongside them.
+COMBINE_SCRIPT="$(cat "${EXTRACT_DIR}/combine_tags.sh")"
+GHCR_SAMPLE_TAGS="$(printf 'ghcr.io/ferritelabs/ferrite:%s\nghcr.io/ferritelabs/ferrite:latest' "$EXPECTED_VERSION")"
+GHCR_SAMPLE_LABELS="org.opencontainers.image.version=${EXPECTED_VERSION}"
+DOCKERHUB_SAMPLE_TAGS="$(printf 'ferritelabs/ferrite:%s\nferritelabs/ferrite:latest' "$EXPECTED_VERSION")"
+
+run_combine() {
+  local dockerhub_tags="$1" output="$2"
+  (
+    export GHCR_TAGS="$GHCR_SAMPLE_TAGS"
+    export GHCR_LABELS="$GHCR_SAMPLE_LABELS"
+    export DOCKERHUB_TAGS="$dockerhub_tags"
+    export GITHUB_OUTPUT="$output"
+    bash -c "$COMBINE_SCRIPT"
+  )
+}
+
+DISABLED_OUT="${EXTRACT_DIR}/combine_disabled.out"
+: > "$DISABLED_OUT"
+if run_combine "" "$DISABLED_OUT" >"${EXTRACT_DIR}/log_combine_disabled.txt" 2>&1; then
+  DISABLED_CONTENT="$(cat "$DISABLED_OUT")"
+  assert_contains "$DISABLED_CONTENT" "$GHCR_SAMPLE_TAGS" \
+    "disabled Docker Hub: combined tags still contain every GHCR tag"
+  if printf '%s\n' "$DISABLED_CONTENT" | grep -qx "ferritelabs/ferrite:${EXPECTED_VERSION}"; then
+    harness_fail "disabled/missing DOCKERHUB_ENABLED: combined tags unexpectedly contain a Docker Hub tag"
+  else
+    harness_ok "disabled/missing DOCKERHUB_ENABLED: combined tags contain no Docker Hub tag"
+  fi
+else
+  harness_fail "combine-tags step unexpectedly failed with empty DOCKERHUB_TAGS: $(cat "${EXTRACT_DIR}/log_combine_disabled.txt")"
+fi
+
+ENABLED_OUT="${EXTRACT_DIR}/combine_enabled.out"
+: > "$ENABLED_OUT"
+if run_combine "$DOCKERHUB_SAMPLE_TAGS" "$ENABLED_OUT" >"${EXTRACT_DIR}/log_combine_enabled.txt" 2>&1; then
+  ENABLED_CONTENT="$(cat "$ENABLED_OUT")"
+  assert_contains "$ENABLED_CONTENT" "$GHCR_SAMPLE_TAGS" \
+    "enabled Docker Hub: combined tags still contain every GHCR tag"
+  assert_contains "$ENABLED_CONTENT" "$DOCKERHUB_SAMPLE_TAGS" \
+    "DOCKERHUB_ENABLED=true: combined tags include the Docker Hub tags produced by meta_dockerhub"
+else
+  harness_fail "combine-tags step unexpectedly failed with non-empty DOCKERHUB_TAGS: $(cat "${EXTRACT_DIR}/log_combine_enabled.txt")"
+fi
+
 # Exercise every payload-consuming metadata script with shell-substitution
 # strings. They must reject the value as invalid data without executing it.
 MALICIOUS_MARKER="${EXTRACT_DIR}/payload-executed"
@@ -638,8 +733,8 @@ if run_version_sync_meta "$FERRITE_RELEASE_VERSION" "$FERRITE_RELEASE_SHA256" \
       "appVersion: \"${FERRITE_RELEASE_VERSION}\"" \
       "a ferrite-release dispatch payload updates the sidecar chart appVersion end to end"
     assert_contains "$(cat "${FERRITE_RELEASE_DIR}/gitops/kustomize/base/statefulset.yaml")" \
-      "image: ferritelabs/ferrite:${FERRITE_RELEASE_VERSION}" \
-      "a ferrite-release dispatch payload updates the Kustomize base StatefulSet image end to end"
+      "image: ghcr.io/ferritelabs/ferrite:${FERRITE_RELEASE_VERSION}" \
+      "a ferrite-release dispatch payload updates the Kustomize base StatefulSet image tag end to end, preserving its GHCR repository"
     for dockerfile in Dockerfile Dockerfile.moonshot Dockerfile.playground; do
       assert_contains "$(cat "${FERRITE_RELEASE_DIR}/${dockerfile}")" \
         "ARG FERRITE_VERSION=${FERRITE_RELEASE_VERSION}" \
