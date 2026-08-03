@@ -74,6 +74,11 @@ assert_contains "$(cat "$FLUX")" "tag: v${EXPECTED_VERSION}" \
 assert_contains "$(cat "$FLUX")" "tag: \"${EXPECTED_VERSION}\"" \
   "Flux production pins the active image version"
 
+KUSTOMIZE_STATEFULSET="${REPO_ROOT}/gitops/kustomize/base/statefulset.yaml"
+assert_contains "$(cat "$KUSTOMIZE_STATEFULSET")" \
+  "image: ferritelabs/ferrite:${EXPECTED_VERSION}" \
+  "Kustomize base StatefulSet pins the active Ferrite image instead of a floating latest tag"
+
 for terraform_file in \
   terraform/common/variables.tf \
   terraform/aws-ecs/main.tf \

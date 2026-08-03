@@ -118,6 +118,7 @@ jobs:
           MOONSHOT_COMPOSE="docker-compose.moonshot.yml"
           ARGOCD_PRODUCTION="gitops/argocd/overlays/production.yaml"
           FLUX_PRODUCTION="gitops/flux/overlays/production.yaml"
+          KUSTOMIZE_STATEFULSET="gitops/kustomize/base/statefulset.yaml"
           TERRAFORM_FILES=(
             terraform/common/variables.tf
             terraform/aws-ecs/main.tf
@@ -135,6 +136,7 @@ jobs:
             "$MOONSHOT_COMPOSE"
             "$ARGOCD_PRODUCTION"
             "$FLUX_PRODUCTION"
+            "$KUSTOMIZE_STATEFULSET"
             "${TERRAFORM_FILES[@]}"
             "$TERRAFORM_README"
             "$RELEASE_WORKFLOW"
@@ -164,6 +166,7 @@ jobs:
           test "$(grep -c '^        - name: image.tag$' "$ARGOCD_PRODUCTION")" -eq 1
           test "$(grep -c '^    tag: v' "$FLUX_PRODUCTION")" -eq 1
           test "$(grep -c '^      tag: "' "$FLUX_PRODUCTION")" -eq 1
+          test "$(grep -c '^          image: ferritelabs/ferrite:' "$KUSTOMIZE_STATEFULSET")" -eq 1
           for terraform_file in "${TERRAFORM_FILES[@]}"; do
             test "$(grep -c '^variable "ferrite_version"' "$terraform_file")" -eq 1
           done
@@ -197,6 +200,7 @@ jobs:
             "$STAGING_DIR/$ARGOCD_PRODUCTION"
           perl -pi -e "s/^    tag: v.*/    tag: v${VERSION}/" "$STAGING_DIR/$FLUX_PRODUCTION"
           perl -pi -e "s/^      tag: \".*\"/      tag: \"${VERSION}\"/" "$STAGING_DIR/$FLUX_PRODUCTION"
+          perl -pi -e "s#^(          image: ferritelabs/ferrite:).*#\${1}${VERSION}#" "$STAGING_DIR/$KUSTOMIZE_STATEFULSET"
           # shellcheck disable=SC2016
           for terraform_file in "${TERRAFORM_FILES[@]}"; do
             VERSION="$VERSION" perl -0pi -e \
@@ -224,6 +228,7 @@ jobs:
             grep -qx "          value: \"${VERSION}\""
           grep -qx "    tag: v${VERSION}" "$STAGING_DIR/$FLUX_PRODUCTION"
           grep -qx "      tag: \"${VERSION}\"" "$STAGING_DIR/$FLUX_PRODUCTION"
+          grep -qx "          image: ferritelabs/ferrite:${VERSION}" "$STAGING_DIR/$KUSTOMIZE_STATEFULSET"
           for terraform_file in "${TERRAFORM_FILES[@]}"; do
             grep -A5 '^variable "ferrite_version"' "$STAGING_DIR/$terraform_file" |
               grep -q "default     = \"${VERSION}\""

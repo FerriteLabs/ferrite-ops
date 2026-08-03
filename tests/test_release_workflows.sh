@@ -110,6 +110,7 @@ for active_target in \
   docker-compose.moonshot.yml \
   gitops/argocd/overlays/production.yaml \
   gitops/flux/overlays/production.yaml \
+  gitops/kustomize/base/statefulset.yaml \
   terraform/common/variables.tf \
   terraform/aws-ecs/main.tf \
   terraform/aws-eks/main.tf \
@@ -345,6 +346,7 @@ SYNC_TARGETS=(
   docker-compose.moonshot.yml
   gitops/argocd/overlays/production.yaml
   gitops/flux/overlays/production.yaml
+  gitops/kustomize/base/statefulset.yaml
   terraform/common/variables.tf
   terraform/aws-ecs/main.tf
   terraform/aws-eks/main.tf
@@ -390,6 +392,9 @@ if (cd "$SYNC_DIR" && VERSION="$SYNC_VERSION" SHA256="$SYNC_SHA256" bash -c "$SY
     "targetRevision: v${SYNC_VERSION}" "version-sync functional replay updates Argo CD"
   assert_contains "$(cat "${SYNC_DIR}/gitops/flux/overlays/production.yaml")" \
     "tag: v${SYNC_VERSION}" "version-sync functional replay updates Flux"
+  assert_contains "$(cat "${SYNC_DIR}/gitops/kustomize/base/statefulset.yaml")" \
+    "image: ferritelabs/ferrite:${SYNC_VERSION}" \
+    "version-sync functional replay updates the Kustomize base StatefulSet image"
   for terraform_file in terraform/common/variables.tf terraform/aws-ecs/main.tf terraform/aws-eks/main.tf; do
     assert_contains "$(grep -A5 '^variable "ferrite_version"' "${SYNC_DIR}/${terraform_file}")" \
       "default     = \"${SYNC_VERSION}\"" \
@@ -659,6 +664,9 @@ if run_version_sync_meta "$FERRITE_RELEASE_VERSION" "$FERRITE_RELEASE_SHA256" \
     assert_contains "$(cat "${FERRITE_RELEASE_DIR}/charts/ferrite-sidecar/Chart.yaml")" \
       "appVersion: \"${FERRITE_RELEASE_VERSION}\"" \
       "a ferrite-release dispatch payload updates the sidecar chart appVersion end to end"
+    assert_contains "$(cat "${FERRITE_RELEASE_DIR}/gitops/kustomize/base/statefulset.yaml")" \
+      "image: ferritelabs/ferrite:${FERRITE_RELEASE_VERSION}" \
+      "a ferrite-release dispatch payload updates the Kustomize base StatefulSet image end to end"
     for dockerfile in Dockerfile Dockerfile.moonshot Dockerfile.playground; do
       assert_contains "$(cat "${FERRITE_RELEASE_DIR}/${dockerfile}")" \
         "ARG FERRITE_VERSION=${FERRITE_RELEASE_VERSION}" \

@@ -19,7 +19,7 @@ spec:
         fsGroup: 1000
       containers:
         - name: ferrite
-          image: ferritelabs/ferrite:latest
+          image: ferritelabs/ferrite:0.4.0
           ports:
             - name: resp
               containerPort: 6379
