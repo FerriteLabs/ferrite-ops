@@ -50,15 +50,15 @@ spec:
           livenessProbe:
             exec:
               command:
-                - redis-cli
-                - ping
+                - ferrite-cli
+                - PING
             periodSeconds: 10
             timeoutSeconds: 3
           readinessProbe:
             exec:
               command:
-                - redis-cli
-                - ping
+                - ferrite-cli
+                - PING
             periodSeconds: 5
             timeoutSeconds: 3
           securityContext:

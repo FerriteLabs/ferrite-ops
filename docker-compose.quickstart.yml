@@ -18,7 +18,7 @@ services:
       - RUST_LOG=ferrite=info
       - FERRITE_STUDIO_ENABLED=true    # Experimental web UI (may be unstable)
     healthcheck:
-      test: ["CMD", "redis-cli", "-p", "6379", "PING"]
+      test: ["CMD", "/usr/local/bin/ferrite-cli", "PING"]
       interval: 5s
       timeout: 3s
       retries: 10
