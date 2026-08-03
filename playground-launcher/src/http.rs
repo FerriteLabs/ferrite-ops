@@ -274,6 +274,14 @@ mod tests {
             "REPLICAOF 127.0.0.1 1",
             "SLAVEOF 127.0.0.1 1",
             "FLUSHALL",
+            "MIGRATE.START redis://example.invalid",
+            "migrate start redis://example.invalid",
+            "CLOUD.PROVIDER.ADD provider custom",
+            "cloud provider.add provider custom",
+            "S3.OBJECT.PUT bucket key value",
+            "s3 object.put bucket key value",
+            "REPLICATE.ADD peer",
+            "replicate add peer",
         ] {
             let (status, body) = call(state.clone(), execute_request(command)).await;
             assert_eq!(status, StatusCode::FORBIDDEN, "{command} must be forbidden");

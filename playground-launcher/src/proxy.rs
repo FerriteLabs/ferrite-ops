@@ -116,7 +116,7 @@ pub async fn handle_connection(client: TcpStream, upstream_addr: &str) -> Result
             continue;
         }
 
-        let decision = policy::classify_bytes(&arguments[0]);
+        let decision = policy::classify_bytes_arguments(&arguments);
         if !decision.is_allowed() {
             client_write
                 .write_all(&resp::encode_error(&decision.message()))
@@ -379,6 +379,14 @@ mod tests {
             vec!["REPLICAOF", "127.0.0.1", "1"],
             vec!["SLAVEOF", "127.0.0.1", "1"],
             vec!["FLUSHALL"],
+            vec!["MIGRATE.START", "redis://example.invalid"],
+            vec!["MIGRATE", "START", "redis://example.invalid"],
+            vec!["CLOUD.PROVIDER.ADD", "provider", "custom"],
+            vec!["CLOUD", "PROVIDER.ADD", "provider", "custom"],
+            vec!["S3.OBJECT.PUT", "bucket", "key", "value"],
+            vec!["S3", "OBJECT.PUT", "bucket", "key", "value"],
+            vec!["REPLICATE.ADD", "peer"],
+            vec!["REPLICATE", "ADD", "peer"],
         ] {
             let reply = client.command(&command).await;
             match reply {

@@ -8,39 +8,24 @@
 //! that cannot be served by a bounded request/response proxy are rejected
 //! before they are forwarded to the Ferrite child.
 
-/// Administrative and lifecycle commands. These can stop, reconfigure,
-/// replicate, or destroy the shared playground instance, or execute arbitrary
-/// server-side code, and are never forwarded.
+/// Exact privileged commands that can stop, reconfigure, replicate, destroy,
+/// or otherwise administer the shared playground instance.
 const ADMINISTRATIVE_COMMANDS: &[&str] = &[
-    "ACL",
     "BGREWRITEAOF",
     "BGSAVE",
-    "CLIENT",
-    "CLUSTER",
-    "CONFIG",
-    "DEBUG",
-    "EVAL",
-    "EVALSHA",
-    "EVALSHA_RO",
-    "EVAL_RO",
     "FAILOVER",
-    "FCALL",
-    "FCALL_RO",
     "FLUSHALL",
     "FLUSHDB",
-    "FUNCTION",
     "LATENCY",
-    "MIGRATE",
-    "MODULE",
     "MONITOR",
     "PFDEBUG",
     "PFSELFTEST",
     "PSYNC",
+    "REPLCONF",
     "REPLICAOF",
     "RESET",
     "RESTORE",
     "SAVE",
-    "SCRIPT",
     "SHUTDOWN",
     "SLAVEOF",
     "SLOWLOG",
@@ -48,10 +33,78 @@ const ADMINISTRATIVE_COMMANDS: &[&str] = &[
     "SYNC",
 ];
 
+/// Privileged or externally connected Ferrite command families.
+///
+/// Ferrite v0.4.0 accepts a mixture of `FAMILY.SUBCOMMAND` and
+/// `FAMILY SUBCOMMAND` forms. A family matches only its exact root or a dotted
+/// descendant, so a command such as `MIGRATEX` is not accidentally rejected.
+const ADMINISTRATIVE_FAMILIES: &[&str] = &[
+    "ACL",
+    "ADMIN",
+    "AGENT",
+    "BRANCH",
+    "BUDGET",
+    "CDC",
+    "CHAOS",
+    "CLIENT",
+    "CLUSTER",
+    "CLOUD",
+    "CONFIG",
+    "CONSENSUS",
+    "DEBUG",
+    "EBPF",
+    "EDGE",
+    "EVAL",
+    "EVALSHA",
+    "EVALSHA_RO",
+    "EVAL_RO",
+    "FAAS",
+    "FCALL",
+    "FCALL_RO",
+    "FEDERATE",
+    "FEDERATION",
+    "FERRITE.ADVISOR",
+    "FERRITE.DEBUG",
+    "FN",
+    "FUNCTION",
+    "GATEWAY",
+    "INFERENCE",
+    "MARKETPLACE",
+    "MEMORY",
+    "MESH",
+    "MIGRATE",
+    "MULTICLOUD",
+    "MODULE",
+    "OBSERVE",
+    "OPTIMIZER",
+    "PANGEA",
+    "PIPELINE",
+    "PNG",
+    "POLICY",
+    "POLICYENGINE",
+    "PROTOCOL",
+    "PROXY",
+    "RAG",
+    "REGION",
+    "REPLICATE",
+    "S3",
+    "SCALING",
+    "SCRIPT",
+    "SEMANTIC.CONFIG",
+    "STREAM",
+    "TENANT",
+    "TIERING",
+    "TRIGGER",
+    "VIEW",
+    "WASM",
+];
+
 /// Commands that never produce exactly one bounded reply on a request/response
 /// connection: they either block until another client acts or switch the
-/// connection into a server-push mode. The playground proxies one command to
-/// one reply, so these are refused with a distinct, non-security message.
+/// connection into a server-push mode. Commands that deliberately enumerate or
+/// sort an entire data set are also refused; cursor/range alternatives remain
+/// available. The playground proxies one command to one reply, so these are
+/// refused with a distinct, non-security message.
 const UNSUPPORTED_COMMANDS: &[&str] = &[
     "BLMOVE",
     "BLMPOP",
@@ -61,10 +114,20 @@ const UNSUPPORTED_COMMANDS: &[&str] = &[
     "BZMPOP",
     "BZPOPMAX",
     "BZPOPMIN",
+    "HGETALL",
+    "HKEYS",
+    "HVALS",
+    "KEYS",
     "PSUBSCRIBE",
     "PUNSUBSCRIBE",
+    "SDIFF",
+    "SINTER",
+    "SMEMBERS",
+    "SORT",
+    "SORT_RO",
     "SSUBSCRIBE",
     "SUBSCRIBE",
+    "SUNION",
     "SUNSUBSCRIBE",
     "UNSUBSCRIBE",
     "WAIT",
@@ -104,11 +167,18 @@ impl Decision {
 /// command as sent by the client; matching is case-insensitive, exactly like
 /// Redis command dispatch.
 pub fn classify(name: &str) -> Decision {
-    let normalized = name.trim().to_ascii_uppercase();
+    classify_normalized(normalize(name))
+}
+
+fn classify_normalized(normalized: String) -> Decision {
     if normalized.is_empty() {
         return Decision::Allow;
     }
-    if ADMINISTRATIVE_COMMANDS.contains(&normalized.as_str()) {
+    if ADMINISTRATIVE_COMMANDS.contains(&normalized.as_str())
+        || ADMINISTRATIVE_FAMILIES
+            .iter()
+            .any(|family| matches_family(&normalized, family))
+    {
         return Decision::Administrative(normalized);
     }
     if UNSUPPORTED_COMMANDS.contains(&normalized.as_str()) {
@@ -120,20 +190,63 @@ pub fn classify(name: &str) -> Decision {
 /// Classify a fully parsed command (argv form). Empty commands are rejected
 /// by the callers' own parsing, so an empty argv is treated as allowed here.
 pub fn classify_arguments<S: AsRef<str>>(arguments: &[S]) -> Decision {
-    match arguments.first() {
-        Some(name) => classify(name.as_ref()),
-        None => Decision::Allow,
-    }
+    let normalized: Vec<String> = arguments
+        .iter()
+        .map(|argument| normalize(argument.as_ref()))
+        .collect();
+    classify_normalized_arguments(&normalized)
 }
 
-/// Classify a raw (possibly non-UTF-8) command name received on the RESP port.
-pub fn classify_bytes(name: &[u8]) -> Decision {
-    match std::str::from_utf8(name) {
-        Ok(name) => classify(name),
-        // A non-UTF-8 command name can never match a Ferrite command name, so
-        // let the server produce its own "unknown command" error.
-        Err(_) => Decision::Allow,
+/// Classify a fully parsed binary argv received on the public RESP port.
+pub fn classify_bytes_arguments(arguments: &[Vec<u8>]) -> Decision {
+    let normalized = arguments
+        .iter()
+        .map(|argument| {
+            std::str::from_utf8(argument)
+                .map(normalize)
+                .unwrap_or_default()
+        })
+        .collect::<Vec<_>>();
+    classify_normalized_arguments(&normalized)
+}
+
+fn classify_normalized_arguments(arguments: &[String]) -> Decision {
+    let Some(name) = arguments.first() else {
+        return Decision::Allow;
+    };
+
+    let decision = classify(name);
+    if !decision.is_allowed() {
+        return decision;
     }
+
+    if let Some(subcommand) = arguments.get(1).filter(|value| !value.is_empty()) {
+        let decision = classify_normalized(format!("{name}.{subcommand}"));
+        if !decision.is_allowed() {
+            return decision;
+        }
+    }
+
+    // XREAD and XREADGROUP are ordinary bounded stream reads unless the
+    // untrusted caller adds BLOCK, which changes them into blocking commands.
+    if matches!(name.as_str(), "XREAD" | "XREADGROUP")
+        && arguments.iter().skip(1).any(|argument| argument == "BLOCK")
+    {
+        return Decision::Unsupported(name.clone());
+    }
+
+    Decision::Allow
+}
+
+fn normalize(value: &str) -> String {
+    value.trim().to_ascii_uppercase()
+}
+
+fn matches_family(command: &str, family: &str) -> bool {
+    command == family
+        || command
+            .strip_prefix(family)
+            .is_some_and(|suffix| suffix.starts_with('.'))
 }
 
 #[cfg(test)]
@@ -164,9 +277,28 @@ mod tests {
     #[test]
     fn rejects_additional_playground_lifecycle_commands() {
         for command in [
-            "CLIENT", "CLUSTER", "FAILOVER", "FLUSHALL", "FLUSHDB", "FUNCTION", "SCRIPT", "EVAL",
-            "MIGRATE", "MONITOR", "RESET", "RESTORE", "SWAPDB", "SYNC", "PSYNC", "SLOWLOG",
-            "LATENCY",
+            "CLIENT",
+            "CLUSTER",
+            "FAILOVER",
+            "FLUSHALL",
+            "FLUSHDB",
+            "FUNCTION",
+            "SCRIPT",
+            "EVAL",
+            "MIGRATE",
+            "MONITOR",
+            "RESET",
+            "RESTORE",
+            "SWAPDB",
+            "SYNC",
+            "PSYNC",
+            "SLOWLOG",
+            "CLOUD",
+            "REPLICATE",
+            "PIPELINE",
+            "TRIGGER",
+            "WASM",
+            "CHAOS",
         ] {
             assert!(
                 matches!(classify(command), Decision::Administrative(_)),
@@ -177,7 +309,17 @@ mod tests {
 
     #[test]
     fn rejects_commands_without_a_single_bounded_reply() {
-        for command in ["SUBSCRIBE", "PSUBSCRIBE", "BLPOP", "BZPOPMIN", "WAIT"] {
+        for command in [
+            "SUBSCRIBE",
+            "PSUBSCRIBE",
+            "BLPOP",
+            "BZPOPMIN",
+            "WAIT",
+            "KEYS",
+            "HGETALL",
+            "SMEMBERS",
+            "SORT",
+        ] {
             assert!(
                 matches!(classify(command), Decision::Unsupported(_)),
                 "{command} must be refused as unsupported"
@@ -189,7 +331,8 @@ mod tests {
     fn allows_ordinary_redis_compatible_commands() {
         for command in [
             "GET", "SET", "DEL", "PING", "INFO", "TYPE", "TTL", "LRANGE", "HSCAN", "SSCAN",
-            "XRANGE", "INCR", "EXPIRE", "SELECT", "MULTI", "EXEC", "COMMAND", "DBSIZE", "SCAN",
+            "XRANGE", "XREAD", "INCR", "EXPIRE", "SELECT", "MULTI", "EXEC", "COMMAND", "DBSIZE",
+            "SCAN",
         ] {
             assert_eq!(
                 classify(command),
@@ -207,11 +350,60 @@ mod tests {
             Decision::Administrative(_)
         ));
         assert!(matches!(
-            classify_bytes(b"config"),
+            classify_bytes_arguments(&[b"config".to_vec()]),
             Decision::Administrative(_)
         ));
         assert!(matches!(
             classify_arguments(&["SHUTDOWN".to_string(), "NOSAVE".to_string()]),
+            Decision::Administrative(_)
+        ));
+    }
+
+    #[test]
+    fn rejects_dotted_and_subcommand_forms_without_loose_prefix_matches() {
+        for arguments in [
+            vec!["MIGRATE.START", "redis://example.invalid"],
+            vec!["migrate", "start", "redis://example.invalid"],
+            vec!["CLOUD.PROVIDER.ADD", "provider", "custom"],
+            vec!["cloud", "provider.add", "provider", "custom"],
+            vec!["S3.OBJECT.PUT", "bucket", "key", "value"],
+            vec!["s3", "object.put", "bucket", "key", "value"],
+            vec!["REPLICATE.ADD", "peer"],
+            vec!["replicate", "add", "peer"],
+            vec!["VIEW.SUBSCRIBE", "view"],
+            vec!["view", "subscribe", "view"],
+        ] {
+            assert!(
+                matches!(classify_arguments(&arguments), Decision::Administrative(_)),
+                "{arguments:?} must be rejected"
+            );
+        }
+
+        assert_eq!(classify("MIGRATEX"), Decision::Allow);
+        assert_eq!(classify("S3X.OBJECT.PUT"), Decision::Allow);
+    }
+
+    #[test]
+    fn blocking_stream_reads_are_rejected_but_bounded_reads_are_allowed() {
+        assert!(matches!(
+            classify_arguments(&["XREAD", "BLOCK", "0", "STREAMS", "events", "0"]),
+            Decision::Unsupported(_)
+        ));
+        assert!(matches!(
+            classify_arguments(&["xreadgroup", "group", "g", "c", "block", "1000"]),
+            Decision::Unsupported(_)
+        ));
+        assert_eq!(
+            classify_arguments(&["XREAD", "COUNT", "10", "STREAMS", "events", "0"]),
+            Decision::Allow
+        );
+    }
+
+    #[test]
+    fn binary_argument_classification_matches_http_classification() {
+        let arguments = vec![b"migrate".to_vec(), b"start".to_vec()];
+        assert!(matches!(
+            classify_bytes_arguments(&arguments),
             Decision::Administrative(_)
         ));
     }
@@ -228,6 +420,9 @@ mod tests {
 
     #[test]
     fn non_utf8_command_names_are_left_to_the_server() {
-        assert_eq!(classify_bytes(&[0xff, 0xfe]), Decision::Allow);
+        assert_eq!(
+            classify_bytes_arguments(&[vec![0xff, 0xfe]]),
+            Decision::Allow
+        );
     }
 }
