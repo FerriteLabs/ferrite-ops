@@ -32,6 +32,12 @@
 | F-21 | P1 | Playground shutdown | Shutdown used Tokio's immediate child kill instead of forwarding SIGTERM and escalating only after a grace period. | Fixed; SIGINT/SIGTERM forwards SIGTERM, waits up to 10 seconds, then uses SIGKILL only as escalation and reaps the child |
 | F-22 | P1 | Release tags | Dispatch releases could publish only the raw `v`-prefixed input because Docker metadata ran before normalized release metadata. | Fixed; normalized metadata is derived first and stable releases publish exact, major.minor, major, and latest tags |
 | F-23 | P1 | Version sync | Release workflows updated the primary chart but could leave the sidecar chart on an old Ferrite image appVersion. | Fixed; every release path updates the sidecar appVersion without changing its independently versioned chart package |
+| F-24 | P0 | Playground lifecycle | The Ferrite child owned the public `0.0.0.0:6379` port, so any unauthenticated client could `SHUTDOWN`, `CONFIG`, `DEBUG`, `MODULE`, `ACL`, `SAVE`, `BGSAVE`, `BGREWRITEAOF`, or `REPLICAOF` the shared instance, and its clean `exit(0)` was treated as success. | Fixed; the child binds `127.0.0.1:6380` only, the launcher owns the public RESP port behind one shared command policy, and any unsolicited child exit is an error |
+| F-25 | P1 | Playground API parity | `/api/execute` forwarded any command straight to Ferrite, so the HTTP path bypassed whatever the RESP path enforced. | Fixed; both entry points classify commands with the same `policy` module |
+| F-26 | P1 | Response bounds | Replies were bounded per bulk string and per array element only, so many individually small elements could still be buffered without limit. | Fixed; one cumulative `ResponseBudget` bounds each whole reply and the unbudgeted decode path was removed |
+| F-27 | P1 | Key inspection bounds | Key detail issued `LRANGE 0 -1`, `SMEMBERS`, `HGETALL`, `ZRANGE 0 -1`, and a whole-value `GET`. | Fixed; every type is read as a bounded range, bounded `COUNT`, or validated cursor scan that reports total/returned/limit/truncated/cursor |
+| F-28 | P2 | Release tags | `docker/metadata-action` could still add its implicit `latest` tag outside the explicit stable gate. | Fixed; `latest=false` plus functional per-trigger assertions on the effective published tag set |
+| F-29 | P2 | Sidecar image | `sidecar.image.tag` defaulted to the floating `latest`, so a synchronized chart appVersion did not move the injected Ferrite image. | Fixed; the default is empty and the helper falls back to `.Chart.AppVersion` |
 
 ## D-01 Resolution
 
@@ -50,7 +56,8 @@ Playground additionally:
 
 - compiles the repository-owned `playground-launcher` as a standalone HTTP/RESP supervisor;
 - serves a minimal interactive page and JSON API on `0.0.0.0:8080`;
-- verifies and executes against the actual Ferrite RESP child on `0.0.0.0:6379`;
+- runs the Ferrite child on the internal loopback address `127.0.0.1:6380` only and serves the
+  public Redis-compatible `0.0.0.0:6379` port from the launcher's own policy-enforcing RESP proxy;
 - forwards SIGTERM and waits up to ten seconds before SIGKILL escalation, then reaps the child;
 - removes reliance on unused `FERRITE_STUDIO_*` variables;
 - probes the real RESP-backed endpoint at `/api/health`.
@@ -74,12 +81,65 @@ normalized before Docker tag generation, so a stable `v0.4.0` dispatch publishes
 All chart-update release paths update the primary chart's package version/appVersion and the sidecar
 chart's appVersion. The sidecar chart package remains independently versioned.
 
+Release tag derivation additionally disables `docker/metadata-action`'s implicit `latest` flavor, and
+`tests/test_release_workflows.sh` resolves the tag template against each trigger's real derived
+outputs: `push`, `repository_dispatch`, and `workflow_dispatch` of a stable release publish exactly
+`0.4.0`, `0.4`, `0`, and `latest`, while a prerelease publishes only its normalized exact tag.
+
+The sidecar chart's `sidecar.image.tag` now defaults to empty and resolves to the chart's
+`appVersion`, so the release paths that synchronize that appVersion also move the injected Ferrite
+image; `tests/test_helm_charts.sh` renders the default, an explicit override, and an appVersion bump.
+
 `tests/test_active_release_versions.sh` checks the active release/deployment allowlist for stale v0.2.0 or
 v0.3.0 defaults. Historical changelogs, migration notes, package changelogs, and explicit version-scoped
 compatibility guards remain intentionally unchanged.
 
+## Playground Lifecycle and Bounds Resolution
+
+The launcher is split into single-responsibility modules — `policy`, `proxy`, `resp`, `command`,
+`http`, `keys`, and `supervisor` — with a test-only in-process mock Ferrite that lets both entry
+points be tested end to end without a Ferrite build.
+
+Lifecycle and administrative safety:
+
+- the Ferrite child is spawned with `--bind 127.0.0.1 --port 6380` and is never publicly reachable;
+- the launcher owns `0.0.0.0:6379`, decodes RESP array and inline commands, classifies each one, and
+  forwards only approved commands to the child, re-encoding the real reply byte-for-byte;
+- `policy` rejects at minimum `SHUTDOWN`, `DEBUG`, `MODULE`, `ACL`, `CONFIG`, `SAVE`, `BGSAVE`,
+  `BGREWRITEAOF`, `REPLICAOF`, and `SLAVEOF`, plus the other unauthenticated-playground lifecycle
+  commands `CLIENT`, `CLUSTER`, `FAILOVER`, `FLUSHALL`, `FLUSHDB`, `FUNCTION`, `SCRIPT`, `EVAL`
+  family, `MIGRATE`, `MONITOR`, `RESET`, `RESTORE`, `SWAPDB`, `SYNC`, `PSYNC`, `SLOWLOG`, `LATENCY`,
+  `PFDEBUG`, and `PFSELFTEST`; commands that cannot return a single bounded reply (`SUBSCRIBE`
+  family, the blocking `B*` commands, `WAIT`/`WAITAOF`) are refused with a distinct, non-security
+  message;
+- ordinary Redis-compatible commands and the public port are preserved: a rejection does not close
+  the connection and subsequent `SET`/`GET` succeed;
+- `/api/execute` applies the identical policy and answers `403` for refused commands;
+- any Ferrite child exit that the launcher did not initiate is an error, including `exit(0)`;
+- the proxy bounds request line length, per-argument and total request size, argument count,
+  concurrent connections, and client idle time.
+
+Response and resource bounds:
+
+- a cumulative `ResponseBudget` charges every header line and payload byte of one reply (8 MiB by
+  default, 1 MiB for key detail), so a reply built from many small elements is bounded too, and the
+  only decode entry point is the budgeted one;
+- an over-budget reply drops the desynchronized upstream connection, returns an error, and the
+  client's next command is served normally;
+- key detail is bounded per type — `GETRANGE` with `STRLEN` for strings, 100-element `LRANGE`,
+  `ZRANGE ... WITHSCORES`, and `XRANGE ... COUNT` pages, and `SSCAN`/`HSCAN` cursor pages for sets
+  and hashes — and reports `length`, `returned`, `limit`, `truncated`, and `cursor`. Cursors from
+  query strings are validated as non-negative integers before being forwarded.
+
 ## Runtime Verification Completed
 
+- 45 `playground-launcher` unit tests pass (`cargo test`), run from `tests/run.sh` via
+  `tests/test_playground_launcher_unit.sh` and from a dedicated CI job.
+- The exact Playground image build, start, and probe suite passes: `SHUTDOWN` is refused with `403`
+  over HTTP and with a policy error on the public RESP port, the container stays up, `SET`/`GET`
+  keep working on both paths, the child is confirmed to run with `--bind 127.0.0.1 --port 6380`,
+  bounded key detail returns honest totals/truncation/cursors, an invalid cursor returns `400`, and
+  `docker stop` still exits `0` with no leaked process.
 - Moonshot default Compose build produced `ferrite:moonshot`; the service became healthy, reported
   `ferrite 0.4.0`, exposed `FERRITE_COMPILED_FEATURES=forge-runtime`, returned `PONG`, and served `FN.HELP`.
 - Playground default image produced `ferritelabs/playground:test`; `/api/health` verified RESP with `PING`
