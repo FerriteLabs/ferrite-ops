@@ -36,7 +36,14 @@ EXPECTED_VERSION="$(sed -n 's/^FERRITE_VERSION=//p' "$ACTIVE_RELEASE")"
 EXPECTED_SHA256="$(sed -n 's/^FERRITE_SOURCE_SHA256=//p' "$ACTIVE_RELEASE")"
 EXPECTED_MAJOR="${EXPECTED_VERSION%%.*}"
 EXPECTED_MAJOR_MINOR="${EXPECTED_VERSION%.*}"
-EXPECTED_TAG_SET="${EXPECTED_VERSION}"
+# release.yml no longer bakes the exact version tag directly into the
+# metadata-action tag list; it only ever publishes a unique, throwaway
+# candidate tag (candidate-<run id>-<run attempt>) and later promotes it to
+# the exact tag separately (see tests/test_exact_image_immutability.sh).
+# run_case() below fixes RUN_ID/RUN_ATTEMPT so this is deterministic.
+EXPECTED_RUN_ID="424242"
+EXPECTED_RUN_ATTEMPT="1"
+EXPECTED_CANDIDATE_TAG="candidate-${EXPECTED_RUN_ID}-${EXPECTED_RUN_ATTEMPT}"
 RELEASE_CONTENT="$(cat "$RELEASE_YML")"
 VERSION_SYNC_CONTENT="$(cat "$VERSION_SYNC_YML")"
 ORCHESTRATION_CONTENT="$(cat "$ORCHESTRATION_YML")"
@@ -60,10 +67,12 @@ assert_contains "$RELEASE_CONTENT" "inputs.tag" \
   "release.yml derives the version from the workflow_dispatch input"
 assert_contains "$RELEASE_CONTENT" "default: 'v${EXPECTED_VERSION}'" \
   "release.yml's workflow_dispatch default matches active-release.env"
-assert_contains "$RELEASE_CONTENT" 'type=raw,value=${{ steps.release_meta.outputs.version }}' \
-  "release.yml tags every trigger with the normalized exact semver"
+assert_contains "$RELEASE_CONTENT" 'type=raw,value=${{ steps.release_meta.outputs.candidate_tag }}' \
+  "release.yml tags the build with a unique, throwaway candidate tag, never the exact version directly"
+assert_not_contains "$RELEASE_CONTENT" 'type=raw,value=${{ steps.release_meta.outputs.version }}' \
+  "release.yml never bakes the exact version tag directly into the candidate build's metadata"
 assert_not_contains "$RELEASE_CONTENT" 'type=raw,value=latest' \
-  "release.yml never bakes a floating latest tag into the exact-version build"
+  "release.yml never bakes a floating latest tag into the candidate build"
 assert_not_contains "$RELEASE_CONTENT" 'type=raw,value=${{ steps.release_meta.outputs.major_minor }}' \
   "release.yml no longer builds the floating major.minor tag inline; promotion advances it"
 assert_not_contains "$RELEASE_CONTENT" 'type=raw,value=${{ steps.release_meta.outputs.major }}' \
@@ -80,12 +89,26 @@ assert_contains "$RELEASE_CONTENT" "docker buildx imagetools create" \
   "release.yml promotes floating tags by adding them to the signed digest (imagetools/cosign compatible)"
 assert_contains "$RELEASE_CONTENT" "scripts/release-ordering.sh" \
   "release.yml gates floating-tag promotion on the shared SemVer ordering guard"
-assert_contains "$RELEASE_CONTENT" "Resolve current promoted stable version" \
-  "release.yml reads the current promoted version from registry metadata, not workflow input"
+assert_contains "$RELEASE_CONTENT" "Resolve current per-tag promoted versions" \
+  "release.yml independently reads each floating tag's current promoted version from registry metadata, not workflow input"
 assert_not_contains "$RELEASE_CONTENT" 'type=raw,value=${{ inputs.tag }}' \
   "workflow_dispatch does not publish an unnormalized raw v-prefixed tag"
 assert_contains "$RELEASE_CONTENT" "latest=false" \
   "release.yml disables docker/metadata-action's implicit latest tag"
+assert_contains "$RELEASE_CONTENT" "group: ferrite-release-" \
+  "release.yml serializes runs for the same version with a per-version concurrency group"
+assert_contains "$RELEASE_CONTENT" "id: check_existing" \
+  "release.yml checks for an existing exact GHCR tag before building anything"
+assert_contains "$RELEASE_CONTENT" "candidate-\${RUN_ID}-\${RUN_ATTEMPT}" \
+  "release.yml derives a unique candidate tag from the run id and attempt"
+assert_contains "$RELEASE_CONTENT" "dev.ferritelabs.image.source-sha256" \
+  "release.yml verifies the baked source-checksum label of an existing exact tag"
+assert_contains "$RELEASE_CONTENT" "promote-exact:" \
+  "release.yml defines a dedicated exact-tag promotion job"
+assert_contains "$RELEASE_CONTENT" "needs: [build-and-push, verify, smoke-test]" \
+  "release.yml only promotes the exact tag after build, verify, AND smoke-test all succeed"
+assert_contains "$RELEASE_CONTENT" "Refusing to overwrite an existing exact version tag" \
+  "release.yml refuses to overwrite an existing exact tag that points at a different digest"
 
 # --- Docker Hub is optional; GHCR is always published -----------------------
 assert_contains "$RELEASE_CONTENT" "id: dockerhub" \
@@ -98,8 +121,10 @@ assert_contains "$RELEASE_CONTENT" 'DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN
   "release.yml includes Docker Hub token presence in publishing eligibility"
 assert_contains "$RELEASE_CONTENT" "id: meta_dockerhub" \
   "release.yml extracts Docker Hub metadata as its own gated step"
-assert_eq "2" "$(grep -c "if: steps.dockerhub.outputs.enabled == 'true'" "$RELEASE_YML")" \
-  "release.yml gates both Docker Hub login and metadata on enabled plus configured credentials"
+assert_contains "$RELEASE_CONTENT" "if: steps.dockerhub.outputs.enabled == 'true'" \
+  "release.yml gates Docker Hub login on enabled plus configured credentials"
+assert_contains "$RELEASE_CONTENT" "if: steps.check_existing.outputs.idempotent != 'true' && steps.dockerhub.outputs.enabled == 'true'" \
+  "release.yml gates Docker Hub metadata on BOTH the idempotent check and publishing eligibility"
 assert_not_contains "$RELEASE_CONTENT" "if: vars.DOCKERHUB_ENABLED == 'true'" \
   "release.yml does not generate Docker Hub metadata based on the variable alone"
 assert_not_contains "$RELEASE_CONTENT" '            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
@@ -318,11 +343,13 @@ if release_index >= metadata_index:
 
 metadata_tags = next(s["with"]["tags"] for s in steps if s.get("id") == "meta")
 required_tags = [
-    "type=raw,value=${{ steps.release_meta.outputs.version }}",
+    "type=raw,value=${{ steps.release_meta.outputs.candidate_tag }}",
 ]
 missing_tags = [tag for tag in required_tags if tag not in metadata_tags]
 if missing_tags:
     raise SystemExit(f"metadata tags are missing normalized outputs: {missing_tags}")
+if "type=raw,value=${{ steps.release_meta.outputs.version }}" in metadata_tags:
+    raise SystemExit("metadata tags must never bake the exact version tag directly")
 
 metadata_flavor = next(
     (s["with"].get("flavor", "") for s in steps if s.get("id") == "meta"), ""
@@ -342,10 +369,11 @@ with open(dockerhub_eligibility_out_path, "w") as f:
 dockerhub_step = next(s for s in steps if s.get("id") == "meta_dockerhub")
 dockerhub_login_step = next(s for s in steps if s.get("name") == "Log in to Docker Hub")
 dockerhub_condition = "steps.dockerhub.outputs.enabled == 'true'"
-if dockerhub_step.get("if") != dockerhub_condition:
-    raise SystemExit("meta_dockerhub step must be gated on Docker Hub publishing eligibility")
+dockerhub_metadata_condition = "steps.check_existing.outputs.idempotent != 'true' && steps.dockerhub.outputs.enabled == 'true'"
+if dockerhub_step.get("if") != dockerhub_metadata_condition:
+    raise SystemExit("meta_dockerhub step must be gated on BOTH the idempotent check and Docker Hub publishing eligibility")
 if dockerhub_login_step.get("if") != dockerhub_condition:
-    raise SystemExit("Docker Hub login must use the same publishing eligibility gate as metadata")
+    raise SystemExit("Docker Hub login must use the publishing eligibility gate")
 if dockerhub_step["with"]["images"] != "${{ env.DOCKERHUB_IMAGE }}":
     raise SystemExit("meta_dockerhub step must target only the Docker Hub image")
 dockerhub_tags = dockerhub_step["with"]["tags"]
@@ -573,15 +601,17 @@ fi
 # rather than only the template text.
 effective_tags() {
   local output_file="$1"
-  local version major major_minor stable line value enable
+  local version major major_minor stable candidate_tag line value enable
 
   version="$(grep -E '^version=' "$output_file" | head -1 | cut -d= -f2-)"
   major="$(grep -E '^major=' "$output_file" | head -1 | cut -d= -f2-)"
   major_minor="$(grep -E '^major_minor=' "$output_file" | head -1 | cut -d= -f2-)"
   stable="$(grep -E '^stable=' "$output_file" | head -1 | cut -d= -f2-)"
+  candidate_tag="$(grep -E '^candidate_tag=' "$output_file" | head -1 | cut -d= -f2-)"
 
   while IFS= read -r line; do
     [[ -z "${line// /}" ]] && continue
+    line="${line//\$\{\{ steps.release_meta.outputs.candidate_tag \}\}/${candidate_tag}}"
     line="${line//\$\{\{ steps.release_meta.outputs.version \}\}/${version}}"
     line="${line//\$\{\{ steps.release_meta.outputs.major_minor \}\}/${major_minor}}"
     line="${line//\$\{\{ steps.release_meta.outputs.major \}\}/${major}}"
@@ -618,6 +648,9 @@ run_case() {
     export DISPATCH_VERSION="$client_payload_version"
     export WORKFLOW_TAG="$input_tag"
     export REPOSITORY_OWNER="FerriteLabs"
+    export RUN_ID="$EXPECTED_RUN_ID"
+    export RUN_ATTEMPT="$EXPECTED_RUN_ATTEMPT"
+    export ORDER_SCRIPT="${REPO_ROOT}/scripts/release-ordering.sh"
     bash "${EXTRACT_DIR}/release_meta.sh"
   )
 }
@@ -631,7 +664,7 @@ if run_case "push_tag" push "" "" "v${EXPECTED_VERSION}" >"${EXTRACT_DIR}/log_pu
   assert_contains "$OUT" "FERRITE_VERSION=${EXPECTED_VERSION}" "push-tag case emits FERRITE_VERSION build-arg"
   assert_contains "$OUT" "FERRITE_SOURCE_SHA256=${EXPECTED_SHA256}" \
     "push-tag case computes the active release source SHA256"
-  assert_tag_set push_tag "$EXPECTED_TAG_SET"
+  assert_tag_set push_tag "$EXPECTED_CANDIDATE_TAG"
 else
   harness_fail "push-tag case unexpectedly failed: $(cat "${EXTRACT_DIR}/log_push_tag.txt")"
 fi
@@ -644,7 +677,7 @@ if run_case "workflow_dispatch" workflow_dispatch "" "v${EXPECTED_VERSION}" >"${
     "workflow_dispatch emits an explicit FERRITE_VERSION build-arg"
   assert_contains "$OUT" "FERRITE_SOURCE_SHA256=${EXPECTED_SHA256}" \
     "workflow_dispatch computes and emits the active source checksum"
-  assert_tag_set workflow_dispatch "$EXPECTED_TAG_SET"
+  assert_tag_set workflow_dispatch "$EXPECTED_CANDIDATE_TAG"
 else
   harness_fail "workflow_dispatch case unexpectedly failed: $(cat "${EXTRACT_DIR}/log_workflow_dispatch.txt")"
 fi
@@ -660,7 +693,7 @@ if run_case "repository_dispatch" repository_dispatch "v${EXPECTED_VERSION}" "" 
     "repository_dispatch emits the active major rolling tag"
   assert_contains "$OUT" "stable=true" \
     "repository_dispatch stable release enables latest"
-  assert_tag_set repository_dispatch "$EXPECTED_TAG_SET"
+  assert_tag_set repository_dispatch "$EXPECTED_CANDIDATE_TAG"
 else
   harness_fail "repository_dispatch case unexpectedly failed: $(cat "${EXTRACT_DIR}/log_repository_dispatch.txt")"
 fi
@@ -675,7 +708,7 @@ if (
     "prerelease keeps its normalized exact semver tag"
   assert_contains "$OUT" "stable=false" \
     "prerelease disables major, major.minor, and latest rolling tags"
-  assert_tag_set prerelease "0.5.0-rc.1"
+  assert_tag_set prerelease "$EXPECTED_CANDIDATE_TAG"
 else
   harness_fail "prerelease case unexpectedly failed: $(cat "${EXTRACT_DIR}/log_prerelease.txt")"
 fi

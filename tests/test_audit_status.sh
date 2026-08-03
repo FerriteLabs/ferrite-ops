@@ -90,4 +90,15 @@ assert_contains "$AUDIT_CONTENT" "ferrite-ops-tag-<version>" \
 assert_contains "$AUDIT_CONTENT" "exactly \`[active-release.env]\`" \
   "AUDIT.md records the restricted ops tag trigger paths"
 
+assert_contains "$AUDIT_CONTENT" "## Exact Image Immutability and Independent Floating-Tag Resolution" \
+  "AUDIT.md records the exact-image-immutability and independent floating-tag resolution"
+assert_contains "$AUDIT_CONTENT" "dev.ferritelabs.image.source-sha256" \
+  "AUDIT.md records the new baked source-checksum label"
+assert_contains "$AUDIT_CONTENT" "candidate-<run id>-<run attempt>" \
+  "AUDIT.md records the unique throwaway candidate tag"
+assert_contains "$AUDIT_CONTENT" "the exact tag is the last" \
+  "AUDIT.md records that the exact tag is the last thing the release workflow writes"
+assert_contains "$AUDIT_CONTENT" "1.9.1\` published after \`2.0.0" \
+  "AUDIT.md records the independent floating-tag backport scenario"
+
 harness_summary

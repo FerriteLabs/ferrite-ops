@@ -538,6 +538,57 @@ unrelated push that happened to touch, say, `docker-compose.yml` without any cor
   replays both a main-tip check that passes (this push is still the tip) and one that fails (main has
   since advanced past it).
 
+## Exact Image Immutability and Independent Floating-Tag Resolution (this change)
+
+Two further release-integrity gaps remained: `release.yml` pushed the exact, immutable version tag
+directly as part of the multi-arch build/sign/attest pipeline (so a mid-pipeline failure could leave a
+signed-but-not-fully-verified exact tag, or a concurrent same-version run could race it), and floating-tag
+promotion advanced `latest`/`<major>`/`<major>.<minor>` as a single bundle gated on one version (`latest`'s),
+which would incorrectly skip a legitimate backport to an older series.
+
+- `release.yml` gains a workflow-level `ferrite-release-<version>` concurrency group
+  (`cancel-in-progress: false`), keyed directly on the raw version from whichever event triggered the run,
+  so duplicate/retried runs for the SAME version always serialize while different versions still build
+  fully concurrently.
+- `build-and-push`'s new `Check existing exact GHCR tag` step runs BEFORE any build step and decides
+  whether this exact version has already been fully published: it reads the existing tag's
+  `org.opencontainers.image.version` and a new `dev.ferritelabs.image.source-sha256` label (now baked by
+  the Dockerfile from a `FERRITE_SOURCE_SHA256` global build-arg, redeclared bare in the `source` and
+  `runtime` stages so it correctly inherits any `--build-arg` override the same way `FERRITE_VERSION`
+  already did) and verifies its cosign signature. A full match is treated as an idempotent no-op — every
+  build/scan/sign/SBOM/attest step below is skipped entirely; a mismatched label or an unverifiable
+  signature FAILS the run immediately, before any build step runs, rather than silently diverging from or
+  rebuilding over a corrupted or unsigned existing release.
+- When not idempotent, `build-and-push` now builds and pushes ONLY a unique, throwaway
+  `candidate-<run id>-<run attempt>` tag — never the exact version tag — then scans it with Trivy
+  (`CRITICAL,HIGH`, blocking) before signing it with cosign and generating/attaching/attesting its SBOM and
+  SLSA provenance, all against that candidate tag/digest.
+- A new `promote-exact` job, gated on `needs: [build-and-push, verify, smoke-test]` all succeeding, is the
+  ONLY place that ever creates or touches the exact version tag: it re-checks immediately beforehand
+  whether the exact tag already exists on GHCR and, independently, on the optional Docker Hub mirror — a
+  match is left untouched (idempotent no-op), and a tag pointing at a *different* digest is refused
+  outright on EITHER registry rather than overwritten. Because promote-exact runs only after every prior
+  job has succeeded, a failed run can never leave an unverified exact tag behind: the exact tag is the last
+  thing this workflow ever writes, not the first. The throwaway candidate tag is intentionally left in the
+  registry as a harmless, clearly-named artifact; registry-level retention/cleanup of `candidate-*` tags
+  is a documented follow-up rather than implemented here, since it is a registry-hygiene concern, not a
+  correctness gap — a candidate tag is never treated as, confused with, or promotable in place of, an
+  exact release tag.
+- `promote-stable` now independently resolves and gates each of `latest`, `<major>`, and `<major>.<minor>`
+  against its OWN currently promoted version (`Resolve current per-tag promoted versions` /
+  `Promote floating tags to this digest`, replacing the previous single bundled `latest`-only gate).
+  A backport release (e.g. `1.9.1` published after `2.0.0`) now correctly leaves `latest` alone (`1.9.1` <
+  `2.0.0`) while still independently advancing `1` and `1.9` because `1.9.1` is newer than whatever they
+  currently point at.
+- `tests/test_exact_image_immutability.sh` (38 checks) functionally replays `check_existing` (first
+  publish, verified idempotent match, mismatched version/checksum labels, an unsigned existing tag) and
+  `promote-exact` (first publish, idempotent retry, a simulated concurrent same-version run, a digest
+  mismatch on GHCR and independently on Docker Hub, a matching Docker Hub tag, and invalid
+  version/digest input) against a stateful fake registry and fake `cosign`.
+  `tests/test_release_promotion.sh` (32 checks) is rewritten for independent per-tag gating and adds the
+  exact 1.9.1-after-2.0.0 backport scenario, proving `latest` is skipped while `1` and `1.9` still advance.
+  `tests/test_release_workflows.sh` is updated throughout for the candidate-tag build target.
+
 ## Deferred Items
 
 | ID | Description | Reason deferred |

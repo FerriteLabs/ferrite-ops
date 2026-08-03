@@ -13,7 +13,15 @@
 # FERRITE_SOURCE_SHA256 is required: any override of FERRITE_VERSION and/or
 # FERRITE_SOURCE_URL must be paired with the matching tarball's SHA256, or
 # the build fails during the `source` stage (see below).
+#
+# Both ARGs are declared here, before the first FROM, so every later stage
+# that needs one can redeclare it bare (`ARG NAME`, no default) and still
+# automatically inherit both this default value AND any --build-arg
+# override — Docker's global-arg scoping rule. A stage-local ARG (declared
+# only inside one FROM..FROM block) does not carry over to other stages at
+# all, so re-declaring it bare there would silently lose the value.
 ARG FERRITE_VERSION=0.4.0
+ARG FERRITE_SOURCE_SHA256=b4db8cc8eb0d3c2cef4a019a47d550c347df69fb8a4f77550c814fae463005cf
 FROM rust:1.95-slim-bookworm AS chef
 
 # Install cargo-chef for caching dependencies, plus curl/ca-certificates to
@@ -33,14 +41,15 @@ ARG FERRITE_SOURCE_URL=https://github.com/FerriteLabs/ferrite/archive/refs/tags/
 
 # SHA256 of the fetched source tarball. Required and verified before
 # extraction: a build with a missing, empty, or mismatched value fails
-# loudly rather than silently trusting an unverified download. The
-# default below is the real, verified SHA256 of the default
-# FERRITE_VERSION's tarball (v0.4.0) at the URL above. Any override of
-# FERRITE_VERSION and/or FERRITE_SOURCE_URL (e.g. a fork, a newer release,
-# or a local mirror) must also pass a matching --build-arg
-# FERRITE_SOURCE_SHA256=<sha256 of that exact tarball> — the v0.4.0
-# default will not match a different tarball and the build will fail.
-ARG FERRITE_SOURCE_SHA256=b4db8cc8eb0d3c2cef4a019a47d550c347df69fb8a4f77550c814fae463005cf
+# loudly rather than silently trusting an unverified download. Re-declared
+# bare (see the global-arg note above the first FROM): this inherits the
+# real, verified SHA256 of the default FERRITE_VERSION's tarball (v0.4.0)
+# at the URL above, or any --build-arg FERRITE_SOURCE_SHA256=<sha256>
+# override. Any override of FERRITE_VERSION and/or FERRITE_SOURCE_URL
+# (e.g. a fork, a newer release, or a local mirror) must also pass a
+# matching override — the v0.4.0 default will not match a different
+# tarball and the build will fail.
+ARG FERRITE_SOURCE_SHA256
 
 # The upstream source ships a dev-convenience .cargo/config.toml that pins
 # a clang+mold linker for faster local rebuilds. Per that file's own
@@ -191,9 +200,14 @@ RUN mkdir -p /etc/ferrite \
 # compiled binaries actually link against at runtime.
 FROM debian:bookworm-slim AS runtime
 
-# Re-declare to make the value available for the LABEL below: ARGs declared
-# before the first FROM are not automatically visible inside build stages.
+# Re-declare (bare — see the global-arg note above the first FROM) to make
+# the values available for the LABELs below: ARGs declared before the
+# first FROM are not automatically visible inside a later build stage
+# unless redeclared, but redeclaring bare here still inherits both the
+# top-level default and any --build-arg override; the release workflow
+# always passes both explicitly to match the exact version it builds.
 ARG FERRITE_VERSION
+ARG FERRITE_SOURCE_SHA256
 
 # Install only the runtime shared libraries the compiled binaries need:
 # CA roots for outbound TLS connections, and libssl3 for the OpenSSL
@@ -264,3 +278,8 @@ LABEL org.opencontainers.image.version="${FERRITE_VERSION}"
 LABEL org.opencontainers.image.authors="Jose David Baena"
 LABEL org.opencontainers.image.source="https://github.com/ferritelabs/ferrite"
 LABEL org.opencontainers.image.licenses="Apache-2.0"
+# Custom label recording the exact, checksum-verified source tarball this
+# image was built from. release.yml reads this label back from an existing
+# exact-version registry tag to verify it matches the release it is about
+# to (re)publish before treating a re-run as a safe, idempotent no-op.
+LABEL dev.ferritelabs.image.source-sha256="${FERRITE_SOURCE_SHA256}"
