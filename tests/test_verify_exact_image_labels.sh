@@ -37,6 +37,8 @@ for fixture in \
   multi-platform-mismatched-version.json \
   multi-platform-missing-labels.json \
   multi-platform-invalid-sha-format.json \
+  multi-platform-match-with-attestation.json \
+  multi-platform-mismatch-with-attestation.json \
   single-platform-match.json \
   single-platform-mismatched-version.json \
   single-platform-missing-labels.json \
@@ -66,6 +68,22 @@ if run_exact multi-platform-match.json "1.2.3" "$SHA_A" >/dev/null 2>&1; then
   harness_ok "exact mode passes when every platform (amd64+arm64) carries the exact expected version and checksum labels"
 else
   harness_fail "exact mode incorrectly rejected a consistent matching amd64+arm64 image"
+fi
+
+# Buildx includes provenance/SBOM attestations as descriptor-marked
+# `unknown/unknown` entries. They are not runtime platforms and carry no
+# Ferrite labels, so they must be excluded without weakening verification of
+# amd64/arm64.
+if run_exact multi-platform-match-with-attestation.json "1.2.3" "$SHA_A" >/dev/null 2>&1; then
+  harness_ok "exact mode ignores descriptor-marked attestation entries while verifying every runtime platform"
+else
+  harness_fail "exact mode incorrectly rejected matching runtime platforms because a BuildKit attestation entry lacks runtime labels"
+fi
+
+if run_exact multi-platform-mismatch-with-attestation.json "1.2.3" "$SHA_A" >/dev/null 2>&1; then
+  harness_fail "exact mode let a descriptor-marked attestation entry hide a mismatched runtime platform"
+else
+  harness_ok "exact mode still fails on a mismatched runtime platform when attestations are present"
 fi
 
 # One mismatched platform (different source-sha256 on arm64): must fail.
@@ -136,6 +154,18 @@ if run_consistent multi-platform-match.json "1.2.3" >/dev/null 2>&1; then
   harness_ok "consistent mode passes when every platform (amd64+arm64) shares the same well-formed checksum"
 else
   harness_fail "consistent mode incorrectly rejected a consistent matching amd64+arm64 image"
+fi
+
+if run_consistent multi-platform-match-with-attestation.json "1.2.3" >/dev/null 2>&1; then
+  harness_ok "consistent mode ignores descriptor-marked attestations while requiring all runtime platforms to agree"
+else
+  harness_fail "consistent mode incorrectly treated a BuildKit attestation as an unlabeled runtime platform"
+fi
+
+if run_consistent multi-platform-mismatch-with-attestation.json "1.2.3" >/dev/null 2>&1; then
+  harness_fail "consistent mode let an attestation entry hide disagreement between runtime platforms"
+else
+  harness_ok "consistent mode detects runtime-platform disagreement when attestations are present"
 fi
 
 if run_consistent multi-platform-mismatched-sha256.json "1.2.3" >/dev/null 2>&1; then

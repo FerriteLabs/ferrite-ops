@@ -372,8 +372,8 @@ jobs:
           ERR_LOG="$(mktemp)"
           trap 'rm -f "$ERR_LOG"' EXIT
 
-          RAW_IMAGE=""
-          if ! RAW_IMAGE="$(docker buildx imagetools inspect "${GHCR_IMAGE}:${VERSION}" --format '{{json .Image}}' 2>"$ERR_LOG")"; then
+          MANIFEST_JSON=""
+          if ! MANIFEST_JSON="$(docker buildx imagetools inspect "${GHCR_IMAGE}:${VERSION}" --format '{{json .Manifest}}' 2>"$ERR_LOG")"; then
             if grep -qiE 'not found|manifest unknown|no such manifest|MANIFEST_UNKNOWN' "$ERR_LOG"; then
               echo "::notice::No existing ${GHCR_IMAGE}:${VERSION} tag; this is the first publish of this exact version."
               echo "idempotent=false" >> "$GITHUB_OUTPUT"
@@ -385,21 +385,24 @@ jobs:
             exit 1
           fi
 
-          MANIFEST_DIGEST="$(docker buildx imagetools inspect "${GHCR_IMAGE}:${VERSION}" --format '{{json .Manifest}}' | jq -r '.digest // empty')"
+          MANIFEST_DIGEST="$(printf '%s' "$MANIFEST_JSON" | jq -r '.digest // empty')"
           if [ -z "$MANIFEST_DIGEST" ]; then
             echo "::error::${GHCR_IMAGE}:${VERSION} exists but its manifest digest could not be determined."
             exit 1
           fi
+          RAW_IMAGE="$(docker buildx imagetools inspect "${GHCR_IMAGE}:${VERSION}" --format '{{json .Image}}')"
+          LABEL_PAYLOAD="$(jq -cn \
+            --argjson manifest "$MANIFEST_JSON" \
+            --argjson image "$RAW_IMAGE" \
+            '{manifest: $manifest, image: $image}')"
 
           # Shared with reconcile-release-tags.yml's own exact-source
-          # verification step so the two workflows can never drift on what
-          # "this exact tag's labels are trustworthy" means. `.Image` is a
-          # single config object for a single-arch image, or a map of
-          # platform -> config for a multi-arch image; the shared script
-          # normalizes both shapes and requires EVERY platform (not just the
-          # first) to carry this run's exact version/checksum labels, so a
-          # partially-rebuilt or mixed-platform manifest always fails.
-          if ! printf '%s' "$RAW_IMAGE" |
+          # verification step so the two workflows cannot drift. The helper
+          # uses descriptor metadata from `.Manifest` to exclude only
+          # BuildKit provenance/SBOM attestation entries, then requires EVERY
+          # runtime platform config in `.Image` to carry this run's exact
+          # version/checksum labels.
+          if ! printf '%s' "$LABEL_PAYLOAD" |
             bash "$LABELS_SCRIPT" exact "$VERSION" "$SHA256" 2>"$ERR_LOG"; then
             echo "::error::${GHCR_IMAGE}:${VERSION} already exists but at least one platform's baked metadata does not match this release exactly (expected version='${VERSION}', sha256='${SHA256}'). Refusing to silently diverge from, or rebuild over, a mismatched or mixed-platform exact tag."
             cat "$ERR_LOG" >&2

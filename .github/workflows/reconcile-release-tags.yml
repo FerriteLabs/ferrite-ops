@@ -200,7 +200,11 @@ jobs:
             # platform's version label must equal this exact tag's own name.
             RAW_IMAGE="$(docker buildx imagetools inspect \
               "${GHCR_IMAGE}:${VERSION}" --format '{{json .Image}}')"
-            if ! printf '%s' "$RAW_IMAGE" |
+            LABEL_PAYLOAD="$(jq -cn \
+              --argjson manifest "$MANIFEST_JSON" \
+              --argjson image "$RAW_IMAGE" \
+              '{manifest: $manifest, image: $image}')"
+            if ! printf '%s' "$LABEL_PAYLOAD" |
               bash "$LABELS_SCRIPT" consistent "$VERSION"; then
               echo "::error::Exact tag ${VERSION} has missing, inconsistent, or invalid version/source metadata across its platform(s)."
               exit 1

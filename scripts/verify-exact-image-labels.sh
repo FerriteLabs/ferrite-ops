@@ -17,17 +17,24 @@
 # reconcile-release-tags.yml's independently-written jq already inspected
 # every platform. That drift is exactly the bug this shared script closes.
 #
-# `docker buildx imagetools inspect <ref> --format '{{json .Image}}'` prints
-# either:
+# The preferred stdin shape combines both Buildx views:
+#   {"manifest": <`.Manifest` JSON>, "image": <`.Image` JSON>}
+# The manifest descriptors let this helper identify and exclude BuildKit
+# provenance/SBOM attestation manifests, which Buildx exposes as synthetic
+# `unknown/unknown` `.Image` entries without the runtime image labels.
+#
+# The nested `.image` value (or a legacy raw `.Image` value used by direct
+# tests) is either:
 #   - a single object with a top-level "config" key, for a single-platform
 #     image, or
 #   - an object mapping each platform string (e.g. "linux/amd64") to its own
 #     `{"config": {...}}`, for a multi-platform image.
-# This script normalizes both shapes into a list of "platform configs" and
-# requires EVERY one of them — not just the first — to carry the expected
-# labels, so mixed-platform metadata (a stale or partially-rebuilt manifest
-# list) always fails instead of silently passing on the strength of a single
-# platform.
+# This script filters only descriptors explicitly marked
+# `vnd.docker.reference.type=attestation-manifest`, normalizes every remaining
+# runtime platform into a list of configs, and requires EVERY one of them —
+# not just the first — to carry the expected labels. Missing labels on a real
+# platform still fail; mixed-platform metadata cannot hide behind a valid
+# sibling platform.
 #
 # Usage:
 #   verify-exact-image-labels.sh exact <version> <sha256>
@@ -66,14 +73,47 @@ usage() {
   exit 2
 }
 
-# Shared jq helper: normalizes either a single-platform `{"config": {...}}`
-# object or a multi-platform `{"<platform>": {"config": {...}}, ...}` map
-# into an array of platform config objects.
+# Shared jq helper: normalizes either the preferred combined manifest/image
+# payload, a single-platform `{"config": {...}}` object, or a legacy
+# multi-platform `{"<platform>": {"config": {...}}, ...}` map into an array
+# of runtime platform config objects. Only descriptor-proven attestations are
+# excluded; an ordinary platform missing labels remains in the array and
+# fails verification.
 JQ_IMAGES_DEF='
+  def attestation_platforms($manifest):
+    [
+      ($manifest.manifests // [])[]
+      | select(
+          (.annotations["vnd.docker.reference.type"] // "")
+          == "attestation-manifest"
+        )
+      | "\(.platform.os // "")/\(.platform.architecture // "")"
+    ];
+  def runtime_images($image; $manifest):
+    if ($image | type) == "object" and ($image | has("config")) then
+      [$image]
+    elif ($image | type) == "object" then
+      attestation_platforms($manifest) as $attestation_platforms
+      | [
+          $image
+          | to_entries[]
+          | .key as $platform
+          | select(($attestation_platforms | index($platform)) == null)
+          | .value
+        ]
+    else
+      []
+    end;
   def images:
-    if type == "object" and has("config") then [.]
-    elif type == "object" then [.[]]
-    else [] end;
+    if type == "object" and has("manifest") and has("image") then
+      runtime_images(.image; .manifest)
+    elif type == "object" and has("config") then
+      [.]
+    elif type == "object" then
+      [.[]]
+    else
+      []
+    end;
 '
 
 main() {

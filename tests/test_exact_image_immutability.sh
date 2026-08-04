@@ -157,9 +157,14 @@ if [ "${1:-}" = "buildx" ] && [ "${2:-}" = "imagetools" ] && [ "${3:-}" = "inspe
   VERSION_LABEL="$(printf '%s' "$LINE" | awk '{print $3}')"
   SHA_LABEL="$(printf '%s' "$LINE" | awk '{print $4}')"
   IMAGE_FILE="$(printf '%s' "$LINE" | awk '{print $5}')"
+  MANIFEST_FILE="$(printf '%s' "$LINE" | awk '{print $6}')"
   FORMAT="${6:-}"
   if [ "$FORMAT" = '{{json .Manifest}}' ]; then
-    printf '{"digest":"%s"}\n' "$DIGEST"
+    if [ -n "$MANIFEST_FILE" ] && [ "$MANIFEST_FILE" != "-" ] && [ -f "$MANIFEST_FILE" ]; then
+      cat "$MANIFEST_FILE"
+    else
+      printf '{"digest":"%s"}\n' "$DIGEST"
+    fi
   elif [ -n "$IMAGE_FILE" ] && [ "$IMAGE_FILE" != "-" ] && [ -f "$IMAGE_FILE" ]; then
     # A multi-platform (or otherwise custom-shaped) `.Image` fixture,
     # returned verbatim instead of the single-platform template below.
@@ -282,14 +287,17 @@ GHCR_IMAGE="ghcr.io/ferritelabs/ferrite"
 DOCKERHUB_IMAGE="ferritelabs/ferrite"
 
 manifest_set() {
-  # image_file is optional: when set to a path (not "-"), the fake docker
-  # returns that file's content verbatim for `.Image` instead of building a
-  # single-platform object from version/sha -- used to simulate a
-  # multi-platform (amd64+arm64) manifest.
-  local full_ref="$1" digest="$2" version="$3" sha="$4" image_file="${5:--}"
+  # image_file and manifest_file are optional. Together they can model the
+  # production Buildx shape where `.Image` contains runtime platforms plus
+  # an unknown/unknown attestation entry and `.Manifest` identifies that
+  # entry via descriptor annotations.
+  local full_ref="$1" digest="$2" version="$3" sha="$4"
+  local image_file="${5:--}" manifest_file="${6:--}"
   awk -v r="$full_ref" '$1!=r' "$REGISTRY_MANIFEST" > "${REGISTRY_MANIFEST}.tmp" 2>/dev/null || true
   mv "${REGISTRY_MANIFEST}.tmp" "$REGISTRY_MANIFEST"
-  printf '%s %s %s %s %s\n' "$full_ref" "$digest" "$version" "$sha" "$image_file" >> "$REGISTRY_MANIFEST"
+  printf '%s %s %s %s %s %s\n' \
+    "$full_ref" "$digest" "$version" "$sha" "$image_file" "$manifest_file" \
+    >> "$REGISTRY_MANIFEST"
 }
 
 manifest_digest_of() {
@@ -390,6 +398,38 @@ if run_check_existing "0.5.4" "$ONES" "${TMP}/multi_match.out"; then
     "check_existing reports idempotent=true when EVERY platform (amd64+arm64) of a multi-platform exact tag matches exactly and is signed"
 else
   harness_fail "check_existing unexpectedly failed for a consistent multi-platform exact tag: $(cat "${TMP}/multi_match.out.log")"
+fi
+
+# Buildx provenance/SBOM manifests appear as descriptor-marked
+# unknown/unknown entries without runtime labels. The real workflow must
+# ignore that attestation while still verifying amd64 and arm64.
+ATTESTATION_IMAGE="${TMP}/attestation-image.json"
+ATTESTATION_MANIFEST="${TMP}/attestation-manifest.json"
+cat >"$ATTESTATION_IMAGE" <<JSON
+{
+  "linux/amd64": {"config": {"Labels": {"org.opencontainers.image.version": "0.5.7", "dev.ferritelabs.image.source-sha256": "${ONES}"}}},
+  "linux/arm64": {"config": {"Labels": {"org.opencontainers.image.version": "0.5.7", "dev.ferritelabs.image.source-sha256": "${ONES}"}}},
+  "unknown/unknown": {"config": {"Labels": {"moby.buildkit.buildinfo.v1": "attestation"}}}
+}
+JSON
+cat >"$ATTESTATION_MANIFEST" <<JSON
+{
+  "digest": "sha256:${ZERO}",
+  "manifests": [
+    {"digest": "sha256:${ONES}", "platform": {"os": "linux", "architecture": "amd64"}},
+    {"digest": "sha256:${ZERO}", "platform": {"os": "linux", "architecture": "arm64"}},
+    {"digest": "sha256:${ONES}", "platform": {"os": "unknown", "architecture": "unknown"}, "annotations": {"vnd.docker.reference.type": "attestation-manifest"}}
+  ]
+}
+JSON
+manifest_set "${GHCR_IMAGE}:0.5.7" "sha256:${ZERO}" "0.5.7" "$ONES" \
+  "$ATTESTATION_IMAGE" "$ATTESTATION_MANIFEST"
+sign_digest "sha256:${ZERO}"
+if run_check_existing "0.5.7" "$ONES" "${TMP}/attestation_match.out"; then
+  assert_contains "$(cat "${TMP}/attestation_match.out")" "idempotent=true" \
+    "check_existing ignores descriptor-marked attestations and verifies every real platform"
+else
+  harness_fail "check_existing incorrectly rejected a valid attested multi-platform exact tag: $(cat "${TMP}/attestation_match.out.log")"
 fi
 
 # One platform (arm64) disagrees on the source-checksum label: must fail,

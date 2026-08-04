@@ -315,8 +315,13 @@ if [ "${1:-}" = "buildx" ] && [ "${2:-}" = "imagetools" ] && [ "${3:-}" = "inspe
   VERSION="$(printf '%s\n' "$LINE" | awk '{print $3}')"
   SOURCE_SHA="$(printf '%s\n' "$LINE" | awk '{print $4}')"
   IMAGE_FILE="$(printf '%s\n' "$LINE" | awk '{print $5}')"
+  MANIFEST_FILE="$(printf '%s\n' "$LINE" | awk '{print $6}')"
   if [ "${6:-}" = '{{json .Manifest}}' ]; then
-    printf '{"digest":"%s"}\n' "$DIGEST"
+    if [ -n "$MANIFEST_FILE" ] && [ "$MANIFEST_FILE" != "-" ] && [ -f "$MANIFEST_FILE" ]; then
+      cat "$MANIFEST_FILE"
+    else
+      printf '{"digest":"%s"}\n' "$DIGEST"
+    fi
   elif [ -n "$IMAGE_FILE" ] && [ "$IMAGE_FILE" != "-" ] && [ -f "$IMAGE_FILE" ]; then
     # A multi-platform (or otherwise custom-shaped) `.Image` fixture,
     # returned verbatim instead of the single-platform template below.
@@ -408,14 +413,15 @@ DOCKERHUB_IMAGE="ferritelabs/ferrite"
 SOURCE_SHA="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 
 state_set() {
-  # image_file is optional: when set to a path (not "-"), the fake docker
-  # returns that file's content verbatim for `.Image` instead of building a
-  # single-platform object from version/source_sha -- used to simulate a
-  # multi-platform (amd64+arm64) manifest.
-  local ref="$1" digest="$2" version="${3:-state}" source_sha="${4:-state}" image_file="${5:--}"
+  # image_file and manifest_file are optional. Together they model Buildx
+  # runtime platform configs plus descriptor-marked provenance/SBOM entries.
+  local ref="$1" digest="$2" version="${3:-state}" source_sha="${4:-state}"
+  local image_file="${5:--}" manifest_file="${6:--}"
   awk -v ref="$ref" '$1 != ref' "$REGISTRY_STATE" >"${REGISTRY_STATE}.tmp" || true
   mv "${REGISTRY_STATE}.tmp" "$REGISTRY_STATE"
-  printf '%s %s %s %s %s\n' "$ref" "$digest" "$version" "$source_sha" "$image_file" >>"$REGISTRY_STATE"
+  printf '%s %s %s %s %s %s\n' \
+    "$ref" "$digest" "$version" "$source_sha" "$image_file" "$manifest_file" \
+    >>"$REGISTRY_STATE"
 }
 
 state_digest() {
@@ -524,6 +530,45 @@ if (
   harness_ok "verification passes when every platform (amd64+arm64) of a multi-platform exact source reports matching version and source-checksum labels"
 else
   harness_fail "verification incorrectly rejected a consistent multi-platform exact source: $(cat "${TMP}/multi-match.log")"
+fi
+
+# Production releases enable provenance and SBOM, so Buildx includes a
+# descriptor-marked unknown/unknown attestation entry without Ferrite runtime
+# labels. Reconciliation must ignore that entry but verify both real
+# platforms.
+ATTESTATION_IMAGE="${TMP}/attestation-source-image.json"
+ATTESTATION_MANIFEST="${TMP}/attestation-source-manifest.json"
+cat >"$ATTESTATION_IMAGE" <<JSON
+{
+  "linux/amd64": {"config": {"Labels": {"org.opencontainers.image.version": "2.0.1", "dev.ferritelabs.image.source-sha256": "${SOURCE_SHA}"}}},
+  "linux/arm64": {"config": {"Labels": {"org.opencontainers.image.version": "2.0.1", "dev.ferritelabs.image.source-sha256": "${SOURCE_SHA}"}}},
+  "unknown/unknown": {"config": {"Labels": {"moby.buildkit.buildinfo.v1": "attestation"}}}
+}
+JSON
+cat >"$ATTESTATION_MANIFEST" <<'JSON'
+{
+  "digest": "sha256:6666666666666666666666666666666666666666666666666666666666666666",
+  "manifests": [
+    {"digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111", "platform": {"os": "linux", "architecture": "amd64"}},
+    {"digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222", "platform": {"os": "linux", "architecture": "arm64"}},
+    {"digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333", "platform": {"os": "unknown", "architecture": "unknown"}, "annotations": {"vnd.docker.reference.type": "attestation-manifest"}}
+  ]
+}
+JSON
+state_set "${GHCR_IMAGE}:2.0.1" \
+  "sha256:6666666666666666666666666666666666666666666666666666666666666666" \
+  "2.0.1" "$SOURCE_SHA" "$ATTESTATION_IMAGE" "$ATTESTATION_MANIFEST"
+if (
+  cd "$TMP" || exit 1
+  export PATH="${FAKE_BIN}:${PATH}"
+  export REGISTRY_STATE SIGNED_DIGESTS
+  export GHCR_IMAGE REPOSITORY="ferritelabs/ferrite-ops" DEFAULT_BRANCH="main"
+  export HELPER ORDER_SCRIPT="$ORDER" LABELS_SCRIPT="$LABELS"
+  bash "$VERIFY_SCRIPT"
+) >"${TMP}/attestation-match.log" 2>&1; then
+  harness_ok "verification ignores descriptor-marked attestations while checking every real platform"
+else
+  harness_fail "verification incorrectly rejected a valid attested multi-platform source: $(cat "${TMP}/attestation-match.log")"
 fi
 
 # One platform (arm64) disagrees on the source-checksum label: must fail.
