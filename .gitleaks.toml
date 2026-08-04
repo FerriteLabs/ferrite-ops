@@ -1,0 +1,7 @@
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Grafana authorization-header documentation placeholder"
+regexTarget = "match"
+regexes = ['''Authorization:\s+Bearer\s+YOUR_API_KEY''']

@@ -68,6 +68,7 @@
 | F-57 | P2 | Signature/attestation identity | Keyless cosign verification used an org-wide `^https://github\.com/<owner>/` identity regexp, which would accept a signature minted by ANY repository under the same owner, on any workflow file, on any ref. | Fixed; the identity regexp is scoped to this exact repository's `.github/workflows/release.yml`, on only the two refs this workflow is actually trusted to release from (a `v*` tag push, or a dispatch running on `main`) |
 | F-58 | P0 | Ops tag creation race | `tag-ops-release.yml` validated that origin's `main` still matched the triggering commit, then created and pushed the annotated tag as a SEPARATE later step, leaving a race window in which main could advance between the two and still be tagged. | Fixed; the tag creation and the main-tip comparison are combined into one atomic `git push --atomic --force-with-lease=refs/heads/main:<sha>` invocation, so the tag is created only if origin's main still equals the triggering commit at the moment of the push itself, with no window between check and effect |
 | F-59 | P2 | SemVer validation duplication | `release-orchestration.yml` and `tag-ops-release.yml` validated versions with locally duplicated, looser inline regexes instead of the shared `scripts/release-ordering.sh` validator, silently accepting a leading zero in the core or in a numeric pre-release identifier that the shared validator rejects. | Fixed; every version-accepting step in both workflows now calls `scripts/release-ordering.sh validate`, and each workflow normalizes (strips a leading `v`) exactly once, in its own `prepare`/`resolve` job |
+| F-60 | P2 | Secret-scan verification | A placeholder API-token header in `grafana/README.md` matched gitleaks curl authorization-header rule, causing the full-history CI scan to fail on known non-secret documentation. | Fixed; the live example now reads a token from `GRAFANA_API_TOKEN`, while `.gitleaks.toml` narrowly allowlists only the historical placeholder so the existing commit remains auditable without suppressing real credentials |
 
 ## D-01 Resolution
 
@@ -664,32 +665,39 @@ Six further release-hardening gaps were closed in this pass:
   `release-orchestration.yml`'s `prepare` job, and `tag-ops-release.yml`'s `resolve` job — with every other job
   only re-validating the already-normalized value.
 
-Tests: `tests/test_release_workflows.sh` (183 checks) gained explicit static assertions for the candidate
+Tests: `tests/test_release_workflows.sh` (184 checks) gained explicit static assertions for the candidate
 metadata label override, the scoped identity regexp (plus a live regexp-match/no-match check against real and
 untrusted signing identities), the normalized concurrency groups, and functional leading-zero-rejection replays
 for `release-orchestration.yml`. `tests/test_exact_image_immutability.sh` (44 checks) gained a fake `crane`
 binary and functional replays of the Docker Hub cross-registry backfill (missing mirror, matching digest,
 mismatched digest, and a simulated corrupted copy), plus updated static concurrency assertions.
-`tests/test_ops_release_tag_workflow.sh` (38 checks) gained a functional replay that advances a cloned
+`tests/test_ops_release_tag_workflow.sh` gained a functional replay that advances a cloned
 remote's `main` strictly between this run's earlier validation and its own tag-creation push, proving the
 atomic lease-guarded push rejects the tag (and leaves none behind on origin) even though nothing in this run's
-own local state changed, plus a leading-zero rejection replay for the `resolve` job.
+own local state changed, plus exact-once normalization and both leading-zero core and numeric-prerelease
+rejection replays for the `resolve` job.
 
 ## Final Verification Pass (candidate metadata, cross-registry backfill, normalized concurrency, identity scoping, atomic tagging, strict SemVer)
 
 - `bash tests/run.sh` passes all 29/29 discovered suites, including the updated `test_release_workflows.sh`
-  (183 checks), `test_exact_image_immutability.sh` (44 checks), and `test_ops_release_tag_workflow.sh`
-  (38 checks).
+  (184 checks), `test_exact_image_immutability.sh` (44 checks), and `test_ops_release_tag_workflow.sh`
+  (41 checks).
 - `actionlint .github/workflows/*.yml` passes with no findings, including the restructured `release.yml`
   (`prepare` job, job-level concurrency, scoped cosign identity, crane-based Docker Hub backfill),
   `release-orchestration.yml` (checkout added to every version-validating job, shared strict-SemVer calls), and
   `tag-ops-release.yml` (atomic lease-guarded push, shared strict-SemVer calls).
 - `shellcheck --severity=warning scripts/*.sh tests/*.sh tests/lib/*.sh` passes with no findings.
-- `helm lint charts/ferrite charts/ferrite-sidecar` both pass (unchanged by this change; re-verified since
-  D-02 remains the only deferred chart-related item).
+- `cargo fmt --manifest-path playground-launcher/Cargo.toml --check` passes and
+  `cargo test --manifest-path playground-launcher/Cargo.toml` passes all 76 tests.
+- Strict Helm lint and default/HA template rendering pass for both charts (re-verified since D-02 remains the
+  only deferred chart-related item).
+- Trivy reports zero Dockerfile misconfigurations. The full-history gitleaks scan passes with the narrow
+  historical documentation-placeholder allowlist from F-60.
+- A default `docker build` succeeds, and both the server and CLI execute from the resulting runtime image
+  (`ferrite 0.4.0`, `ferrite-cli 0.4.0`), confirming the CI runtime/ABI checks.
 - No production runtime code (playground, RESP proxy, response budgets, request memory) was touched by this
-  change; only `release.yml`, `release-orchestration.yml`, `tag-ops-release.yml`, and their tests were
-  modified.
+  change; release workflows/tests, audit documentation, and the Grafana import example/secret-scan allowlist
+  were modified.
 
 ## Deferred Items
 

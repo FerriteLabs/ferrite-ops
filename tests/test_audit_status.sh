@@ -5,6 +5,8 @@ set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${HERE}/.." && pwd)"
 AUDIT_CONTENT="$(cat "${REPO_ROOT}/AUDIT.md")"
+GITLEAKS_CONTENT="$(cat "${REPO_ROOT}/.gitleaks.toml")"
+GRAFANA_README_CONTENT="$(cat "${REPO_ROOT}/grafana/README.md")"
 # shellcheck source=tests/lib/harness.sh
 source "${HERE}/lib/harness.sh"
 
@@ -103,7 +105,7 @@ assert_contains "$AUDIT_CONTENT" "1.9.1\` published after \`2.0.0" \
 assert_contains "$AUDIT_CONTENT" "29/29 discovered suites" \
   "AUDIT.md records the final 29-suite verification pass"
 
-for finding in F-54 F-55 F-56 F-57 F-58 F-59; do
+for finding in F-54 F-55 F-56 F-57 F-58 F-59 F-60; do
   assert_contains "$AUDIT_CONTENT" "| ${finding} |" \
     "AUDIT.md records release-hardening finding ${finding} as fixed"
 done
@@ -117,6 +119,12 @@ assert_contains "$AUDIT_CONTENT" "ferrite-release-exact-<version>" \
   "AUDIT.md records the normalized-version job-level concurrency group"
 assert_contains "$AUDIT_CONTENT" "force-with-lease" \
   "AUDIT.md records the atomic lease-guarded ops tag push"
+assert_contains "$GITLEAKS_CONTENT" 'Authorization:\s+Bearer\s+YOUR_API_KEY' \
+  "gitleaks narrowly allowlists the historical documentation placeholder"
+assert_contains "$GRAFANA_README_CONTENT" 'Authorization: Bearer ${GRAFANA_API_TOKEN}' \
+  "Grafana import documentation reads its API token from the environment"
+assert_not_contains "$GRAFANA_README_CONTENT" "Authorization: Bearer YOUR_API_KEY" \
+  "Grafana import documentation no longer contains the secret-like placeholder"
 assert_contains "$AUDIT_CONTENT" "D-02 is the only deferred item." \
   "AUDIT.md still leaves only D-02 deferred after this change"
 

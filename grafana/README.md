@@ -28,7 +28,7 @@ A comprehensive dashboard for monitoring Ferrite instances with:
 ```bash
 curl -X POST \
   -H "Content-Type: application/json" \
-  -H "Authorization: Bearer YOUR_API_KEY" \
+  -H "Authorization: Bearer ${GRAFANA_API_TOKEN}" \
   -d @ferrite-dashboard.json \
   http://localhost:3000/api/dashboards/import
 ```
