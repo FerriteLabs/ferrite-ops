@@ -32,6 +32,8 @@ jobs:
 
       - name: Read canonical version from this push
         id: version
+        env:
+          ORDER_SCRIPT: scripts/release-ordering.sh
         run: |
           set -euo pipefail
 
@@ -42,9 +44,13 @@ jobs:
           fi
           test "$(grep -c '^FERRITE_VERSION=' "$ACTIVE_RELEASE")" -eq 1
           VERSION="$(sed -n 's/^FERRITE_VERSION=//p' "$ACTIVE_RELEASE")"
-          if ! printf '%s\n' "$VERSION" |
-            grep -qE '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?$'; then
-            echo "::error::active-release.env contains an invalid canonical SemVer: ${VERSION}"
+          # The trusted shared validator (not a locally duplicated regex)
+          # enforces strict SemVer 2.0: it rejects a leading zero in the
+          # core (e.g. "01.2.3") AND in any purely-numeric pre-release
+          # identifier (e.g. "1.2.3-01"), which a looser shape-only regex
+          # would silently accept.
+          if ! bash "$ORDER_SCRIPT" validate "$VERSION"; then
+            echo "::error::active-release.env contains a canonical version that fails strict SemVer 2.0 validation (leading zeros in the core or a numeric pre-release identifier are rejected): ${VERSION}"
             exit 1
           fi
 
@@ -89,6 +95,7 @@ jobs:
         id: release
         env:
           MERGED_SHA: ${{ github.sha }}
+          ORDER_SCRIPT: scripts/release-ordering.sh
         run: |
           set -euo pipefail
 
@@ -116,9 +123,10 @@ jobs:
           test "$(grep -c '^FERRITE_SOURCE_SHA256=' "$ACTIVE_RELEASE")" -eq 1
           VERSION="$(sed -n 's/^FERRITE_VERSION=//p' "$ACTIVE_RELEASE")"
           SHA256="$(sed -n 's/^FERRITE_SOURCE_SHA256=//p' "$ACTIVE_RELEASE")"
-          if ! printf '%s\n' "$VERSION" |
-            grep -qE '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?$'; then
-            echo "::error::active-release.env contains an invalid canonical SemVer: ${VERSION}"
+          # Trusted shared validator (see the "resolve" job above): rejects
+          # leading zeros in the core or in a numeric pre-release identifier.
+          if ! bash "$ORDER_SCRIPT" validate "$VERSION"; then
+            echo "::error::active-release.env contains a canonical version that fails strict SemVer 2.0 validation: ${VERSION}"
             exit 1
           fi
           if ! printf '%s\n' "$SHA256" | grep -qE '^[0-9a-f]{64}$'; then

@@ -163,11 +163,29 @@ MERGED_SHA="$(git -C "$FIXTURE" rev-parse HEAD)"
 
 # --- resolve job: reads the canonical version from this exact push ---------
 RESOLVE_OUT="${TMP}/resolve.out"
-if ( cd "$FIXTURE" && GITHUB_OUTPUT="$RESOLVE_OUT" bash "$RESOLVE_SCRIPT" ); then
+if ( cd "$FIXTURE" && GITHUB_OUTPUT="$RESOLVE_OUT" ORDER_SCRIPT="${REPO_ROOT}/scripts/release-ordering.sh" bash "$RESOLVE_SCRIPT" ); then
   assert_contains "$(cat "$RESOLVE_OUT")" "version=${EXPECTED_VERSION}" \
     "resolve job emits the canonical version for this push"
 else
   harness_fail "resolve job unexpectedly failed"
+fi
+
+# --- resolve job: strict SemVer via the shared validator, not a locally
+# duplicated regex -- rejects a leading zero in the core or in a numeric
+# pre-release identifier, which the OLD locally duplicated regex accepted.
+LEADING_ZERO_FIXTURE="${TMP}/leading-zero-fixture"
+cp -R "$FIXTURE" "$LEADING_ZERO_FIXTURE"
+sed -i.bak "s/^FERRITE_VERSION=.*/FERRITE_VERSION=1.2.3-01/" "${LEADING_ZERO_FIXTURE}/active-release.env"
+rm -f "${LEADING_ZERO_FIXTURE}/active-release.env.bak"
+if (
+  cd "$LEADING_ZERO_FIXTURE" &&
+    GITHUB_OUTPUT="${TMP}/leading_zero_resolve.out" \
+      ORDER_SCRIPT="${REPO_ROOT}/scripts/release-ordering.sh" bash "$RESOLVE_SCRIPT"
+) >"${TMP}/leading_zero_resolve.log" 2>&1; then
+  harness_fail "resolve job unexpectedly accepted a leading-zero numeric pre-release identifier (1.2.3-01)"
+else
+  assert_contains "$(cat "${TMP}/leading_zero_resolve.log")" "strict SemVer" \
+    "resolve job rejects a leading-zero numeric pre-release identifier via the shared validator"
 fi
 
 # --- main-tip validation: passes when this push IS the current tip ---------
@@ -200,7 +218,8 @@ OUTPUT="${TMP}/release.out"
 
 if (
   cd "$FIXTURE" &&
-    MERGED_SHA="$MERGED_SHA" GITHUB_OUTPUT="$OUTPUT" bash "$VALIDATE_SCRIPT"
+    MERGED_SHA="$MERGED_SHA" GITHUB_OUTPUT="$OUTPUT" \
+      ORDER_SCRIPT="${REPO_ROOT}/scripts/release-ordering.sh" bash "$VALIDATE_SCRIPT"
 ); then
   assert_contains "$(cat "$OUTPUT")" "version=${EXPECTED_VERSION}" \
     "canonical validation emits the active version"
@@ -241,7 +260,8 @@ sed -i.bak "s/appVersion: \"${EXPECTED_VERSION}\"/appVersion: \"9.9.9\"/" \
 rm -f "${FIXTURE}/charts/ferrite/Chart.yaml.bak"
 if (
   cd "$FIXTURE" &&
-    MERGED_SHA="$MERGED_SHA" GITHUB_OUTPUT="${TMP}/drift.out" bash "$VALIDATE_SCRIPT"
+    MERGED_SHA="$MERGED_SHA" GITHUB_OUTPUT="${TMP}/drift.out" \
+      ORDER_SCRIPT="${REPO_ROOT}/scripts/release-ordering.sh" bash "$VALIDATE_SCRIPT"
 ); then
   harness_fail "ops tag validation unexpectedly accepted chart/appVersion drift"
 else
