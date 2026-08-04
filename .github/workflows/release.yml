@@ -360,6 +360,7 @@ jobs:
           VERSION: ${{ needs.prepare.outputs.version }}
           SHA256: ${{ needs.prepare.outputs.sha256 }}
           CERTIFICATE_IDENTITY_REGEXP: ${{ needs.prepare.outputs.certificate_identity_regexp }}
+          LABELS_SCRIPT: scripts/verify-exact-image-labels.sh
         run: |
           set -euo pipefail
 
@@ -385,24 +386,18 @@ jobs:
             exit 1
           fi
 
-          # `.Image` is a single config object for a single-arch image, or a
-          # map of platform -> config for a multi-arch image; read the
-          # relevant labels from either shape.
-          EXISTING_VERSION="$(printf '%s' "$RAW_IMAGE" | jq -r '
-            if type == "object" and has("config") then
-              (.config.Labels["org.opencontainers.image.version"] // "")
-            elif type == "object" then
-              ([.[] | .config.Labels["org.opencontainers.image.version"] // empty] | (.[0] // ""))
-            else "" end')"
-          EXISTING_SHA256="$(printf '%s' "$RAW_IMAGE" | jq -r '
-            if type == "object" and has("config") then
-              (.config.Labels["dev.ferritelabs.image.source-sha256"] // "")
-            elif type == "object" then
-              ([.[] | .config.Labels["dev.ferritelabs.image.source-sha256"] // empty] | (.[0] // ""))
-            else "" end')"
-
-          if [ "$EXISTING_VERSION" != "$VERSION" ] || [ "$EXISTING_SHA256" != "$SHA256" ]; then
-            echo "::error::${GHCR_IMAGE}:${VERSION} already exists but its baked metadata does not match this release (existing version='${EXISTING_VERSION}', sha256='${EXISTING_SHA256}'; expected version='${VERSION}', sha256='${SHA256}'). Refusing to silently diverge from, or rebuild over, a mismatched exact tag."
+          # Shared with reconcile-release-tags.yml's own exact-source
+          # verification step so the two workflows can never drift on what
+          # "this exact tag's labels are trustworthy" means. `.Image` is a
+          # single config object for a single-arch image, or a map of
+          # platform -> config for a multi-arch image; the shared script
+          # normalizes both shapes and requires EVERY platform (not just the
+          # first) to carry this run's exact version/checksum labels, so a
+          # partially-rebuilt or mixed-platform manifest always fails.
+          if ! printf '%s' "$RAW_IMAGE" |
+            bash "$LABELS_SCRIPT" exact "$VERSION" "$SHA256" 2>"$ERR_LOG"; then
+            echo "::error::${GHCR_IMAGE}:${VERSION} already exists but at least one platform's baked metadata does not match this release exactly (expected version='${VERSION}', sha256='${SHA256}'). Refusing to silently diverge from, or rebuild over, a mismatched or mixed-platform exact tag."
+            cat "$ERR_LOG" >&2
             exit 1
           fi
 

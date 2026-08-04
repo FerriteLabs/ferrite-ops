@@ -49,6 +49,7 @@ RELEASE_CONTENT="$(cat "$RELEASE_YML")"
 RECONCILE_CONTENT="$(cat "$RECONCILE_YML")"
 VERSION_SYNC_CONTENT="$(cat "$VERSION_SYNC_YML")"
 ORCHESTRATION_CONTENT="$(cat "$ORCHESTRATION_YML")"
+LABELS_SCRIPT_CONTENT="$(cat "${REPO_ROOT}/scripts/verify-exact-image-labels.sh")"
 
 # --- Static checks: release.yml ---------------------------------------------
 assert_contains "$RELEASE_CONTENT" "FERRITE_SOURCE_SHA256" \
@@ -147,8 +148,12 @@ assert_contains "$RELEASE_CONTENT" "id: check_existing" \
   "release.yml checks for an existing exact GHCR tag before building anything"
 assert_contains "$RELEASE_CONTENT" "candidate-\${RUN_ID}-\${RUN_ATTEMPT}" \
   "release.yml derives a unique candidate tag from the run id and attempt"
-assert_contains "$RELEASE_CONTENT" "dev.ferritelabs.image.source-sha256" \
-  "release.yml verifies the baked source-checksum label of an existing exact tag"
+assert_contains "$RELEASE_CONTENT" "LABELS_SCRIPT: scripts/verify-exact-image-labels.sh" \
+  "release.yml wires in the shared exact-tag label verification helper"
+assert_contains "$RELEASE_CONTENT" 'bash "$LABELS_SCRIPT" exact "$VERSION" "$SHA256"' \
+  "release.yml verifies an existing exact tag's labels via the shared helper in 'exact' mode"
+assert_contains "$LABELS_SCRIPT_CONTENT" "dev.ferritelabs.image.source-sha256" \
+  "the shared label-verification helper checks the baked source-checksum label of an existing exact tag"
 assert_contains "$RELEASE_CONTENT" "release-transaction:" \
   "release.yml defines one exact release transaction job"
 assert_not_contains "$RELEASE_CONTENT" "promote-exact:" \

@@ -175,6 +175,7 @@ jobs:
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
           HELPER: scripts/reconcile-release-tags.py
           ORDER_SCRIPT: scripts/release-ordering.sh
+          LABELS_SCRIPT: scripts/verify-exact-image-labels.sh
         run: |
           set -euo pipefail
 
@@ -190,28 +191,18 @@ jobs:
               exit 1
             fi
 
+            # Shared with release.yml's own pre-build exact-tag check so the
+            # two workflows can never drift on what "this exact tag's labels
+            # are trustworthy" means. Reconciliation has no independently
+            # known canonical checksum for a historical release, so it uses
+            # "consistent" mode: every platform must agree with every other
+            # platform on a well-formed source-checksum label, and every
+            # platform's version label must equal this exact tag's own name.
             RAW_IMAGE="$(docker buildx imagetools inspect \
               "${GHCR_IMAGE}:${VERSION}" --format '{{json .Image}}')"
-            if ! printf '%s' "$RAW_IMAGE" | jq -e --arg version "$VERSION" '
-              def images:
-                if type == "object" and has("config") then [.]
-                elif type == "object" then [.[]]
-                else [] end;
-              images as $images |
-              ($images | length) > 0 and
-              all($images[];
-                (.config.Labels["org.opencontainers.image.version"] // "") == $version
-              ) and
-              all($images[];
-                (.config.Labels["dev.ferritelabs.image.source-sha256"] // "")
-                | test("^[0-9a-f]{64}$")
-              ) and
-              ([
-                $images[]
-                | .config.Labels["dev.ferritelabs.image.source-sha256"]
-              ] | unique | length) == 1
-            ' >/dev/null; then
-              echo "::error::Exact tag ${VERSION} has missing, inconsistent, or invalid version/source metadata."
+            if ! printf '%s' "$RAW_IMAGE" |
+              bash "$LABELS_SCRIPT" consistent "$VERSION"; then
+              echo "::error::Exact tag ${VERSION} has missing, inconsistent, or invalid version/source metadata across its platform(s)."
               exit 1
             fi
 

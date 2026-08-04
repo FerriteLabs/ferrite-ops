@@ -68,8 +68,11 @@ assert_contains "$CONTENT" "any other ambiguous inspection failure aborts the ex
   "eligible Docker Hub exact-tag inspection failures are documented as fatal"
 assert_not_contains "$CONTENT" "Skipping optional \${dest_image} promotion" \
   "eligible Docker Hub inspection errors can never silently succeed"
-assert_contains "$CONTENT" "dev.ferritelabs.image.source-sha256" \
-  "release.yml verifies the baked source-checksum label of an existing exact tag"
+assert_contains "$CONTENT" "LABELS_SCRIPT: scripts/verify-exact-image-labels.sh" \
+  "release.yml wires in the shared exact-tag label verification helper"
+LABELS_SCRIPT_CONTENT="$(cat "${REPO_ROOT}/scripts/verify-exact-image-labels.sh")"
+assert_contains "$LABELS_SCRIPT_CONTENT" "dev.ferritelabs.image.source-sha256" \
+  "the shared label-verification helper checks the baked source-checksum label of an existing exact tag"
 assert_contains "$CONTENT" "cosign verify" \
   "release.yml verifies the signature of an existing exact tag before treating it as safe"
 assert_not_contains "$CONTENT" 'type=raw,value=${{ steps.release_meta.outputs.version }}' \
@@ -153,9 +156,14 @@ if [ "${1:-}" = "buildx" ] && [ "${2:-}" = "imagetools" ] && [ "${3:-}" = "inspe
   DIGEST="$(printf '%s' "$LINE" | awk '{print $2}')"
   VERSION_LABEL="$(printf '%s' "$LINE" | awk '{print $3}')"
   SHA_LABEL="$(printf '%s' "$LINE" | awk '{print $4}')"
+  IMAGE_FILE="$(printf '%s' "$LINE" | awk '{print $5}')"
   FORMAT="${6:-}"
   if [ "$FORMAT" = '{{json .Manifest}}' ]; then
     printf '{"digest":"%s"}\n' "$DIGEST"
+  elif [ -n "$IMAGE_FILE" ] && [ "$IMAGE_FILE" != "-" ] && [ -f "$IMAGE_FILE" ]; then
+    # A multi-platform (or otherwise custom-shaped) `.Image` fixture,
+    # returned verbatim instead of the single-platform template below.
+    cat "$IMAGE_FILE"
   else
     printf '{"config":{"Labels":{"org.opencontainers.image.version":"%s","dev.ferritelabs.image.source-sha256":"%s"}}}\n' \
       "$VERSION_LABEL" "$SHA_LABEL"
@@ -274,10 +282,14 @@ GHCR_IMAGE="ghcr.io/ferritelabs/ferrite"
 DOCKERHUB_IMAGE="ferritelabs/ferrite"
 
 manifest_set() {
-  local full_ref="$1" digest="$2" version="$3" sha="$4"
+  # image_file is optional: when set to a path (not "-"), the fake docker
+  # returns that file's content verbatim for `.Image` instead of building a
+  # single-platform object from version/sha -- used to simulate a
+  # multi-platform (amd64+arm64) manifest.
+  local full_ref="$1" digest="$2" version="$3" sha="$4" image_file="${5:--}"
   awk -v r="$full_ref" '$1!=r' "$REGISTRY_MANIFEST" > "${REGISTRY_MANIFEST}.tmp" 2>/dev/null || true
   mv "${REGISTRY_MANIFEST}.tmp" "$REGISTRY_MANIFEST"
-  printf '%s %s %s %s\n' "$full_ref" "$digest" "$version" "$sha" >> "$REGISTRY_MANIFEST"
+  printf '%s %s %s %s %s\n' "$full_ref" "$digest" "$version" "$sha" "$image_file" >> "$REGISTRY_MANIFEST"
 }
 
 manifest_digest_of() {
@@ -301,6 +313,7 @@ run_check_existing() {
     export SHA256="$sha256"
     export CERTIFICATE_IDENTITY_REGEXP='^https://github\.com/ferritelabs/'
     export GITHUB_OUTPUT="$out"
+    export LABELS_SCRIPT="${REPO_ROOT}/scripts/verify-exact-image-labels.sh"
     bash "$CHECK_SCRIPT"
   ) >"${out}.log" 2>&1
 }
@@ -356,6 +369,62 @@ if run_check_existing "0.5.3" "$ONES" "${TMP}/unsigned.out"; then
 else
   assert_contains "$(cat "${TMP}/unsigned.out.log")" "could not be verified" \
     "check_existing fails when an existing, metadata-matching exact tag cannot be verified"
+fi
+
+# --- check_existing: MULTI-PLATFORM (amd64+arm64) exact-tag idempotency ---
+# These prove the real workflow step -- via the shared
+# verify-exact-image-labels.sh helper it now delegates to -- inspects EVERY
+# platform of a multi-arch manifest, not just the first, closing the exact
+# gap this task set out to fix (release.yml previously read only `.[0]`).
+MULTI_MATCH_IMAGE="${TMP}/multi-match-image.json"
+cat >"$MULTI_MATCH_IMAGE" <<JSON
+{
+  "linux/amd64": {"config": {"Labels": {"org.opencontainers.image.version": "0.5.4", "dev.ferritelabs.image.source-sha256": "${ONES}"}}},
+  "linux/arm64": {"config": {"Labels": {"org.opencontainers.image.version": "0.5.4", "dev.ferritelabs.image.source-sha256": "${ONES}"}}}
+}
+JSON
+manifest_set "${GHCR_IMAGE}:0.5.4" "sha256:${ZERO}" "0.5.4" "$ONES" "$MULTI_MATCH_IMAGE"
+sign_digest "sha256:${ZERO}"
+if run_check_existing "0.5.4" "$ONES" "${TMP}/multi_match.out"; then
+  assert_contains "$(cat "${TMP}/multi_match.out")" "idempotent=true" \
+    "check_existing reports idempotent=true when EVERY platform (amd64+arm64) of a multi-platform exact tag matches exactly and is signed"
+else
+  harness_fail "check_existing unexpectedly failed for a consistent multi-platform exact tag: $(cat "${TMP}/multi_match.out.log")"
+fi
+
+# One platform (arm64) disagrees on the source-checksum label: must fail,
+# not silently pass on the strength of the first (amd64) platform alone.
+MULTI_MISMATCH_IMAGE="${TMP}/multi-mismatch-image.json"
+cat >"$MULTI_MISMATCH_IMAGE" <<JSON
+{
+  "linux/amd64": {"config": {"Labels": {"org.opencontainers.image.version": "0.5.5", "dev.ferritelabs.image.source-sha256": "${ONES}"}}},
+  "linux/arm64": {"config": {"Labels": {"org.opencontainers.image.version": "0.5.5", "dev.ferritelabs.image.source-sha256": "${ZERO}"}}}
+}
+JSON
+manifest_set "${GHCR_IMAGE}:0.5.5" "sha256:${ZERO}" "0.5.5" "$ONES" "$MULTI_MISMATCH_IMAGE"
+sign_digest "sha256:${ZERO}"
+if run_check_existing "0.5.5" "$ONES" "${TMP}/multi_mismatch.out"; then
+  harness_fail "check_existing unexpectedly accepted a multi-platform exact tag whose arm64 platform disagreed on the source-checksum label"
+else
+  assert_contains "$(cat "${TMP}/multi_mismatch.out.log")" "at least one platform's baked metadata does not match this release exactly" \
+    "check_existing fails when one platform (arm64) of a multi-platform exact tag has a mismatched source-checksum label"
+fi
+
+# One platform (arm64) is missing its labels entirely: must fail.
+MULTI_MISSING_LABELS_IMAGE="${TMP}/multi-missing-labels-image.json"
+cat >"$MULTI_MISSING_LABELS_IMAGE" <<JSON
+{
+  "linux/amd64": {"config": {"Labels": {"org.opencontainers.image.version": "0.5.6", "dev.ferritelabs.image.source-sha256": "${ONES}"}}},
+  "linux/arm64": {"config": {"Labels": {}}}
+}
+JSON
+manifest_set "${GHCR_IMAGE}:0.5.6" "sha256:${ZERO}" "0.5.6" "$ONES" "$MULTI_MISSING_LABELS_IMAGE"
+sign_digest "sha256:${ZERO}"
+if run_check_existing "0.5.6" "$ONES" "${TMP}/multi_missing_labels.out"; then
+  harness_fail "check_existing unexpectedly accepted a multi-platform exact tag whose arm64 platform has no labels at all"
+else
+  assert_contains "$(cat "${TMP}/multi_missing_labels.out.log")" "at least one platform's baked metadata does not match this release exactly" \
+    "check_existing fails when one platform (arm64) of a multi-platform exact tag is missing its labels entirely"
 fi
 
 # === promote-exact ===========================================================

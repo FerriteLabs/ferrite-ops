@@ -12,6 +12,7 @@ RELEASE_YML="${REPO_ROOT}/.github/workflows/release.yml"
 RECONCILE_YML="${REPO_ROOT}/.github/workflows/reconcile-release-tags.yml"
 HELPER="${REPO_ROOT}/scripts/reconcile-release-tags.py"
 ORDER="${REPO_ROOT}/scripts/release-ordering.sh"
+LABELS="${REPO_ROOT}/scripts/verify-exact-image-labels.sh"
 FIXTURE="${HERE}/fixtures/release-reconciliation/ghcr-pages.json"
 RELEASE_CONTENT="$(cat "$RELEASE_YML")"
 RECONCILE_CONTENT="$(cat "$RECONCILE_YML")"
@@ -51,12 +52,17 @@ assert_contains "$RECONCILE_CONTENT" "per_page=100" \
   "GHCR enumeration requests the maximum page size"
 assert_contains "$RECONCILE_CONTENT" "cosign verify" \
   "every exact source digest is signature-verified"
-assert_contains "$RECONCILE_CONTENT" "org.opencontainers.image.version" \
-  "exact source version metadata is verified"
-assert_contains "$RECONCILE_CONTENT" "dev.ferritelabs.image.source-sha256" \
-  "exact source checksum metadata is verified"
-assert_contains "$RECONCILE_CONTENT" "unique | length" \
-  "multi-platform exact sources require one consistent source checksum"
+assert_contains "$RECONCILE_CONTENT" "LABELS_SCRIPT: scripts/verify-exact-image-labels.sh" \
+  "reconcile-release-tags.yml wires in the shared exact-tag label verification helper"
+assert_contains "$RECONCILE_CONTENT" 'bash "$LABELS_SCRIPT" consistent "$VERSION"' \
+  "reconcile-release-tags.yml verifies each exact source's labels via the shared helper in 'consistent' mode"
+LABELS_SCRIPT_CONTENT="$(cat "${REPO_ROOT}/scripts/verify-exact-image-labels.sh")"
+assert_contains "$LABELS_SCRIPT_CONTENT" "org.opencontainers.image.version" \
+  "the shared label-verification helper checks exact source version metadata"
+assert_contains "$LABELS_SCRIPT_CONTENT" "dev.ferritelabs.image.source-sha256" \
+  "the shared label-verification helper checks exact source checksum metadata"
+assert_contains "$LABELS_SCRIPT_CONTENT" "unique | length" \
+  "the shared label-verification helper requires multi-platform exact sources to share one consistent source checksum"
 assert_contains "$RECONCILE_CONTENT" "SOURCE_DIGEST" \
   "exact sources are re-read before applying the plan"
 assert_eq "3" "$(grep -c 'cosign verify \\' "$RECONCILE_YML")" \
@@ -308,8 +314,13 @@ if [ "${1:-}" = "buildx" ] && [ "${2:-}" = "imagetools" ] && [ "${3:-}" = "inspe
   DIGEST="$(printf '%s\n' "$LINE" | awk '{print $2}')"
   VERSION="$(printf '%s\n' "$LINE" | awk '{print $3}')"
   SOURCE_SHA="$(printf '%s\n' "$LINE" | awk '{print $4}')"
+  IMAGE_FILE="$(printf '%s\n' "$LINE" | awk '{print $5}')"
   if [ "${6:-}" = '{{json .Manifest}}' ]; then
     printf '{"digest":"%s"}\n' "$DIGEST"
+  elif [ -n "$IMAGE_FILE" ] && [ "$IMAGE_FILE" != "-" ] && [ -f "$IMAGE_FILE" ]; then
+    # A multi-platform (or otherwise custom-shaped) `.Image` fixture,
+    # returned verbatim instead of the single-platform template below.
+    cat "$IMAGE_FILE"
   else
     printf '{"config":{"Labels":{"org.opencontainers.image.version":"%s","dev.ferritelabs.image.source-sha256":"%s"}}}\n' \
       "$VERSION" "$SOURCE_SHA"
@@ -397,10 +408,14 @@ DOCKERHUB_IMAGE="ferritelabs/ferrite"
 SOURCE_SHA="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 
 state_set() {
-  local ref="$1" digest="$2" version="${3:-state}" source_sha="${4:-state}"
+  # image_file is optional: when set to a path (not "-"), the fake docker
+  # returns that file's content verbatim for `.Image` instead of building a
+  # single-platform object from version/source_sha -- used to simulate a
+  # multi-platform (amd64+arm64) manifest.
+  local ref="$1" digest="$2" version="${3:-state}" source_sha="${4:-state}" image_file="${5:--}"
   awk -v ref="$ref" '$1 != ref' "$REGISTRY_STATE" >"${REGISTRY_STATE}.tmp" || true
   mv "${REGISTRY_STATE}.tmp" "$REGISTRY_STATE"
-  printf '%s %s %s %s\n' "$ref" "$digest" "$version" "$source_sha" >>"$REGISTRY_STATE"
+  printf '%s %s %s %s %s\n' "$ref" "$digest" "$version" "$source_sha" "$image_file" >>"$REGISTRY_STATE"
 }
 
 state_digest() {
@@ -433,7 +448,7 @@ if (
   export PATH="${FAKE_BIN}:${PATH}"
   export REGISTRY_STATE SIGNED_DIGESTS
   export GHCR_IMAGE REPOSITORY="ferritelabs/ferrite-ops" DEFAULT_BRANCH="main"
-  export HELPER ORDER_SCRIPT="$ORDER"
+  export HELPER ORDER_SCRIPT="$ORDER" LABELS_SCRIPT="$LABELS"
   bash "$VERIFY_SCRIPT"
 ) >"${TMP}/verify.log" 2>&1; then
   harness_ok "all discovered exact sources pass digest, metadata, and signature verification"
@@ -453,7 +468,7 @@ if (
   export PATH="${FAKE_BIN}:${PATH}"
   export REGISTRY_STATE SIGNED_DIGESTS
   export GHCR_IMAGE REPOSITORY="ferritelabs/ferrite-ops" DEFAULT_BRANCH="main"
-  export HELPER ORDER_SCRIPT="$ORDER"
+  export HELPER ORDER_SCRIPT="$ORDER" LABELS_SCRIPT="$LABELS"
   bash "$VERIFY_SCRIPT"
 ) >"${TMP}/unsigned.log" 2>&1; then
   harness_fail "verification accepted an unsigned exact stable source"
@@ -473,13 +488,69 @@ if (
   export PATH="${FAKE_BIN}:${PATH}"
   export REGISTRY_STATE SIGNED_DIGESTS
   export GHCR_IMAGE REPOSITORY="ferritelabs/ferrite-ops" DEFAULT_BRANCH="main"
-  export HELPER ORDER_SCRIPT="$ORDER"
+  export HELPER ORDER_SCRIPT="$ORDER" LABELS_SCRIPT="$LABELS"
   bash "$VERIFY_SCRIPT"
 ) >"${TMP}/metadata-mismatch.log" 2>&1; then
   harness_fail "verification accepted an exact tag with mismatched version metadata"
 else
   harness_ok "verification fails closed on mismatched exact-tag metadata"
 fi
+state_set "${GHCR_IMAGE}:2.0.1" \
+  "sha256:6666666666666666666666666666666666666666666666666666666666666666" \
+  "2.0.1" "$SOURCE_SHA"
+
+# --- Multi-platform (amd64+arm64) exact-source label verification ---------
+# Proves the real workflow step -- via the shared verify-exact-image-labels.sh
+# helper it now delegates to in "consistent" mode -- inspects EVERY platform
+# of a multi-arch manifest, not just the first.
+MULTI_MATCH_IMAGE="${TMP}/multi-match-source.json"
+cat >"$MULTI_MATCH_IMAGE" <<JSON
+{
+  "linux/amd64": {"config": {"Labels": {"org.opencontainers.image.version": "2.0.1", "dev.ferritelabs.image.source-sha256": "${SOURCE_SHA}"}}},
+  "linux/arm64": {"config": {"Labels": {"org.opencontainers.image.version": "2.0.1", "dev.ferritelabs.image.source-sha256": "${SOURCE_SHA}"}}}
+}
+JSON
+state_set "${GHCR_IMAGE}:2.0.1" \
+  "sha256:6666666666666666666666666666666666666666666666666666666666666666" \
+  "2.0.1" "$SOURCE_SHA" "$MULTI_MATCH_IMAGE"
+if (
+  cd "$TMP" || exit 1
+  export PATH="${FAKE_BIN}:${PATH}"
+  export REGISTRY_STATE SIGNED_DIGESTS
+  export GHCR_IMAGE REPOSITORY="ferritelabs/ferrite-ops" DEFAULT_BRANCH="main"
+  export HELPER ORDER_SCRIPT="$ORDER" LABELS_SCRIPT="$LABELS"
+  bash "$VERIFY_SCRIPT"
+) >"${TMP}/multi-match.log" 2>&1; then
+  harness_ok "verification passes when every platform (amd64+arm64) of a multi-platform exact source reports matching version and source-checksum labels"
+else
+  harness_fail "verification incorrectly rejected a consistent multi-platform exact source: $(cat "${TMP}/multi-match.log")"
+fi
+
+# One platform (arm64) disagrees on the source-checksum label: must fail.
+MULTI_MISMATCH_IMAGE="${TMP}/multi-mismatch-source.json"
+cat >"$MULTI_MISMATCH_IMAGE" <<JSON
+{
+  "linux/amd64": {"config": {"Labels": {"org.opencontainers.image.version": "2.0.1", "dev.ferritelabs.image.source-sha256": "${SOURCE_SHA}"}}},
+  "linux/arm64": {"config": {"Labels": {"org.opencontainers.image.version": "2.0.1", "dev.ferritelabs.image.source-sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}}}
+}
+JSON
+state_set "${GHCR_IMAGE}:2.0.1" \
+  "sha256:6666666666666666666666666666666666666666666666666666666666666666" \
+  "2.0.1" "$SOURCE_SHA" "$MULTI_MISMATCH_IMAGE"
+if (
+  cd "$TMP" || exit 1
+  export PATH="${FAKE_BIN}:${PATH}"
+  export REGISTRY_STATE SIGNED_DIGESTS
+  export GHCR_IMAGE REPOSITORY="ferritelabs/ferrite-ops" DEFAULT_BRANCH="main"
+  export HELPER ORDER_SCRIPT="$ORDER" LABELS_SCRIPT="$LABELS"
+  bash "$VERIFY_SCRIPT"
+) >"${TMP}/multi-mismatch.log" 2>&1; then
+  harness_fail "verification incorrectly accepted a multi-platform exact source with a mismatched arm64 source-checksum label"
+else
+  harness_ok "verification fails closed when one platform (arm64) of a multi-platform exact source has a mismatched source-checksum label"
+fi
+
+# Restore known-good single-object state for 2.0.1 before continuing.
 state_set "${GHCR_IMAGE}:2.0.1" \
   "sha256:6666666666666666666666666666666666666666666666666666666666666666" \
   "2.0.1" "$SOURCE_SHA"
@@ -492,7 +563,7 @@ if (
   export PATH="${FAKE_BIN}:${PATH}"
   export REGISTRY_STATE SIGNED_DIGESTS
   export GHCR_IMAGE REPOSITORY="ferritelabs/ferrite-ops" DEFAULT_BRANCH="main"
-  export HELPER ORDER_SCRIPT="$ORDER"
+  export HELPER ORDER_SCRIPT="$ORDER" LABELS_SCRIPT="$LABELS"
   bash "$VERIFY_SCRIPT"
 ) >"${TMP}/digest-mismatch.log" 2>&1; then
   harness_fail "verification accepted GHCR API and registry digest disagreement"
