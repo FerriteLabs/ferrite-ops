@@ -21,11 +21,12 @@ REPO_ROOT="$(cd "${HERE}/.." && pwd)"
 source "${HERE}/lib/harness.sh"
 
 RELEASE_YML="${REPO_ROOT}/.github/workflows/release.yml"
+RECONCILE_YML="${REPO_ROOT}/.github/workflows/reconcile-release-tags.yml"
 VERSION_SYNC_YML="${REPO_ROOT}/.github/workflows/version-sync.yml"
 ORCHESTRATION_YML="${REPO_ROOT}/.github/workflows/release-orchestration.yml"
 ACTIVE_RELEASE="${REPO_ROOT}/active-release.env"
 
-for f in "$RELEASE_YML" "$VERSION_SYNC_YML" "$ORCHESTRATION_YML" "$ACTIVE_RELEASE"; do
+for f in "$RELEASE_YML" "$RECONCILE_YML" "$VERSION_SYNC_YML" "$ORCHESTRATION_YML" "$ACTIVE_RELEASE"; do
   if [[ ! -f "$f" ]]; then
     echo "  FAIL: ${f} not found" >&2
     exit 1
@@ -45,6 +46,7 @@ EXPECTED_RUN_ID="424242"
 EXPECTED_RUN_ATTEMPT="1"
 EXPECTED_CANDIDATE_TAG="candidate-${EXPECTED_RUN_ID}-${EXPECTED_RUN_ATTEMPT}"
 RELEASE_CONTENT="$(cat "$RELEASE_YML")"
+RECONCILE_CONTENT="$(cat "$RECONCILE_YML")"
 VERSION_SYNC_CONTENT="$(cat "$VERSION_SYNC_YML")"
 ORCHESTRATION_CONTENT="$(cat "$ORCHESTRATION_YML")"
 
@@ -80,8 +82,8 @@ assert_not_contains "$RELEASE_CONTENT" 'type=raw,value=${{ needs.prepare.outputs
 
 # --- Candidate OCI metadata: real normalized SemVer, not the run-specific
 # candidate tag string (see tests/test_exact_image_immutability.sh and
-# tests/test_release_promotion.sh for the functional idempotent/backport
-# consequences of this exact label). ---
+# tests/test_release_reconciliation.sh for the complete-state consequences of
+# this exact label). ---
 assert_contains "$RELEASE_CONTENT" 'labels: |
             org.opencontainers.image.version=${{ needs.prepare.outputs.version }}' \
   "release.yml's GHCR candidate metadata step explicitly overrides org.opencontainers.image.version to the real normalized SemVer"
@@ -105,20 +107,28 @@ assert_not_contains "$RELEASE_CONTENT" 'CERTIFICATE_IDENTITY_REGEXP: ^https://gi
 assert_eq "3" "$(grep -c 'certificate-identity-regexp="\$CERTIFICATE_IDENTITY_REGEXP"' "$RELEASE_YML")" \
   "all three cosign verify/verify-attestation invocations consume the single shared identity regexp"
 
-assert_contains "$RELEASE_CONTENT" "promote-stable:" \
-  "release.yml defines a dedicated floating-tag promotion job"
-assert_contains "$RELEASE_CONTENT" "if: needs.release-transaction.outputs.stable == 'true'" \
-  "release.yml promotes floating tags only for stable releases; prereleases stay exact-only"
-assert_contains "$RELEASE_CONTENT" "group: ferrite-floating-tag-promotion" \
-  "release.yml serializes floating-tag promotion so concurrent releases cannot race"
-assert_contains "$RELEASE_CONTENT" "cancel-in-progress: false" \
-  "release.yml queues rather than cancels serialized promotions"
-assert_contains "$RELEASE_CONTENT" "docker buildx imagetools create" \
-  "release.yml promotes floating tags by adding them to the signed digest (imagetools/cosign compatible)"
-assert_contains "$RELEASE_CONTENT" "scripts/release-ordering.sh" \
-  "release.yml gates floating-tag promotion on the shared SemVer ordering guard"
-assert_contains "$RELEASE_CONTENT" "Resolve current per-tag promoted versions" \
-  "release.yml independently reads each floating tag's current promoted version from registry metadata, not workflow input"
+assert_not_contains "$RELEASE_CONTENT" "promote-stable:" \
+  "release.yml no longer performs event-specific floating-tag promotion"
+assert_contains "$RECONCILE_CONTENT" "workflows: [Release]" \
+  "successful exact release completion triggers complete-state reconciliation"
+assert_contains "$RECONCILE_CONTENT" 'ref: ${{ github.event.repository.default_branch }}' \
+  "registry reconciliation executes reviewed default-branch code"
+assert_contains "$RECONCILE_CONTENT" "group: ferrite-release-tag-reconciliation" \
+  "floating-tag reconciliation is globally serialized"
+assert_contains "$RECONCILE_CONTENT" "cancel-in-progress: false" \
+  "the active complete-state reconciliation is never cancelled"
+assert_contains "$RECONCILE_CONTENT" "gh api --paginate --slurp" \
+  "reconciliation enumerates every GHCR package-version page"
+assert_contains "$RECONCILE_CONTENT" "scripts/reconcile-release-tags.py" \
+  "reconciliation uses the pure desired-state helper"
+assert_contains "$RECONCILE_CONTENT" "scripts/release-ordering.sh" \
+  "the desired-state helper consumes the shared strict SemVer comparator"
+assert_contains "$RECONCILE_CONTENT" "cosign verify" \
+  "reconciliation verifies exact source signatures before planning"
+assert_contains "$RECONCILE_CONTENT" "docker buildx imagetools create" \
+  "GHCR floating tags are moved to selected signed digests without rebuilding"
+assert_contains "$RECONCILE_CONTENT" "crane copy" \
+  "optional Docker Hub floating tags are copied cross-registry from GHCR"
 assert_not_contains "$RELEASE_CONTENT" 'type=raw,value=${{ inputs.tag }}' \
   "workflow_dispatch does not publish an unnormalized raw v-prefixed tag"
 assert_contains "$RELEASE_CONTENT" "latest=false" \
@@ -237,7 +247,7 @@ assert_not_contains "$ORCHESTRATION_CONTENT" \
 # release workflows. Untrusted values enter scripts only through step env.
 if command -v python3 >/dev/null 2>&1 &&
   python3 -c "import yaml" >/dev/null 2>&1 &&
-  python3 - "$RELEASE_YML" "$VERSION_SYNC_YML" "$ORCHESTRATION_YML" <<'PYEOF'
+  python3 - "$RELEASE_YML" "$RECONCILE_YML" "$VERSION_SYNC_YML" "$ORCHESTRATION_YML" <<'PYEOF'
 import sys
 import yaml
 
@@ -1110,7 +1120,7 @@ else
 fi
 
 if command -v actionlint >/dev/null 2>&1; then
-  if actionlint "$RELEASE_YML" "$VERSION_SYNC_YML" "$ORCHESTRATION_YML"; then
+  if actionlint "$RELEASE_YML" "$RECONCILE_YML" "$VERSION_SYNC_YML" "$ORCHESTRATION_YML"; then
     harness_ok "actionlint accepts hardened release workflows"
   else
     harness_fail "actionlint rejected hardened release workflows"

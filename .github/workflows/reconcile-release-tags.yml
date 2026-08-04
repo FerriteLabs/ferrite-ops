@@ -1,0 +1,296 @@
+name: Reconcile Release Tags
+
+on:
+  workflow_run:
+    workflows: [Release]
+    types: [completed]
+  workflow_dispatch:
+  schedule:
+    # Weekly repair is intentionally conservative; every successful exact
+    # release also triggers reconciliation immediately.
+    - cron: '17 4 * * 0'
+
+# One global lock protects the complete enumerate/verify/plan/apply cycle.
+# GitHub may replace an older pending run with a newer pending event, which
+# is safe because every run derives the complete desired state from all
+# immutable exact tags instead of depending on an individual release event.
+concurrency:
+  group: ferrite-release-tag-reconciliation
+  cancel-in-progress: false
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository_owner }}/ferrite
+  DOCKERHUB_IMAGE: ferritelabs/ferrite
+
+jobs:
+  reconcile:
+    name: Reconcile Stable Floating Tags
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # workflow_dispatch may be invoked while viewing another ref; the
+          # registry-writing job always executes the reviewed default-branch
+          # helper/workflow implementation.
+          ref: ${{ github.event.repository.default_branch }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Determine Docker Hub reconciliation eligibility
+        id: dockerhub
+        env:
+          DOCKERHUB_ENABLED: ${{ vars.DOCKERHUB_ENABLED }}
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          ENABLED=false
+          if [ "$DOCKERHUB_ENABLED" = "true" ]; then
+            if [ -n "$DOCKERHUB_USERNAME" ] && [ -n "$DOCKERHUB_TOKEN" ]; then
+              ENABLED=true
+            else
+              echo "::warning::DOCKERHUB_ENABLED is true, but Docker Hub credentials are incomplete; reconciling GHCR only."
+            fi
+          fi
+          echo "enabled=${ENABLED}" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to Docker Hub
+        if: steps.dockerhub.outputs.enabled == 'true'
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Set up crane
+        if: steps.dockerhub.outputs.enabled == 'true'
+        uses: imjasonh/setup-crane@v0.7
+        with:
+          version: v0.21.8
+
+      - name: Enumerate paginated GHCR package versions
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          OWNER: ${{ github.repository_owner }}
+          PACKAGE: ferrite
+          HELPER: scripts/reconcile-release-tags.py
+          ORDER_SCRIPT: scripts/release-ordering.sh
+        run: |
+          set -euo pipefail
+
+          # --paginate follows every Link: rel="next" response; --slurp
+          # preserves the page boundaries in one valid JSON array.
+          gh api --paginate --slurp \
+            "/orgs/${OWNER}/packages/container/${PACKAGE}/versions?per_page=100" \
+            > ghcr-version-pages.json
+
+          python3 "$HELPER" \
+            --ordering-script "$ORDER_SCRIPT" \
+            discover \
+            --input ghcr-version-pages.json \
+            > exact-tag-candidates.json
+
+          COUNT="$(jq 'length' exact-tag-candidates.json)"
+          echo "::notice::Discovered ${COUNT} exact stable SemVer GHCR tag(s) across all pages."
+
+      - name: Verify every exact stable GHCR source
+        env:
+          GHCR_IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          REPOSITORY: ${{ github.repository }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          HELPER: scripts/reconcile-release-tags.py
+          ORDER_SCRIPT: scripts/release-ordering.sh
+        run: |
+          set -euo pipefail
+
+          : > verified-exact-tags.jsonl
+          while IFS=$'\t' read -r VERSION API_DIGEST; do
+            [ -n "$VERSION" ] || continue
+
+            MANIFEST_JSON="$(docker buildx imagetools inspect \
+              "${GHCR_IMAGE}:${VERSION}" --format '{{json .Manifest}}')"
+            RESOLVED_DIGEST="$(printf '%s' "$MANIFEST_JSON" | jq -r '.digest // empty')"
+            if [ "$RESOLVED_DIGEST" != "$API_DIGEST" ]; then
+              echo "::error::Exact tag ${VERSION} resolved to ${RESOLVED_DIGEST:-<none>}, not GHCR API digest ${API_DIGEST}."
+              exit 1
+            fi
+
+            RAW_IMAGE="$(docker buildx imagetools inspect \
+              "${GHCR_IMAGE}:${VERSION}" --format '{{json .Image}}')"
+            if ! printf '%s' "$RAW_IMAGE" | jq -e --arg version "$VERSION" '
+              def images:
+                if type == "object" and has("config") then [.]
+                elif type == "object" then [.[]]
+                else [] end;
+              images as $images |
+              ($images | length) > 0 and
+              all($images[];
+                (.config.Labels["org.opencontainers.image.version"] // "") == $version
+              ) and
+              all($images[];
+                (.config.Labels["dev.ferritelabs.image.source-sha256"] // "")
+                | test("^[0-9a-f]{64}$")
+              ) and
+              ([
+                $images[]
+                | .config.Labels["dev.ferritelabs.image.source-sha256"]
+              ] | unique | length) == 1
+            ' >/dev/null; then
+              echo "::error::Exact tag ${VERSION} has missing, inconsistent, or invalid version/source metadata."
+              exit 1
+            fi
+
+            CERTIFICATE_IDENTITY_REGEXP="$(python3 "$HELPER" \
+              --ordering-script "$ORDER_SCRIPT" \
+              identity \
+              --repository "$REPOSITORY" \
+              --version "$VERSION" \
+              --default-branch "$DEFAULT_BRANCH")"
+            cosign verify \
+              --certificate-oidc-issuer=https://token.actions.githubusercontent.com \
+              --certificate-identity-regexp="$CERTIFICATE_IDENTITY_REGEXP" \
+              "${GHCR_IMAGE}@${RESOLVED_DIGEST}" >/dev/null
+
+            jq -cn \
+              --arg version "$VERSION" \
+              --arg digest "$RESOLVED_DIGEST" \
+              '{version: $version, digest: $digest}' \
+              >> verified-exact-tags.jsonl
+          done < <(jq -r '.[] | [.version, .digest] | @tsv' exact-tag-candidates.json)
+
+          jq -s '.' verified-exact-tags.jsonl > verified-exact-tags.json
+          VERIFIED_COUNT="$(jq 'length' verified-exact-tags.json)"
+          echo "::notice::Verified ${VERIFIED_COUNT} signed exact stable source tag(s)."
+
+      - name: Compute complete desired floating-tag state
+        env:
+          HELPER: scripts/reconcile-release-tags.py
+          ORDER_SCRIPT: scripts/release-ordering.sh
+        run: |
+          set -euo pipefail
+
+          python3 "$HELPER" \
+            --ordering-script "$ORDER_SCRIPT" \
+            plan \
+            --input verified-exact-tags.json \
+            > floating-tag-plan.json
+
+          jq -r '.[] | "\(.tag) -> \(.version) @ \(.digest)"' \
+            floating-tag-plan.json
+
+      - name: Apply and verify GHCR floating tags
+        env:
+          GHCR_IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          REPOSITORY: ${{ github.repository }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          HELPER: scripts/reconcile-release-tags.py
+          ORDER_SCRIPT: scripts/release-ordering.sh
+        run: |
+          set -euo pipefail
+
+          while IFS=$'\t' read -r TAG VERSION DIGEST; do
+            [ -n "$TAG" ] || continue
+
+            # Re-read the immutable exact source immediately before mutation.
+            SOURCE_DIGEST="$(docker buildx imagetools inspect \
+              "${GHCR_IMAGE}:${VERSION}" \
+              --format '{{json .Manifest}}' | jq -r '.digest // empty')"
+            if [ "$SOURCE_DIGEST" != "$DIGEST" ]; then
+              echo "::error::Exact source ${VERSION} changed during reconciliation (${SOURCE_DIGEST:-<none>} != ${DIGEST}); refusing to apply a stale plan."
+              exit 1
+            fi
+
+            CERTIFICATE_IDENTITY_REGEXP="$(python3 "$HELPER" \
+              --ordering-script "$ORDER_SCRIPT" \
+              identity \
+              --repository "$REPOSITORY" \
+              --version "$VERSION" \
+              --default-branch "$DEFAULT_BRANCH")"
+            cosign verify \
+              --certificate-oidc-issuer=https://token.actions.githubusercontent.com \
+              --certificate-identity-regexp="$CERTIFICATE_IDENTITY_REGEXP" \
+              "${GHCR_IMAGE}@${DIGEST}" >/dev/null
+
+            CURRENT_DIGEST="$(docker buildx imagetools inspect \
+              "${GHCR_IMAGE}:${TAG}" \
+              --format '{{json .Manifest}}' 2>/dev/null |
+              jq -r '.digest // empty' || true)"
+            if [ "$CURRENT_DIGEST" != "$DIGEST" ]; then
+              echo "::notice::Reconciling ${GHCR_IMAGE}:${TAG} -> ${VERSION} (${DIGEST})."
+              docker buildx imagetools create \
+                --tag "${GHCR_IMAGE}:${TAG}" \
+                "${GHCR_IMAGE}@${DIGEST}"
+            fi
+
+            DESTINATION_DIGEST="$(docker buildx imagetools inspect \
+              "${GHCR_IMAGE}:${TAG}" \
+              --format '{{json .Manifest}}' | jq -r '.digest // empty')"
+            if [ "$DESTINATION_DIGEST" != "$DIGEST" ]; then
+              echo "::error::GHCR destination ${TAG} resolved to ${DESTINATION_DIGEST:-<none>}, expected ${DIGEST}."
+              exit 1
+            fi
+          done < <(jq -r '.[] | [.tag, .version, .digest] | @tsv' floating-tag-plan.json)
+
+      - name: Copy and verify Docker Hub floating tags
+        if: steps.dockerhub.outputs.enabled == 'true'
+        env:
+          GHCR_IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          DOCKERHUB_IMAGE: ${{ env.DOCKERHUB_IMAGE }}
+          REPOSITORY: ${{ github.repository }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          HELPER: scripts/reconcile-release-tags.py
+          ORDER_SCRIPT: scripts/release-ordering.sh
+        run: |
+          set -euo pipefail
+
+          while IFS=$'\t' read -r TAG VERSION DIGEST; do
+            [ -n "$TAG" ] || continue
+
+            SOURCE_DIGEST="$(docker buildx imagetools inspect \
+              "${GHCR_IMAGE}:${VERSION}" \
+              --format '{{json .Manifest}}' | jq -r '.digest // empty')"
+            if [ "$SOURCE_DIGEST" != "$DIGEST" ]; then
+              echo "::error::Exact source ${VERSION} changed before Docker Hub reconciliation (${SOURCE_DIGEST:-<none>} != ${DIGEST}); refusing to apply a stale plan."
+              exit 1
+            fi
+
+            CERTIFICATE_IDENTITY_REGEXP="$(python3 "$HELPER" \
+              --ordering-script "$ORDER_SCRIPT" \
+              identity \
+              --repository "$REPOSITORY" \
+              --version "$VERSION" \
+              --default-branch "$DEFAULT_BRANCH")"
+            cosign verify \
+              --certificate-oidc-issuer=https://token.actions.githubusercontent.com \
+              --certificate-identity-regexp="$CERTIFICATE_IDENTITY_REGEXP" \
+              "${GHCR_IMAGE}@${DIGEST}" >/dev/null
+
+            echo "::notice::Copying ${VERSION} (${DIGEST}) from GHCR to Docker Hub tag ${TAG}."
+            crane copy \
+              "${GHCR_IMAGE}@${DIGEST}" \
+              "${DOCKERHUB_IMAGE}:${TAG}"
+
+            DESTINATION_DIGEST="$(crane digest "${DOCKERHUB_IMAGE}:${TAG}")"
+            if [ "$DESTINATION_DIGEST" != "$DIGEST" ]; then
+              echo "::error::Docker Hub destination ${TAG} resolved to ${DESTINATION_DIGEST:-<none>}, expected ${DIGEST}."
+              exit 1
+            fi
+          done < <(jq -r '.[] | [.tag, .version, .digest] | @tsv' floating-tag-plan.json)
+
+          echo "::notice::Docker Hub floating tags match the verified GHCR desired state."
