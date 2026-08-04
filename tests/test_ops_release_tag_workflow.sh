@@ -32,8 +32,14 @@ assert_not_contains "$CONTENT" "packages:" \
   "ops tag workflow does not request package permissions"
 assert_contains "$CONTENT" "git tag -a" \
   "ops tag workflow creates an annotated tag"
-assert_contains "$CONTENT" 'git push origin "refs/tags/${OPS_TAG}"' \
-  "ops tag workflow pushes only the immutable tag ref"
+assert_contains "$CONTENT" 'git push --atomic \' \
+  "ops tag workflow pushes atomically"
+assert_contains "$CONTENT" '--force-with-lease="refs/heads/main:${MERGED_SHA}"' \
+  "ops tag workflow's push carries a compare-and-swap lease on refs/heads/main"
+assert_contains "$CONTENT" '"${MERGED_SHA}:refs/heads/main"' \
+  "ops tag workflow's atomic push includes a same-commit main ref update to carry the lease check"
+assert_contains "$CONTENT" '"refs/tags/${OPS_TAG}"' \
+  "ops tag workflow's atomic push includes the immutable tag ref"
 assert_contains "$CONTENT" "git ls-remote --exit-code --tags origin" \
   "ops tag workflow refuses an existing remote tag"
 assert_not_contains "$CONTENT" "git tag -f" \
@@ -241,6 +247,49 @@ if (
     "functional replay pushes the tag at the merged commit"
 else
   harness_fail "immutable ops tag creation unexpectedly failed"
+fi
+
+
+# --- Atomic push: main advances AFTER validation, but BEFORE the push ------
+# Simulates the exact race item 5 hardens against: this run's earlier
+# validation steps (main-tip check, canonical release validation) both
+# passed against MERGED_SHA, but a second, independent push lands on origin
+# main strictly between that validation and this run's own tag-creation
+# step actually executing its push. The lease-guarded atomic push below must
+# reject the push (and therefore never create the tag) even though nothing
+# in THIS run's own local state changed — the earlier, separate main-tip
+# pre-check cannot observe a race that happens after it already ran.
+RACE_VERSION="9.9.9-race.1"
+RACE_TAG="ferrite-ops-v${RACE_VERSION}"
+RACE_MERGED_SHA="$(git --git-dir="$REMOTE" rev-parse refs/heads/main)"
+
+RACE_CLONE="${TMP}/race-clone"
+git clone -q "$REMOTE" "$RACE_CLONE"
+git -C "$RACE_CLONE" config user.name "Other Workflow Run"
+git -C "$RACE_CLONE" config user.email "other@example.invalid"
+echo "a concurrent, independent push lands on main mid-race" >> "${RACE_CLONE}/active-release.env.race"
+git -C "$RACE_CLONE" add active-release.env.race
+git -C "$RACE_CLONE" commit -q -m "concurrent push that advances main mid-race"
+git -C "$RACE_CLONE" push -q origin main
+ADVANCED_SHA="$(git --git-dir="$REMOTE" rev-parse refs/heads/main)"
+if [ "$ADVANCED_SHA" = "$RACE_MERGED_SHA" ]; then
+  harness_fail "race fixture setup did not actually advance origin/main"
+fi
+
+if (
+  cd "$FIXTURE" &&
+    MERGED_SHA="$RACE_MERGED_SHA" VERSION="$RACE_VERSION" OPS_TAG="$RACE_TAG" \
+      bash "$TAG_SCRIPT" >"${TMP}/race.log" 2>&1
+); then
+  harness_fail "atomic push unexpectedly succeeded after main advanced mid-race"
+else
+  assert_contains "$(cat "${TMP}/race.log")" "Atomic push rejected" \
+    "the atomic lease-guarded push rejects a tag creation when main advanced between validation and push"
+fi
+if git ls-remote --exit-code --tags "$REMOTE" "refs/tags/${RACE_TAG}" >/dev/null 2>&1; then
+  harness_fail "a rejected atomic push still left the tag behind on origin"
+else
+  harness_ok "a rejected atomic push leaves no tag behind on origin"
 fi
 
 git -C "$FIXTURE" tag -d "$EXPECTED_TAG" >/dev/null

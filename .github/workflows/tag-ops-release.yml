@@ -205,4 +205,24 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git tag -a "$OPS_TAG" "$MERGED_SHA" -m "Ferrite ops release ${VERSION}"
-          git push origin "refs/tags/${OPS_TAG}"
+
+          # Atomically re-verify-and-push: --force-with-lease=refs/heads/main:<sha>
+          # asserts, AS PART OF THIS SINGLE PUSH, that origin's main is still
+          # exactly the commit already validated above -- closing the race
+          # window between that earlier validation and this push actually
+          # landing (e.g. a rapid follow-up release-metadata push landing on
+          # main in between). --atomic means every ref update in this one
+          # push either all succeed or all fail together, so a stale lease
+          # rejects the tag creation too -- the tag is never left behind
+          # without the lease having held. The main ref update itself is a
+          # same-commit no-op (main is only ever compared here, never
+          # advanced or rewritten by this workflow); it exists purely to
+          # carry the compare-and-swap check.
+          if ! git push --atomic \
+            --force-with-lease="refs/heads/main:${MERGED_SHA}" \
+            origin \
+            "${MERGED_SHA}:refs/heads/main" \
+            "refs/tags/${OPS_TAG}"; then
+            echo "::error::Atomic push rejected: origin/main advanced past ${MERGED_SHA} before the tag could be pushed, or the tag ref itself was rejected. Refusing to tag a commit main has since superseded."
+            exit 1
+          fi
