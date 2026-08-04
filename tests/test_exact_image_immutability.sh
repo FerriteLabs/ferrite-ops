@@ -207,6 +207,57 @@ with open(path, "w") as f:
 os.chmod(path, os.stat(path).st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
 PYEOF
 
+# Minimal stateful fake `crane`, used ONLY for the cross-registry Docker Hub
+# backfill in promote-exact (`crane digest` / `crane copy`) -- the same
+# REGISTRY_MANIFEST fixture as the fake `docker buildx imagetools` above, so
+# a copy performed by fake crane is immediately visible to fake docker inspecting
+# the SAME destination tag, and vice versa.
+python3 - "$FAKE_BIN/crane" <<'PYEOF'
+import sys, os, stat
+path = sys.argv[1]
+script = r"""#!/usr/bin/env bash
+set -euo pipefail
+
+if [ "${1:-}" = "digest" ]; then
+  REF="$2"
+  LINE="$(awk -v r="$REF" '$1==r{print}' "$REGISTRY_MANIFEST" | tail -1)"
+  if [ -z "$LINE" ]; then
+    echo "Error: NAME_UNKNOWN: repository name not known: ${REF}" >&2
+    exit 1
+  fi
+  printf '%s\n' "$LINE" | awk '{print $2}'
+  exit 0
+fi
+
+if [ "${1:-}" = "copy" ]; then
+  SRC="$2"
+  DEST="$3"
+  SRC_DIGEST="$(printf '%s' "$SRC" | cut -d '@' -f2)"
+  # Simulate a REAL all-platform blob copy: the destination tag now points
+  # at the EXACT SAME digest as the verified source (crane preserves
+  # content-addressability across registries; it does not re-encode) --
+  # UNLESS CRANE_CORRUPT_COPY=true, which deliberately writes back a WRONG
+  # digest so the caller's own post-copy digest-equality verification (not
+  # this fake) is what has to catch the corruption.
+  RESULT_DIGEST="$SRC_DIGEST"
+  if [ "${CRANE_CORRUPT_COPY:-false}" = "true" ]; then
+    RESULT_DIGEST="sha256:$(printf 'corrupt-%s' "$SRC_DIGEST" | shasum -a 256 | cut -d' ' -f1)"
+  fi
+  awk -v r="$DEST" '$1!=r' "$REGISTRY_MANIFEST" > "${REGISTRY_MANIFEST}.tmp" 2>/dev/null || true
+  mv "${REGISTRY_MANIFEST}.tmp" "$REGISTRY_MANIFEST"
+  printf '%s %s copied copied\n' "$DEST" "$RESULT_DIGEST" >> "$REGISTRY_MANIFEST"
+  printf 'crane copy %s %s\n' "$SRC" "$DEST" >> "$DOCKER_LOG"
+  exit 0
+fi
+
+echo "unexpected crane invocation: $*" >&2
+exit 1
+"""
+with open(path, "w") as f:
+    f.write(script)
+os.chmod(path, os.stat(path).st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+PYEOF
+
 GHCR_IMAGE="ghcr.io/ferritelabs/ferrite"
 DOCKERHUB_IMAGE="ferritelabs/ferrite"
 
@@ -297,7 +348,7 @@ fi
 
 # === promote-exact ===========================================================
 run_promote_exact() {
-  local version="$1" digest="$2" dockerhub_enabled="${3:-false}" out="$4"
+  local version="$1" digest="$2" dockerhub_enabled="${3:-false}" out="$4" corrupt_copy="${5:-false}"
   : > "$out"
   : > "$DOCKER_LOG"
   (
@@ -309,6 +360,7 @@ run_promote_exact() {
     export GHCR_IMAGE="$GHCR_IMAGE"
     export DOCKERHUB_IMAGE="$DOCKERHUB_IMAGE"
     export DOCKERHUB_ENABLED="$dockerhub_enabled"
+    export CRANE_CORRUPT_COPY="$corrupt_copy"
     bash "$PROMOTE_SCRIPT"
   ) >"$out" 2>&1
 }
@@ -388,11 +440,25 @@ if run_promote_exact "0.7.2" "sha256:${ONES}" "true" "${TMP}/dockerhub_backfill.
   assert_eq "sha256:${ONES}" "$(manifest_digest_of "${DOCKERHUB_IMAGE}:0.7.2")" \
     "an idempotent GHCR retry backfills a missing Docker Hub exact tag"
   assert_eq \
-    "buildx imagetools create --tag ${DOCKERHUB_IMAGE}:0.7.2 ${GHCR_IMAGE}@sha256:${ONES}" \
+    "crane copy ${GHCR_IMAGE}@sha256:${ONES} ${DOCKERHUB_IMAGE}:0.7.2" \
     "$(cat "$DOCKER_LOG")" \
-    "Docker Hub backfill copies only from the verified GHCR digest"
+    "Docker Hub backfill performs a real cross-registry blob copy from the verified GHCR digest"
 else
   harness_fail "promote-exact could not backfill a missing Docker Hub tag from verified GHCR: $(cat "${TMP}/dockerhub_backfill.out")"
+fi
+
+# --- Docker Hub: a corrupted cross-registry copy is caught and rejected ----
+# Even though crane performs a real blob copy (unlike imagetools create), the
+# copy itself could still fail partway or land on the wrong content in a
+# real-world registry hiccup; promote-exact independently re-reads the
+# destination digest after the copy and refuses to treat the promotion as
+# successful unless it is BYTE-IDENTICAL to the verified GHCR source digest.
+: > "$REGISTRY_MANIFEST"
+if run_promote_exact "0.7.3" "sha256:${ONES}" "true" "${TMP}/dockerhub_corrupt.out" "true"; then
+  harness_fail "promote-exact unexpectedly accepted a corrupted cross-registry Docker Hub copy"
+else
+  assert_contains "$(cat "${TMP}/dockerhub_corrupt.out")" "does not match the verified source digest" \
+    "promote-exact detects and rejects a corrupted cross-registry Docker Hub copy"
 fi
 
 # --- Invalid inputs are rejected defensively --------------------------------

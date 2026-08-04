@@ -623,6 +623,21 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
+      # `docker buildx imagetools create` does not reliably copy blob
+      # content BETWEEN different registries — it can create a manifest
+      # list referencing digests, but the underlying layer/config blobs must
+      # already exist in the destination registry. That holds for GHCR (the
+      # source digest was pushed there directly) but not necessarily for an
+      # optional Docker Hub backfill, so crane — a real, pinned OCI registry
+      # client that performs an actual all-platform blob copy — is used
+      # instead for that cross-registry case only. Entirely conditional on
+      # Docker Hub eligibility, exactly like the login step above.
+      - name: Set up crane
+        if: needs.build-and-push.outputs.dockerhub_enabled == 'true'
+        uses: imjasonh/setup-crane@v0.7
+        with:
+          version: v0.21.8
+
       - name: Promote the verified digest to the exact immutable version tag
         env:
           VERSION: ${{ needs.build-and-push.outputs.version }}
@@ -643,19 +658,16 @@ jobs:
             exit 1
           fi
 
-          # Promotes DIGEST to "${image}:${VERSION}" unless that exact tag
-          # already exists and points elsewhere, in which case it refuses
-          # outright rather than overwriting a different, already-published
-          # exact version. An existing tag that already matches DIGEST is
-          # left untouched (idempotent no-op) instead of being re-written.
-          # `required` controls only how an AMBIGUOUS inspection failure
-          # (neither a clean "not found" nor a clean match) is handled: fatal
-          # for the required GHCR promotion, a skipped warning for the
-          # optional Docker Hub mirror. A genuine digest MISMATCH is always
-          # fatal on both registries — Docker Hub must never overwrite a
-          # different existing digest either.
+          # Promotes DIGEST to "${image}:${VERSION}" on the SAME registry as
+          # the verified source (GHCR only) unless that exact tag already
+          # exists and points elsewhere, in which case it refuses outright
+          # rather than overwriting a different, already-published exact
+          # version. An existing tag that already matches DIGEST is left
+          # untouched (idempotent no-op) instead of being re-written. Never
+          # used cross-registry — see promote_exact_tag_cross_registry below
+          # for the Docker Hub backfill, which needs a real blob copy.
           promote_exact_tag() {
-            local image="$1" source_image="$2" required="$3"
+            local image="$1"
             local err_log existing_digest
             err_log="$(mktemp)"
             if existing_digest="$(docker buildx imagetools inspect "${image}:${VERSION}" --format '{{json .Manifest}}' 2>"$err_log" | jq -r '.digest // empty')" \
@@ -670,27 +682,69 @@ jobs:
             fi
             if grep -qiE 'not found|manifest unknown|no such manifest|MANIFEST_UNKNOWN' "$err_log"; then
               rm -f "$err_log"
-              echo "::notice::Promoting ${image}:${VERSION} -> ${DIGEST} from verified source ${source_image}@${DIGEST}"
-              docker buildx imagetools create --tag "${image}:${VERSION}" "${source_image}@${DIGEST}"
+              echo "::notice::Promoting ${image}:${VERSION} -> ${DIGEST} from verified source ${image}@${DIGEST}"
+              docker buildx imagetools create --tag "${image}:${VERSION}" "${image}@${DIGEST}"
               return 0
             fi
             echo "::error::Could not determine whether ${image}:${VERSION} already exists:"
             cat "$err_log" >&2
             rm -f "$err_log"
-            if [ "$required" = "true" ]; then
+            return 1
+          }
+
+          # Cross-registry Docker Hub backfill: performs a REAL all-platform
+          # blob copy with crane (pulling every referenced layer/config from
+          # the verified GHCR source and pushing it to Docker Hub, not just
+          # referencing a manifest that may not resolve there), then
+          # independently re-reads the destination digest and asserts it is
+          # BYTE-IDENTICAL to the verified GHCR source digest before treating
+          # the promotion as successful. Optional end-to-end: any ambiguous
+          # inspection failure is a skipped warning (never fatal), but a
+          # genuine digest MISMATCH — whether pre-existing or produced by a
+          # corrupt copy — is always fatal; Docker Hub must never overwrite a
+          # different existing digest, nor be left pointing at a tag this
+          # workflow cannot prove matches the signed, verified source.
+          promote_exact_tag_cross_registry() {
+            local dest_image="$1" source_image="$2"
+            local err_log existing_digest
+            err_log="$(mktemp)"
+            if existing_digest="$(crane digest "${dest_image}:${VERSION}" 2>"$err_log")" \
+              && [ -n "$existing_digest" ]; then
+              rm -f "$err_log"
+              if [ "$existing_digest" = "$DIGEST" ]; then
+                echo "::notice::${dest_image}:${VERSION} already points at ${DIGEST}; nothing to promote (idempotent)."
+                return 0
+              fi
+              echo "::error::${dest_image}:${VERSION} already exists but points at a DIFFERENT digest (${existing_digest} != ${DIGEST}). Refusing to overwrite an existing exact version tag."
               return 1
             fi
-            echo "::warning::Skipping optional ${image} promotion due to the inspection error above."
+            if grep -qiE 'not found|manifest unknown|no such manifest|MANIFEST_UNKNOWN|NAME_UNKNOWN|404' "$err_log"; then
+              rm -f "$err_log"
+              echo "::notice::Promoting ${dest_image}:${VERSION} -> ${DIGEST} via a real cross-registry blob copy from verified source ${source_image}@${DIGEST}"
+              crane copy "${source_image}@${DIGEST}" "${dest_image}:${VERSION}"
+              local copied_digest
+              copied_digest="$(crane digest "${dest_image}:${VERSION}")"
+              if [ "$copied_digest" != "$DIGEST" ]; then
+                echo "::error::Cross-registry copy to ${dest_image}:${VERSION} produced digest ${copied_digest}, which does not match the verified source digest ${DIGEST}."
+                return 1
+              fi
+              echo "::notice::Verified ${dest_image}:${VERSION} digest matches the verified GHCR source digest exactly."
+              return 0
+            fi
+            echo "::error::Could not determine whether ${dest_image}:${VERSION} already exists:"
+            cat "$err_log" >&2
+            rm -f "$err_log"
+            echo "::warning::Skipping optional ${dest_image} promotion due to the inspection error above."
             return 0
           }
 
-          promote_exact_tag "$GHCR_IMAGE" "$GHCR_IMAGE" true
+          promote_exact_tag "$GHCR_IMAGE"
 
           if [ "$DOCKERHUB_ENABLED" = "true" ]; then
             # GHCR is the signed, metadata-verified source of truth. Copying
             # from it also lets an idempotent retry safely backfill Docker
             # Hub when that mirror was disabled during the original release.
-            promote_exact_tag "$DOCKERHUB_IMAGE" "$GHCR_IMAGE" false
+            promote_exact_tag_cross_registry "$DOCKERHUB_IMAGE" "$GHCR_IMAGE"
           fi
 
           echo "::notice::Exact version tag ${VERSION} is now published and verified at ${DIGEST}."
