@@ -21,10 +21,25 @@ CONTENT="$(cat "$RELEASE_YML")"
 DOCKERFILE_CONTENT="$(cat "$DOCKERFILE")"
 
 # --- Static checks -----------------------------------------------------------
-assert_contains "$CONTENT" "concurrency:" \
-  "release.yml defines workflow-level concurrency"
-assert_contains "$CONTENT" "group: ferrite-release-\${{ github.event_name == 'push'" \
-  "release.yml's concurrency group is keyed on the release version from the raw triggering event"
+# Concurrency is enforced at JOB level (build-and-push, promote-exact), keyed
+# on the `prepare` job's normalized, validated version output — NOT a
+# workflow-level group keyed on the raw triggering event. A raw-event-keyed
+# group would give a `v1.2.3` tag push and an equivalent `1.2.3`
+# workflow_dispatch input two DIFFERENT group strings and never serialize
+# them against each other; tests/test_release_workflows.sh's
+# "workflow_dispatch_bare" case functionally proves a "v1.2.3" input and a
+# bare "1.2.3" input normalize to the IDENTICAL version (and therefore the
+# identical concurrency group).
+assert_contains "$CONTENT" "prepare:" \
+  "release.yml defines a trusted prepare job that runs before any build"
+assert_contains "$CONTENT" "needs: prepare" \
+  "build-and-push depends on the prepare job"
+assert_contains "$CONTENT" "group: ferrite-release-exact-\${{ needs.prepare.outputs.version }}" \
+  "build-and-push's concurrency group is keyed on prepare's normalized version"
+assert_contains "$CONTENT" "group: ferrite-release-exact-\${{ needs.build-and-push.outputs.version }}" \
+  "promote-exact's concurrency group is keyed on the same normalized version"
+assert_not_contains "$CONTENT" "github.event_name == 'push' && github.ref_name || github.event.client_payload.version || inputs.tag" \
+  "release.yml no longer keys any concurrency group on the raw, un-normalized triggering event"
 assert_contains "$CONTENT" "cancel-in-progress: false" \
   "release.yml never cancels an in-flight release run for the same version"
 assert_contains "$CONTENT" 'candidate_tag: ${{ steps.release_meta.outputs.candidate_tag }}' \

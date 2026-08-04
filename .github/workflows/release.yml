@@ -12,15 +12,6 @@ on:
         required: true
         default: 'v0.4.0'
 
-# Serializes every run of this workflow for the SAME release version (a
-# retried, duplicate, or accidentally re-triggered run for e.g. 0.4.1 always
-# queues behind an earlier 0.4.1 run rather than racing it), while different
-# versions still build fully concurrently, since the group name embeds the
-# raw version straight from the triggering event.
-concurrency:
-  group: ferrite-release-${{ github.event_name == 'push' && github.ref_name || github.event.client_payload.version || inputs.tag }}
-  cancel-in-progress: false
-
 # NOTE: this workflow only builds, signs, and publishes the Ferrite image.
 # Chart, Dockerfile-default, Compose, GitOps, Terraform, and packaging pin
 # updates are handled exclusively by version-sync.yml, which is triggered by
@@ -29,6 +20,20 @@ concurrency:
 # a second, partial chart-only bump racing it.
 #
 # Release model — the exact version tag is immutable end-to-end:
+#   0. prepare — the ONE trusted place that derives this run's release
+#      version from the triggering event and normalizes it (stripping an
+#      optional leading "v") BEFORE any build, scan, sign, or registry write
+#      happens. Every job below consumes prepare's validated, normalized
+#      `version` output instead of re-deriving it from raw event data. This
+#      is deliberately NOT a workflow-level `concurrency:` keyed on the raw
+#      event value: a `v1.2.3` tag push and a `1.2.3` workflow_dispatch input
+#      describe the exact SAME release but would produce two DIFFERENT raw
+#      concurrency-group strings and never serialize against each other.
+#      Instead, build-and-push and promote-exact each carry their own
+#      job-level `concurrency:` keyed on prepare's normalized version, so
+#      any two runs — however differently the version was spelled — that
+#      resolve to the same normalized version always queue behind each
+#      other rather than racing.
 #   1. build-and-push — first checks whether the exact version tag already
 #      exists on GHCR (a previous, successful run of this exact version). If
 #      it does, its signature and its baked version/source-checksum labels
@@ -50,14 +55,17 @@ concurrency:
 #      re-checks immediately beforehand whether the exact tag already exists;
 #      an existing tag with a matching digest is left alone (idempotent
 #      no-op), and one with a *different* digest is refused outright — on
-#      GHCR and, independently, on the optional Docker Hub mirror. Because
-#      promote-exact only runs once build-and-push, verify, and smoke-test
-#      have all succeeded, a failed run can never leave an unverified exact
-#      tag behind: the exact tag is the LAST thing this workflow ever writes,
-#      not the first. The throwaway candidate tag is NOT the exact tag and
-#      is left in the registry as a harmless, clearly-named build artifact;
-#      registry-level retention/cleanup of candidate-* tags is intentionally
-#      out of scope here (see AUDIT.md).
+#      GHCR and, independently, on the optional Docker Hub mirror (copied
+#      with a real cross-registry blob copy — see the promote-exact job
+#      below — and digest-verified after the copy, since `imagetools create`
+#      does not reliably copy blob content across DIFFERENT registries).
+#      Because promote-exact only runs once build-and-push, verify, and
+#      smoke-test have all succeeded, a failed run can never leave an
+#      unverified exact tag behind: the exact tag is the LAST thing this
+#      workflow ever writes, not the first. The throwaway candidate tag is
+#      NOT the exact tag and is left in the registry as a harmless,
+#      clearly-named build artifact; registry-level retention/cleanup of
+#      candidate-* tags is intentionally out of scope here (see AUDIT.md).
 #   4. promote-stable — a cheap, serialized digest-promotion job that
 #      independently advances each of the floating `latest`, `<major>`, and
 #      `<major>.<minor>` tags to this release's digest, but only for stable
@@ -71,69 +79,46 @@ env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository_owner }}/ferrite
   DOCKERHUB_IMAGE: ferritelabs/ferrite
+  # Restricts every keyless cosign verification in this workflow to a
+  # signature minted by THIS EXACT repository's THIS EXACT workflow file
+  # (.github/workflows/release.yml), on one of the two refs this workflow is
+  # actually trusted to release from: a `v*` tag push (the real release
+  # trigger), or a dispatch (repository_dispatch from core, or a manual
+  # workflow_dispatch) running on `main` — GitHub Actions always executes
+  # dispatch events against the repository's default branch, so both
+  # dispatch trigger types are covered by the `heads/main` alternative.
+  # Deliberately NOT an org-wide regex: this can never match a signature
+  # minted by a different repository under the same owner, a fork, a
+  # different workflow file in this same repository, or a run on any other
+  # ref (a feature branch, a PR head, an arbitrary tag, etc.).
+  CERTIFICATE_IDENTITY_REGEXP: ^https://github\.com/${{ github.repository }}/\.github/workflows/release\.yml@refs/(heads/main|tags/v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?)$
 
 jobs:
-  build-and-push:
-    name: Build & Push Docker Image
+  # ── Step 0: Derive and validate this run's normalized release version ──────
+  # The ONLY place in this workflow that determines the release version from
+  # the triggering event, strips an optional leading "v", and validates it
+  # (both a loose shape check and the shared strict-SemVer validator). Every
+  # other job consumes this job's `version` output instead of re-deriving it
+  # from raw event data, and build-and-push/promote-exact each key their own
+  # job-level `concurrency:` group on this exact, normalized value — so a
+  # `v1.2.3` tag push and a `1.2.3` workflow_dispatch input, which describe
+  # the identical release but would otherwise produce two different raw
+  # strings, always serialize against each other instead of racing.
+  prepare:
+    name: Prepare Release
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      packages: write
-      id-token: write
-      attestations: write
     outputs:
-      digest: ${{ steps.check_existing.outputs.idempotent == 'true' && steps.check_existing.outputs.existing_digest || steps.build.outputs.digest }}
-      image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
       version: ${{ steps.release_meta.outputs.version }}
+      sha256: ${{ steps.release_meta.outputs.sha256 }}
       major: ${{ steps.release_meta.outputs.major }}
       major_minor: ${{ steps.release_meta.outputs.major_minor }}
       stable: ${{ steps.release_meta.outputs.stable }}
       candidate_tag: ${{ steps.release_meta.outputs.candidate_tag }}
-      idempotent: ${{ steps.check_existing.outputs.idempotent }}
-      dockerhub_enabled: ${{ steps.dockerhub.outputs.enabled }}
+      build_args: ${{ steps.release_meta.outputs.build_args }}
     steps:
       - uses: actions/checkout@v4
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Log in to GitHub Container Registry
-        uses: docker/login-action@v3
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Determine Docker Hub publishing eligibility
-        id: dockerhub
-        env:
-          DOCKERHUB_ENABLED: ${{ vars.DOCKERHUB_ENABLED }}
-          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
-          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-
-          ENABLED=false
-          if [ "$DOCKERHUB_ENABLED" = "true" ]; then
-            if [ -n "$DOCKERHUB_USERNAME" ] && [ -n "$DOCKERHUB_TOKEN" ]; then
-              ENABLED=true
-            else
-              echo "::warning::DOCKERHUB_ENABLED is true, but Docker Hub credentials are not fully configured; publishing GHCR only."
-            fi
-          fi
-          echo "enabled=${ENABLED}" >> "$GITHUB_OUTPUT"
-
-      - name: Log in to Docker Hub
-        uses: docker/login-action@v3
-        if: steps.dockerhub.outputs.enabled == 'true'
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-
-      # Installed early so it is available both for verifying a pre-existing
-      # exact tag below AND for signing a freshly built candidate later.
-      - name: Install Cosign
-        uses: sigstore/cosign-installer@v3
 
       # Determine the Ferrite source version to bake into this image, from
       # whichever trigger fired this workflow, and its verified source
@@ -240,6 +225,78 @@ jobs:
             echo "FERRITE_BUILD_ARGS_EOF"
           } >> "$GITHUB_OUTPUT"
 
+  build-and-push:
+    name: Build & Push Docker Image
+    needs: prepare
+    runs-on: ubuntu-latest
+    # Serializes the exact-tag pipeline (this job, and promote-exact below)
+    # across ANY run that resolves to this SAME normalized version — however
+    # differently its raw input was spelled — so a duplicate/retried/
+    # differently-formatted trigger for the same release always queues
+    # behind an in-flight one (and then observes it as an idempotent
+    # no-op via check_existing) instead of racing it.
+    concurrency:
+      group: ferrite-release-exact-${{ needs.prepare.outputs.version }}
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    outputs:
+      digest: ${{ steps.check_existing.outputs.idempotent == 'true' && steps.check_existing.outputs.existing_digest || steps.build.outputs.digest }}
+      image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+      version: ${{ needs.prepare.outputs.version }}
+      major: ${{ needs.prepare.outputs.major }}
+      major_minor: ${{ needs.prepare.outputs.major_minor }}
+      stable: ${{ needs.prepare.outputs.stable }}
+      candidate_tag: ${{ needs.prepare.outputs.candidate_tag }}
+      idempotent: ${{ steps.check_existing.outputs.idempotent }}
+      dockerhub_enabled: ${{ steps.dockerhub.outputs.enabled }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Determine Docker Hub publishing eligibility
+        id: dockerhub
+        env:
+          DOCKERHUB_ENABLED: ${{ vars.DOCKERHUB_ENABLED }}
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          ENABLED=false
+          if [ "$DOCKERHUB_ENABLED" = "true" ]; then
+            if [ -n "$DOCKERHUB_USERNAME" ] && [ -n "$DOCKERHUB_TOKEN" ]; then
+              ENABLED=true
+            else
+              echo "::warning::DOCKERHUB_ENABLED is true, but Docker Hub credentials are not fully configured; publishing GHCR only."
+            fi
+          fi
+          echo "enabled=${ENABLED}" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        if: steps.dockerhub.outputs.enabled == 'true'
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # Installed early so it is available both for verifying a pre-existing
+      # exact tag below AND for signing a freshly built candidate later.
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@v3
+
       # Checks whether the exact version tag this run would publish ALREADY
       # exists on GHCR from a previous, successful run. If so, its signature
       # and its baked org.opencontainers.image.version / source-sha256
@@ -258,9 +315,8 @@ jobs:
         id: check_existing
         env:
           GHCR_IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          VERSION: ${{ steps.release_meta.outputs.version }}
-          SHA256: ${{ steps.release_meta.outputs.sha256 }}
-          CERTIFICATE_IDENTITY_REGEXP: ^https://github\.com/${{ github.repository_owner }}/
+          VERSION: ${{ needs.prepare.outputs.version }}
+          SHA256: ${{ needs.prepare.outputs.sha256 }}
         run: |
           set -euo pipefail
 
@@ -328,6 +384,16 @@ jobs:
       # step in this block is skipped entirely when check_existing found an
       # already-verified, matching exact tag (idempotent no-op): no rebuild,
       # no re-signing, no re-attesting.
+      # The candidate tag itself is a throwaway, run-specific string
+      # (candidate-<run id>-<run attempt>), but the image's baked
+      # org.opencontainers.image.version label MUST be the real release
+      # SemVer: docker/metadata-action derives that label from the tag list
+      # by default, which for a bare `type=raw` tag would otherwise bake the
+      # candidate string itself into the label. check_existing's idempotent
+      # verification above, and promote-stable's per-tag floating-tag
+      # resolution below, both read this exact label back from the registry
+      # expecting a real SemVer value — so it is explicitly overridden here
+      # rather than left to derive from the candidate tag.
       - name: Extract metadata (tags, labels) — GHCR candidate
         id: meta
         if: steps.check_existing.outputs.idempotent != 'true'
@@ -337,7 +403,9 @@ jobs:
           flavor: |
             latest=false
           tags: |
-            type=raw,value=${{ steps.release_meta.outputs.candidate_tag }}
+            type=raw,value=${{ needs.prepare.outputs.candidate_tag }}
+          labels: |
+            org.opencontainers.image.version=${{ needs.prepare.outputs.version }}
 
       # Docker Hub is optional: this step (and therefore every Docker Hub
       # tag) only runs when the repository variable DOCKERHUB_ENABLED is
@@ -355,7 +423,9 @@ jobs:
           flavor: |
             latest=false
           tags: |
-            type=raw,value=${{ steps.release_meta.outputs.candidate_tag }}
+            type=raw,value=${{ needs.prepare.outputs.candidate_tag }}
+          labels: |
+            org.opencontainers.image.version=${{ needs.prepare.outputs.version }}
 
       # Combine the always-on GHCR tags/labels with the optional Docker Hub
       # tags (empty when meta_dockerhub did not run) into the single tag/
@@ -392,7 +462,7 @@ jobs:
           push: true
           tags: ${{ steps.meta_combined.outputs.tags }}
           labels: ${{ steps.meta_combined.outputs.labels }}
-          build-args: ${{ steps.release_meta.outputs.build_args }}
+          build-args: ${{ needs.prepare.outputs.build_args }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
           provenance: true
@@ -476,7 +546,6 @@ jobs:
         env:
           IMAGE: ${{ needs.build-and-push.outputs.image }}
           DIGEST: ${{ needs.build-and-push.outputs.digest }}
-          CERTIFICATE_IDENTITY_REGEXP: ^https://github\.com/${{ github.repository_owner }}/
         run: |
           cosign verify \
             --certificate-oidc-issuer=https://token.actions.githubusercontent.com \
@@ -487,7 +556,6 @@ jobs:
         env:
           IMAGE: ${{ needs.build-and-push.outputs.image }}
           DIGEST: ${{ needs.build-and-push.outputs.digest }}
-          CERTIFICATE_IDENTITY_REGEXP: ^https://github\.com/${{ github.repository_owner }}/
         run: |
           cosign verify-attestation \
             --type spdxjson \
@@ -527,6 +595,13 @@ jobs:
     name: Promote Verified Candidate to Exact Version Tag
     runs-on: ubuntu-latest
     needs: [build-and-push, verify, smoke-test]
+    # Same normalized-version group as build-and-push above: any other run
+    # (however its input was spelled) that resolves to this exact normalized
+    # version queues behind this promotion rather than racing its
+    # read-compare-write against an existing exact tag.
+    concurrency:
+      group: ferrite-release-exact-${{ needs.build-and-push.outputs.version }}
+      cancel-in-progress: false
     permissions:
       contents: read
       packages: write

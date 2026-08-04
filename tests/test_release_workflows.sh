@@ -51,7 +51,7 @@ ORCHESTRATION_CONTENT="$(cat "$ORCHESTRATION_YML")"
 # --- Static checks: release.yml ---------------------------------------------
 assert_contains "$RELEASE_CONTENT" "FERRITE_SOURCE_SHA256" \
   "release.yml derives a FERRITE_SOURCE_SHA256 for the image it publishes"
-assert_contains "$RELEASE_CONTENT" "build-args: \${{ steps.release_meta.outputs.build_args }}" \
+assert_contains "$RELEASE_CONTENT" "build-args: \${{ needs.prepare.outputs.build_args }}" \
   "release.yml passes the derived FERRITE_VERSION/FERRITE_SOURCE_SHA256 to docker/build-push-action"
 assert_contains "$RELEASE_CONTENT" 'grep -qE' \
   "release.yml validates the derived version against a semver pattern"
@@ -67,16 +67,64 @@ assert_contains "$RELEASE_CONTENT" "inputs.tag" \
   "release.yml derives the version from the workflow_dispatch input"
 assert_contains "$RELEASE_CONTENT" "default: 'v${EXPECTED_VERSION}'" \
   "release.yml's workflow_dispatch default matches active-release.env"
-assert_contains "$RELEASE_CONTENT" 'type=raw,value=${{ steps.release_meta.outputs.candidate_tag }}' \
+assert_contains "$RELEASE_CONTENT" 'type=raw,value=${{ needs.prepare.outputs.candidate_tag }}' \
   "release.yml tags the build with a unique, throwaway candidate tag, never the exact version directly"
-assert_not_contains "$RELEASE_CONTENT" 'type=raw,value=${{ steps.release_meta.outputs.version }}' \
+assert_not_contains "$RELEASE_CONTENT" 'type=raw,value=${{ needs.prepare.outputs.version }}' \
   "release.yml never bakes the exact version tag directly into the candidate build's metadata"
 assert_not_contains "$RELEASE_CONTENT" 'type=raw,value=latest' \
   "release.yml never bakes a floating latest tag into the candidate build"
-assert_not_contains "$RELEASE_CONTENT" 'type=raw,value=${{ steps.release_meta.outputs.major_minor }}' \
+assert_not_contains "$RELEASE_CONTENT" 'type=raw,value=${{ needs.prepare.outputs.major_minor }}' \
   "release.yml no longer builds the floating major.minor tag inline; promotion advances it"
-assert_not_contains "$RELEASE_CONTENT" 'type=raw,value=${{ steps.release_meta.outputs.major }}' \
+assert_not_contains "$RELEASE_CONTENT" 'type=raw,value=${{ needs.prepare.outputs.major }}' \
   "release.yml no longer builds the floating major tag inline; promotion advances it"
+
+# --- Candidate OCI metadata: real normalized SemVer, not the run-specific
+# candidate tag string (see tests/test_exact_image_immutability.sh and
+# tests/test_release_promotion.sh for the functional idempotent/backport
+# consequences of this exact label). ---
+assert_contains "$RELEASE_CONTENT" 'labels: |
+            org.opencontainers.image.version=${{ needs.prepare.outputs.version }}' \
+  "release.yml's GHCR candidate metadata step explicitly overrides org.opencontainers.image.version to the real normalized SemVer"
+assert_eq "2" "$(grep -c 'org.opencontainers.image.version=\${{ needs.prepare.outputs.version }}' "$RELEASE_YML")" \
+  "both the GHCR and Docker Hub candidate metadata steps explicitly set the real-SemVer version label"
+
+# --- Signature/attestation identity is restricted to THIS exact repository's
+# THIS exact workflow file, on only the two trusted refs (a `v*` tag push,
+# or a dispatch running on `main`) — never an org-wide regex. ---
+assert_contains "$RELEASE_CONTENT" 'CERTIFICATE_IDENTITY_REGEXP: ^https://github\.com/${{ github.repository }}/\.github/workflows/release\.yml@refs/(heads/main|tags/v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?)$' \
+  "release.yml's cosign identity regexp is scoped to this exact repository's release.yml on trusted refs only"
+assert_not_contains "$RELEASE_CONTENT" 'CERTIFICATE_IDENTITY_REGEXP: ^https://github\.com/${{ github.repository_owner }}/$' \
+  "release.yml no longer uses an org-wide cosign identity regexp"
+assert_eq "1" "$(grep -c 'CERTIFICATE_IDENTITY_REGEXP:' "$RELEASE_YML")" \
+  "the cosign identity regexp is defined exactly once (workflow-level env), not redeclared per step"
+assert_eq "3" "$(grep -c 'certificate-identity-regexp="\$CERTIFICATE_IDENTITY_REGEXP"' "$RELEASE_YML")" \
+  "all three cosign verify/verify-attestation invocations consume the single shared identity regexp"
+
+# The regexp must actually match the two trusted identities (a real release
+# tag push, and a dispatch running on main) and reject everything else: a
+# different repository under the same owner, a fork, a different workflow
+# file in this same repository, and an untrusted ref.
+IDENTITY_REGEXP_LITERAL="$(
+  printf '%s' "$RELEASE_CONTENT" |
+    sed -n 's/^ *CERTIFICATE_IDENTITY_REGEXP: //p' | head -1 |
+    sed 's/\${{ github.repository }}/ferritelabs\/ferrite-ops/'
+)"
+assert_true "$(echo "https://github.com/ferritelabs/ferrite-ops/.github/workflows/release.yml@refs/tags/v1.2.3" | grep -qE "$IDENTITY_REGEXP_LITERAL"; echo $?)" \
+  "the identity regexp matches a real v1.2.3 tag-push signing identity"
+assert_true "$(echo "https://github.com/ferritelabs/ferrite-ops/.github/workflows/release.yml@refs/heads/main" | grep -qE "$IDENTITY_REGEXP_LITERAL"; echo $?)" \
+  "the identity regexp matches a dispatch-on-main signing identity"
+for untrusted in \
+  "https://github.com/ferritelabs/some-other-repo/.github/workflows/release.yml@refs/tags/v1.2.3" \
+  "https://github.com/some-fork/ferrite-ops/.github/workflows/release.yml@refs/tags/v1.2.3" \
+  "https://github.com/ferritelabs/ferrite-ops/.github/workflows/ci.yml@refs/tags/v1.2.3" \
+  "https://github.com/ferritelabs/ferrite-ops/.github/workflows/release.yml@refs/heads/feature-x"; do
+  if echo "$untrusted" | grep -qE "$IDENTITY_REGEXP_LITERAL"; then
+    harness_fail "the identity regexp incorrectly matched an untrusted identity: ${untrusted}"
+  else
+    harness_ok "the identity regexp correctly rejects an untrusted identity: ${untrusted}"
+  fi
+done
+
 assert_contains "$RELEASE_CONTENT" "promote-stable:" \
   "release.yml defines a dedicated floating-tag promotion job"
 assert_contains "$RELEASE_CONTENT" "if: needs.build-and-push.outputs.stable == 'true'" \
@@ -334,21 +382,39 @@ import yaml
 with open(release_yml_path) as f:
     doc = yaml.safe_load(f)
 
+# "Determine release version and source checksum" now runs in the
+# dedicated, trusted `prepare` job — BEFORE any build/scan/registry job —
+# so that build-and-push, verify, smoke-test, and promote-exact can all key
+# their own job-level concurrency on prepare's normalized `version` output.
+prepare_steps = doc["jobs"]["prepare"]["steps"]
+script = next(s["run"] for s in prepare_steps if s.get("name") == "Determine release version and source checksum")
+if doc["jobs"]["build-and-push"].get("needs") != "prepare":
+    raise SystemExit("build-and-push must depend on the prepare job")
+build_concurrency = doc["jobs"]["build-and-push"].get("concurrency", {})
+if "needs.prepare.outputs.version" not in build_concurrency.get("group", ""):
+    raise SystemExit("build-and-push must key its job-level concurrency on prepare's normalized version")
+if build_concurrency.get("cancel-in-progress") is not False:
+    raise SystemExit("build-and-push's concurrency group must queue (not cancel) an in-flight run for the same version")
+
 steps = doc["jobs"]["build-and-push"]["steps"]
-script = next(s["run"] for s in steps if s.get("name") == "Determine release version and source checksum")
-release_index = next(i for i, s in enumerate(steps) if s.get("id") == "release_meta")
 metadata_index = next(i for i, s in enumerate(steps) if s.get("id") == "meta")
-if release_index >= metadata_index:
-    raise SystemExit("release_meta must run before docker/metadata-action")
+if metadata_index < 0:
+    raise SystemExit("docker/metadata-action step not found")
+
+promote_exact_concurrency = doc["jobs"]["promote-exact"].get("concurrency", {})
+if "needs.build-and-push.outputs.version" not in promote_exact_concurrency.get("group", ""):
+    raise SystemExit("promote-exact must key its job-level concurrency on the normalized version")
+if promote_exact_concurrency.get("cancel-in-progress") is not False:
+    raise SystemExit("promote-exact's concurrency group must queue (not cancel) an in-flight run for the same version")
 
 metadata_tags = next(s["with"]["tags"] for s in steps if s.get("id") == "meta")
 required_tags = [
-    "type=raw,value=${{ steps.release_meta.outputs.candidate_tag }}",
+    "type=raw,value=${{ needs.prepare.outputs.candidate_tag }}",
 ]
 missing_tags = [tag for tag in required_tags if tag not in metadata_tags]
 if missing_tags:
     raise SystemExit(f"metadata tags are missing normalized outputs: {missing_tags}")
-if "type=raw,value=${{ steps.release_meta.outputs.version }}" in metadata_tags:
+if "type=raw,value=${{ needs.prepare.outputs.version }}" in metadata_tags:
     raise SystemExit("metadata tags must never bake the exact version tag directly")
 
 metadata_flavor = next(
@@ -611,11 +677,11 @@ effective_tags() {
 
   while IFS= read -r line; do
     [[ -z "${line// /}" ]] && continue
-    line="${line//\$\{\{ steps.release_meta.outputs.candidate_tag \}\}/${candidate_tag}}"
-    line="${line//\$\{\{ steps.release_meta.outputs.version \}\}/${version}}"
-    line="${line//\$\{\{ steps.release_meta.outputs.major_minor \}\}/${major_minor}}"
-    line="${line//\$\{\{ steps.release_meta.outputs.major \}\}/${major}}"
-    line="${line//\$\{\{ steps.release_meta.outputs.stable == \'true\' \}\}/${stable}}"
+    line="${line//\$\{\{ needs.prepare.outputs.candidate_tag \}\}/${candidate_tag}}"
+    line="${line//\$\{\{ needs.prepare.outputs.version \}\}/${version}}"
+    line="${line//\$\{\{ needs.prepare.outputs.major_minor \}\}/${major_minor}}"
+    line="${line//\$\{\{ needs.prepare.outputs.major \}\}/${major}}"
+    line="${line//\$\{\{ needs.prepare.outputs.stable == \'true\' \}\}/${stable}}"
 
     enable="true"
     if [[ "$line" == *",enable="* ]]; then
@@ -680,6 +746,22 @@ if run_case "workflow_dispatch" workflow_dispatch "" "v${EXPECTED_VERSION}" >"${
   assert_tag_set workflow_dispatch "$EXPECTED_CANDIDATE_TAG"
 else
   harness_fail "workflow_dispatch case unexpectedly failed: $(cat "${EXTRACT_DIR}/log_workflow_dispatch.txt")"
+fi
+
+# --- Normalized concurrency (item 3): a "v"-prefixed input and its bare
+# equivalent MUST normalize to the exact same version, since build-and-push
+# and promote-exact key their job-level concurrency group directly on this
+# output -- if "v1.2.3" and "1.2.3" produced different `version=` values,
+# the two spellings would never serialize against each other and could race
+# the same release's build/promote-exact pipeline concurrently.
+if run_case "workflow_dispatch_bare" workflow_dispatch "" "${EXPECTED_VERSION}" \
+  >"${EXTRACT_DIR}/log_workflow_dispatch_bare.txt" 2>&1; then
+  VERSION_V="$(grep -E '^version=' "${EXTRACT_DIR}/output_workflow_dispatch.txt" | head -1)"
+  VERSION_BARE="$(grep -E '^version=' "${EXTRACT_DIR}/output_workflow_dispatch_bare.txt" | head -1)"
+  assert_eq "$VERSION_V" "$VERSION_BARE" \
+    "a 'v${EXPECTED_VERSION}' input and a bare '${EXPECTED_VERSION}' input normalize to the IDENTICAL version -- and therefore the identical job-level concurrency group -- so they can never race each other"
+else
+  harness_fail "bare-version workflow_dispatch case unexpectedly failed: $(cat "${EXTRACT_DIR}/log_workflow_dispatch_bare.txt")"
 fi
 
 if run_case "repository_dispatch" repository_dispatch "v${EXPECTED_VERSION}" "" \
