@@ -109,16 +109,22 @@ for finding in F-54 F-55 F-56 F-57 F-58 F-59 F-60; do
   assert_contains "$AUDIT_CONTENT" "| ${finding} |" \
     "AUDIT.md records release-hardening finding ${finding} as fixed"
 done
-assert_contains "$AUDIT_CONTENT" "## Candidate Metadata, Cross-Registry Backfill, Normalized Concurrency, Identity Scoping, Atomic Tagging, and Strict SemVer Resolution" \
-  "AUDIT.md records this change's release-hardening resolution section"
-assert_contains "$AUDIT_CONTENT" "org.opencontainers.image.version=\${{ needs.prepare.outputs.version }}" \
-  "AUDIT.md records the explicit candidate OCI version label override"
+assert_contains "$AUDIT_CONTENT" "## Deterministic Ops Tags, Event/Ref Trust, and Full Release Transaction Resolution" \
+  "AUDIT.md records the current release-hardening resolution section"
+assert_contains "$AUDIT_CONTENT" "release-transaction" \
+  "AUDIT.md records the single full per-version release transaction"
+assert_contains "$AUDIT_CONTENT" "manual dispatch" \
+  "AUDIT.md records dispatch/ref trust rejection coverage"
+assert_contains "$AUDIT_CONTENT" "later unrelated \`main\` advance" \
+  "AUDIT.md records that later main advances do not change the ops tag target"
 assert_contains "$AUDIT_CONTENT" "imjasonh/setup-crane" \
   "AUDIT.md records the pinned crane cross-registry blob copy tool"
 assert_contains "$AUDIT_CONTENT" "ferrite-release-exact-<version>" \
   "AUDIT.md records the normalized-version job-level concurrency group"
-assert_contains "$AUDIT_CONTENT" "force-with-lease" \
-  "AUDIT.md records the atomic lease-guarded ops tag push"
+assert_contains "$AUDIT_CONTENT" "never uses \`--force-with-lease\`" \
+  "AUDIT.md records removal of the misleading unchanged-main lease"
+assert_contains "$AUDIT_CONTENT" "refs/tags/<tag>:refs/tags/<tag>" \
+  "AUDIT.md records the non-force tag-only ops push"
 assert_contains "$GITLEAKS_CONTENT" 'Authorization:\s+Bearer\s+YOUR_API_KEY' \
   "gitleaks narrowly allowlists the historical documentation placeholder"
 assert_contains "$GRAFANA_README_CONTENT" 'Authorization: Bearer ${GRAFANA_API_TOKEN}' \
