@@ -70,6 +70,8 @@
 | F-59 | P2 | SemVer validation duplication | `release-orchestration.yml` and `tag-ops-release.yml` validated versions with locally duplicated, looser inline regexes instead of the shared `scripts/release-ordering.sh` validator, silently accepting a leading zero in the core or in a numeric pre-release identifier that the shared validator rejects. | Fixed; every version-accepting step in both workflows now calls `scripts/release-ordering.sh validate`, and each workflow normalizes (strips a leading `v`) exactly once, in its own `prepare`/`resolve` job |
 | F-60 | P2 | Secret-scan verification | A placeholder API-token header in `grafana/README.md` matched gitleaks curl authorization-header rule, causing the full-history CI scan to fail on known non-secret documentation. | Fixed; the live example now reads a token from `GRAFANA_API_TOKEN`, while `.gitleaks.toml` narrowly allowlists only the historical placeholder so the existing commit remains auditable without suppressing real credentials |
 | F-61 | P0 | Floating release tags | Floating tags were promoted from only the triggering release event, so dropped/coalesced events or stale/missing series could leave `latest`, major, and major.minor tags incorrect indefinitely. | Fixed; `reconcile-release-tags.yml` paginates all GHCR package versions, admits only signed immutable exact stable SemVer tags with matching digest/version/source metadata, computes every maximum through the shared strict comparator, and repairs GHCR plus an eligible digest-verified Docker Hub mirror |
+| F-62 | P0 | Reconciliation manual trigger | Privileged `workflow_dispatch` let a user select an arbitrary branch containing a modified reconciliation workflow, so default-branch checkout of the helper did not prevent attacker-controlled pre-checkout or workflow-defined registry steps. | Fixed; manual repair is exposed only as the narrowly named `reconcile-release-tags` `repository_dispatch`, which GitHub resolves from the default branch. An initial no-credential step validates the event type/action, default-branch ref, and exact default-branch `github.workflow_ref` before checkout, registry login, or writes; `workflow_dispatch` is absent |
+| F-63 | P0 | Docker Hub exact-tag certainty | Eligible exact releases treated ambiguous Docker Hub inspection failures as optional success, and scheduled reconciliation repaired only floating tags, so auth/network/rate-limit failures or a missed initial mirror could leave exact tags absent without failing or later repair. | Fixed; eligible Docker Hub exact-tag inspection now succeeds only on a verified digest match or a positively identified missing tag, with every other state fatal. Missing exact tags are copied from the signed, metadata-verified GHCR digest using `crane copy` and digest-verified; reconciliation audits all exact stable tags plus floating tags, no-ops on matches, refuses mismatched immutable exact tags, repairs floating mismatches, and fails closed on ambiguous inspection/verification errors |
 
 ## D-01 Resolution
 
@@ -409,12 +411,15 @@ with an older image:
 
 - `release.yml`'s version-locked transaction publishes a unique candidate digest first and creates the
   exact version tag only after verification; different versions still build concurrently without racing.
-- `reconcile-release-tags.yml` runs after successful exact release workflows, on manual dispatch, and on
-  a conservative weekly repair schedule. One fixed `ferrite-release-tag-reconciliation` concurrency group
-  serializes the complete enumerate/verify/plan/apply cycle; pending events may coalesce safely because no
-  run depends on one event's release version.
-- The registry-writing job always checks out the repository's reviewed default branch, including for manual
-  dispatches. GHCR package versions are retrieved with `gh api --paginate --slurp` at 100 records per page. Floating,
+- `reconcile-release-tags.yml` runs after successful exact release workflows, on the narrowly named
+  `reconcile-release-tags` repository dispatch, and on a conservative weekly repair schedule. One fixed
+  `ferrite-release-tag-reconciliation` concurrency group serializes the complete enumerate/verify/plan/apply
+  cycle; pending events may coalesce safely because no run depends on one event's release version.
+- Manual repair uses `gh api --method POST repos/ferritelabs/ferrite-ops/dispatches
+  -f event_type=reconcile-release-tags`; there is no `workflow_dispatch`. GitHub resolves the dispatch from
+  the default branch, and the first step validates the event/action, default-branch ref, and exact
+  default-branch workflow definition before checkout or registry authentication. GHCR package versions are
+  retrieved with `gh api --paginate --slurp` at 100 records per page. Floating,
   candidate, v-prefixed, invalid, and prerelease tags are rejected as sources. Every exact stable source
   must resolve to its API digest, carry consistent exact-version and one identical source-SHA label on every platform,
   and pass the release workflow's Cosign identity verification. Selected sources are re-resolved and re-verified
@@ -424,8 +429,10 @@ with an older image:
   and `scripts/reconcile-release-tags.py` delegates every validation/comparison to it while purely computing
   the maxima for stable overall (`latest`), every major, and every major.minor series.
 - GHCR floating tags are applied to the selected signed digests without rebuilding and verified afterward.
-  Docker Hub runs only when explicitly enabled with both credentials, copies each selected GHCR digest with
-  `crane copy`, and independently verifies the destination digest.
+  Docker Hub runs only when explicitly enabled with both credentials. It audits every exact stable tag and
+  desired floating tag, copies missing exact tags and missing/stale floating tags from verified GHCR with
+  `crane copy`, independently verifies every destination digest, refuses to overwrite a mismatched exact tag,
+  and treats authentication, network, rate-limit, empty-digest, or other ambiguous state as fatal.
 
 ## Release Ordering and Supersession Resolution (this change)
 
@@ -585,16 +592,17 @@ which would incorrectly skip a legitimate backport to an older series.
   from all trusted exact tags. A backport (for example `1.9.2` published after `2.0.2`) leaves `latest`,
   `2`, and `2.0` on `2.0.2` while selecting `1.9.2` for both `1` and `1.9`; a previously missing `1.8`
   series is created from its own maximum in the same run.
-- `tests/test_exact_image_immutability.sh` (46 checks) functionally replays `check_existing` (first
+- `tests/test_exact_image_immutability.sh` (51 checks) functionally replays `check_existing` (first
   publish, verified idempotent match, mismatched version/checksum labels, an unsigned existing tag) and
   exact promotion (first publish, idempotent retry, a simulated concurrent same-version run, a digest
   mismatch on GHCR and independently on Docker Hub, a matching Docker Hub tag, a missing Docker Hub tag
-  backfilled from verified GHCR, and invalid version/digest input) against a stateful fake registry and
-  fake `cosign`.
-  `tests/test_release_reconciliation.sh` (63 checks) covers two paginated GHCR fixture pages, three rapid
+  backfilled from verified GHCR, ambiguous Docker Hub authentication/network/rate-limit inspection,
+  and invalid version/digest input) against a stateful fake registry and fake `cosign`.
+  `tests/test_release_reconciliation.sh` (100 checks) covers two paginated GHCR fixture pages, three rapid
   releases, a backport, prerelease/candidate/floating rejection, missing series, unsigned exact sources,
-  stale GHCR/Docker Hub tags, and digest mismatches. Its functional replay deliberately drops every
-  intermediate release event and proves one final reconciliation repairs all floating tags.
+  malicious-branch dispatch rejection, missing/matching/mismatched Docker Hub exact tags, ambiguous
+  Docker Hub inspection, stale floating tags, and digest mismatches. Its functional replay deliberately
+  drops every intermediate release event and proves one final reconciliation repairs all eligible tags.
   `tests/test_release_workflows.sh` is updated throughout for the candidate-tag build target.
 
 ## Final Verification Pass (trusted supersession, exact-image immutability, strict SemVer, independent floating tags)
@@ -644,18 +652,37 @@ metadata, cross-registry copy, strict SemVer, and secret-scan fixes from F-54/F-
   unrelated `main` advance therefore cannot change the deterministic target, while duplicate same-version
   events cannot overwrite or rebind the existing annotated tag.
 
-Release-focused functional coverage now includes 196 checks in `tests/test_release_workflows.sh`, 46 checks in
-`tests/test_exact_image_immutability.sh`, 36 checks in `tests/test_ops_release_tag_workflow.sh`, and 63 checks in
-`tests/test_release_reconciliation.sh`. The tests extract and replay the real shell steps, including manual dispatch
-from a tag rejection before checksum access, a push-ref/candidate mismatch, non-main configured default-branch
-acceptance, exact transaction step ordering, later unrelated `main` advancement, duplicate tag non-overwrite,
-idempotent/mismatched exact image behavior, cross-registry backfill, paginated exact-tag discovery, and
+Release-focused functional coverage now includes 200 checks in `tests/test_release_workflows.sh`, 51 checks in
+`tests/test_exact_image_immutability.sh`, 36 checks in `tests/test_ops_release_tag_workflow.sh`, and 100 checks in
+`tests/test_release_reconciliation.sh`. The tests extract and replay the real shell steps, including release manual
+dispatch from a tag rejection before checksum access, a push-ref/candidate mismatch, non-main configured
+default-branch acceptance, exact transaction step ordering, later unrelated `main` advancement, duplicate tag
+non-overwrite, idempotent/mismatched exact image behavior, Docker Hub auth/network/rate-limit ambiguity,
+cross-registry exact backfill, paginated exact-tag discovery, malicious-branch reconciliation rejection, and
 single-run repair after coalesced/dropped release events.
 
-## Final Verification Pass (deterministic ops tags, paired release trust, full transaction lock)
+## Reconciliation Dispatch and Docker Hub Exact-Tag Resolution
+
+- **F-62 (default-branch-only manual repair).** `reconcile-release-tags.yml` no longer exposes
+  `workflow_dispatch`. Operators use only the `reconcile-release-tags` repository dispatch, whose workflow
+  definition GitHub loads from the default branch. Before checkout, GHCR login, Docker Hub login, or any write,
+  the workflow checks the event/action, `refs/heads/<default branch>`, and the exact
+  `<repository>/.github/workflows/reconcile-release-tags.yml@refs/heads/<default branch>` workflow ref. The
+  extracted guard rejects a simulated malicious branch definition and unrelated dispatch action.
+- **F-63 (exact mirror certainty and repair).** Once Docker Hub is enabled with complete credentials, the exact
+  release can continue only after `crane digest` proves a match or positively reports the exact tag missing.
+  Authentication, network, rate-limit, empty-result, and other ambiguous failures abort the release. A missing
+  exact tag is copied from the already verified GHCR digest with the real cross-registry `crane copy` path and
+  re-read for digest equality. Scheduled/manual/post-release reconciliation now derives a Docker Hub plan
+  containing every verified exact stable tag plus all desired floating tags: matching tags no-op, missing exact
+  tags are backfilled, mismatched exact tags fail without overwrite, stale floating tags are repaired, and every
+  copy is digest-verified.
+
+## Final Verification Pass (dispatch hardening and Docker Hub exact-tag repair)
 
 - `bash tests/test_release_workflows.sh`, `bash tests/test_exact_image_immutability.sh`,
-  `bash tests/test_ops_release_tag_workflow.sh`, and `bash tests/test_release_reconciliation.sh` pass.
+  `bash tests/test_ops_release_tag_workflow.sh`, and `bash tests/test_release_reconciliation.sh` pass
+  (200, 51, 36, and 100 checks respectively); `bash tests/test_audit_status.sh` passes 96 checks.
 - `bash tests/run.sh` passes all 29/29 discovered suites.
 - `shellcheck --severity=warning scripts/*.sh tests/*.sh tests/lib/*.sh` and
   `actionlint .github/workflows/*.yml` pass with no findings.

@@ -105,7 +105,7 @@ assert_contains "$AUDIT_CONTENT" "1.9.2\` published after \`2.0.2" \
 assert_contains "$AUDIT_CONTENT" "29/29 discovered suites" \
   "AUDIT.md records the final 29-suite verification pass"
 
-for finding in F-54 F-55 F-56 F-57 F-58 F-59 F-60 F-61; do
+for finding in F-54 F-55 F-56 F-57 F-58 F-59 F-60 F-61 F-62 F-63; do
   assert_contains "$AUDIT_CONTENT" "| ${finding} |" \
     "AUDIT.md records release-hardening finding ${finding} as fixed"
 done
@@ -113,16 +113,24 @@ assert_contains "$AUDIT_CONTENT" "## Deterministic Ops Tags, Event/Ref Trust, an
   "AUDIT.md records the current release-hardening resolution section"
 assert_contains "$AUDIT_CONTENT" "release-transaction" \
   "AUDIT.md records the single full per-version release transaction"
-assert_contains "$AUDIT_CONTENT" "manual dispatch" \
-  "AUDIT.md records dispatch/ref trust rejection coverage"
+assert_contains "$AUDIT_CONTENT" "including release manual" \
+  "AUDIT.md records release dispatch/ref trust rejection coverage"
 assert_contains "$AUDIT_CONTENT" "later unrelated \`main\` advance" \
   "AUDIT.md records that later main advances do not change the ops tag target"
 assert_contains "$AUDIT_CONTENT" "imjasonh/setup-crane" \
   "AUDIT.md records the pinned crane cross-registry blob copy tool"
 assert_contains "$AUDIT_CONTENT" "test_release_reconciliation.sh" \
   "AUDIT.md records complete-state reconciliation functional coverage"
-assert_contains "$AUDIT_CONTENT" "one final reconciliation repairs all floating tags" \
-  "AUDIT.md records repair after coalesced or dropped release events"
+assert_contains "$AUDIT_CONTENT" "event_type=reconcile-release-tags" \
+  "AUDIT.md records the narrow manual repository-dispatch command"
+assert_contains "$AUDIT_CONTENT" "there is no \`workflow_dispatch\`" \
+  "AUDIT.md records removal of branch-selectable reconciliation dispatch"
+assert_contains "$AUDIT_CONTENT" "auth/network/rate-limit" \
+  "AUDIT.md records fail-closed Docker Hub inspection ambiguity"
+assert_contains "$AUDIT_CONTENT" "audits all exact stable tags plus floating tags" \
+  "AUDIT.md records Docker Hub exact-tag reconciliation"
+assert_contains "$AUDIT_CONTENT" "one final reconciliation repairs all eligible tags" \
+  "AUDIT.md records exact and floating repair after coalesced or dropped release events"
 assert_contains "$AUDIT_CONTENT" "ferrite-release-exact-<version>" \
   "AUDIT.md records the normalized-version job-level concurrency group"
 assert_contains "$AUDIT_CONTENT" "never uses \`--force-with-lease\`" \

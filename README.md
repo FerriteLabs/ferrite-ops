@@ -219,6 +219,20 @@ The release workflow pushes images to both GHCR and Docker Hub. To enable Docker
    - `DOCKERHUB_TOKEN` — the access token (not your password)
 3. The release workflow will automatically push to `ferritelabs/ferrite` on Docker Hub when a `v*` tag is pushed
 
+If an eligible Docker Hub mirror or a stable floating tag needs repair, request
+the default-branch reconciliation workflow with the narrowly scoped repository
+dispatch event:
+
+```bash
+gh api --method POST \
+  repos/ferritelabs/ferrite-ops/dispatches \
+  -f event_type=reconcile-release-tags
+```
+
+This workflow intentionally has no `workflow_dispatch` trigger. GitHub resolves
+`repository_dispatch` workflows from the default branch, and the job validates
+the event, ref, and workflow definition before any registry login or write.
+
 ```bash
 # Verify after release:
 docker pull ferritelabs/ferrite:latest
