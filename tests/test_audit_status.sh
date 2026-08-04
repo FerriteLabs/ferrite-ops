@@ -53,10 +53,10 @@ assert_not_contains "$AUDIT_CONTENT" "| D-01 |" "AUDIT.md no longer lists D-01 a
 assert_not_contains "$AUDIT_CONTENT" 'compiles `playground-launcher` against `crates/ferrite-studio`' \
   "AUDIT.md no longer claims the Playground uses placeholder Studio APIs"
 
-assert_contains "$AUDIT_CONTENT" "## Immutable Version Tags and Serialized Promotion Resolution" \
-  "AUDIT.md records the split exact-build / serialized-promotion resolution"
-assert_contains "$AUDIT_CONTENT" "ferrite-floating-tag-promotion" \
-  "AUDIT.md records the serialized floating-tag promotion concurrency group"
+assert_contains "$AUDIT_CONTENT" "## Immutable Version Tags and Complete-State Reconciliation Resolution" \
+  "AUDIT.md records immutable exact tags plus complete-state reconciliation"
+assert_contains "$AUDIT_CONTENT" "ferrite-release-tag-reconciliation" \
+  "AUDIT.md records the global reconciliation concurrency group"
 assert_contains "$AUDIT_CONTENT" "docker buildx imagetools create" \
   "AUDIT.md records digest promotion via imagetools compatible with cosign"
 assert_contains "$AUDIT_CONTENT" "## Release Ordering and Supersession Resolution" \
@@ -93,19 +93,19 @@ assert_contains "$AUDIT_CONTENT" "exactly \`[active-release.env]\`" \
   "AUDIT.md records the restricted ops tag trigger paths"
 
 assert_contains "$AUDIT_CONTENT" "## Exact Image Immutability and Independent Floating-Tag Resolution" \
-  "AUDIT.md records the exact-image-immutability and independent floating-tag resolution"
+  "AUDIT.md retains the exact-image-immutability resolution history"
 assert_contains "$AUDIT_CONTENT" "dev.ferritelabs.image.source-sha256" \
   "AUDIT.md records the new baked source-checksum label"
 assert_contains "$AUDIT_CONTENT" "candidate-<run id>-<run attempt>" \
   "AUDIT.md records the unique throwaway candidate tag"
 assert_contains "$AUDIT_CONTENT" "the exact tag is the last" \
   "AUDIT.md records that the exact tag is the last thing the release workflow writes"
-assert_contains "$AUDIT_CONTENT" "1.9.1\` published after \`2.0.0" \
-  "AUDIT.md records the independent floating-tag backport scenario"
+assert_contains "$AUDIT_CONTENT" "1.9.2\` published after \`2.0.2" \
+  "AUDIT.md records the complete-state backport scenario"
 assert_contains "$AUDIT_CONTENT" "29/29 discovered suites" \
   "AUDIT.md records the final 29-suite verification pass"
 
-for finding in F-54 F-55 F-56 F-57 F-58 F-59 F-60; do
+for finding in F-54 F-55 F-56 F-57 F-58 F-59 F-60 F-61; do
   assert_contains "$AUDIT_CONTENT" "| ${finding} |" \
     "AUDIT.md records release-hardening finding ${finding} as fixed"
 done
@@ -119,6 +119,10 @@ assert_contains "$AUDIT_CONTENT" "later unrelated \`main\` advance" \
   "AUDIT.md records that later main advances do not change the ops tag target"
 assert_contains "$AUDIT_CONTENT" "imjasonh/setup-crane" \
   "AUDIT.md records the pinned crane cross-registry blob copy tool"
+assert_contains "$AUDIT_CONTENT" "test_release_reconciliation.sh" \
+  "AUDIT.md records complete-state reconciliation functional coverage"
+assert_contains "$AUDIT_CONTENT" "one final reconciliation repairs all floating tags" \
+  "AUDIT.md records repair after coalesced or dropped release events"
 assert_contains "$AUDIT_CONTENT" "ferrite-release-exact-<version>" \
   "AUDIT.md records the normalized-version job-level concurrency group"
 assert_contains "$AUDIT_CONTENT" "never uses \`--force-with-lease\`" \

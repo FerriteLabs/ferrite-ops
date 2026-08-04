@@ -62,13 +62,14 @@
 | F-51 | P1 | RPM prereleases | Version sync accepted prerelease SemVer and wrote the hyphenated value directly into RPM `Version`, which is not the repository's RPM versioning policy. | Fixed; stable `x.y.z` releases update `Version` and reset `Release` to `1%{?dist}`, while prereleases explicitly skip the RPM spec byte-for-byte; stable and `0.5.0-rc.1` functional replays pass |
 | F-52 | P1 | Playground container health | `Dockerfile.playground` health depended on `/api/health`, so saturation of the public HTTP/backend path could mark a healthy private Ferrite child unhealthy. | Fixed; the image healthcheck executes `ferrite-cli -p 6380 PING` directly against the loopback child, removes the curl-only runtime dependency, and a real-image saturation probe proves the internal check still returns `PONG` when all public HTTP connection slots are occupied |
 | F-53 | P1 | HTTP database selection | `/api/execute` allowed `SELECT` even though every HTTP command uses a new backend connection, so success falsely implied database selection would persist. | Fixed; HTTP `SELECT` returns `409` with a stateless-HTTP explanation before forwarding, while one persistent public RESP connection retains `SELECT` state and a fresh RESP connection remains on database 0 |
-| F-54 | P1 | Release image metadata | Candidate build images relied on `docker/metadata-action`'s auto-derived `org.opencontainers.image.version` label, which for a bare `type=raw` candidate tag bakes in the throwaway `candidate-<run id>-<run attempt>` string rather than the real release SemVer, corrupting `check_existing`'s idempotent-match comparison and `promote-stable`'s per-tag floating version gating once promoted. | Fixed; both the GHCR and Docker Hub candidate metadata steps explicitly set `org.opencontainers.image.version` to the real normalized SemVer via metadata-action's label-overwrite input |
+| F-54 | P1 | Release image metadata | Candidate build images relied on `docker/metadata-action`'s auto-derived `org.opencontainers.image.version` label, which for a bare `type=raw` candidate tag bakes in the throwaway `candidate-<run id>-<run attempt>` string rather than the real release SemVer, corrupting exact-tag idempotency and later reconciliation metadata checks. | Fixed; both the GHCR and Docker Hub candidate metadata steps explicitly set `org.opencontainers.image.version` to the real normalized SemVer via metadata-action's label-overwrite input |
 | F-55 | P2 | Docker Hub cross-registry backfill | `promote-exact`'s optional Docker Hub backfill copied a digest from GHCR to Docker Hub with `docker buildx imagetools create`, which does not reliably copy blob content BETWEEN different registries — it can create a manifest list referencing digests that must already exist at the destination. | Fixed; the cross-registry backfill now uses a pinned `crane` (`imjasonh/setup-crane`) to perform a real all-platform blob copy, and independently re-reads the destination digest afterward to assert it is byte-identical to the verified GHCR source digest before treating the promotion as successful; the GHCR-only (same-registry) promotion is unchanged |
-| F-56 | P0 | Release transaction concurrency | `release.yml` used separate same-version locks for candidate build and exact promotion, releasing the lock while verification and smoke-test jobs ran; a duplicate run could enter that gap and race the verified promotion transaction. | Fixed; one `release-transaction` job holds `ferrite-release-exact-<version>` with `cancel-in-progress: false` through existing-tag checks, build, scan, signing/attestation, verification, smoke testing, and exact-tag promotion. Floating promotion remains separate with its own global serialization and monotonic guards |
+| F-56 | P0 | Release transaction concurrency | `release.yml` used separate same-version locks for candidate build and exact promotion, releasing the lock while verification and smoke-test jobs ran; a duplicate run could enter that gap and race the verified promotion transaction. | Fixed; one `release-transaction` job holds `ferrite-release-exact-<version>` with `cancel-in-progress: false` through existing-tag checks, build, scan, signing/attestation, verification, smoke testing, and exact-tag promotion. Floating tags are repaired separately by complete-state reconciliation |
 | F-57 | P1 | Release event/ref trust | Release version validation did not pair the triggering event with its trusted ref, so a manual or repository dispatch on a historical tag/branch could reach registry login/write work, and Cosign identity allowances were broader than the accepted event/ref pairs. | Fixed; push requires the exact `refs/tags/v<normalized-version>` candidate ref, dispatch requires `refs/heads/main` or the exact configured default branch, all checks run in `prepare` before checksum retrieval or registry-capable jobs, and the version-specific Cosign identity regexp is derived from the same trusted refs |
 | F-58 | P1 | Ops tag deterministic target | `tag-ops-release.yml` treated a later `main` advance as invalidating the path-triggered release-metadata push and carried a misleading compare-and-swap lease by including an unchanged `main` ref in the tag push. | Fixed; both jobs explicitly check out the push event's immutable `github.sha`, canonical metadata is validated at that commit, version-scoped concurrency serializes duplicates, and a normal non-force tag-only push plus local/remote existence checks prevents overwrite without consulting or rebinding to a later `main` |
 | F-59 | P2 | SemVer validation duplication | `release-orchestration.yml` and `tag-ops-release.yml` validated versions with locally duplicated, looser inline regexes instead of the shared `scripts/release-ordering.sh` validator, silently accepting a leading zero in the core or in a numeric pre-release identifier that the shared validator rejects. | Fixed; every version-accepting step in both workflows now calls `scripts/release-ordering.sh validate`, and each workflow normalizes (strips a leading `v`) exactly once, in its own `prepare`/`resolve` job |
 | F-60 | P2 | Secret-scan verification | A placeholder API-token header in `grafana/README.md` matched gitleaks curl authorization-header rule, causing the full-history CI scan to fail on known non-secret documentation. | Fixed; the live example now reads a token from `GRAFANA_API_TOKEN`, while `.gitleaks.toml` narrowly allowlists only the historical placeholder so the existing commit remains auditable without suppressing real credentials |
+| F-61 | P0 | Floating release tags | Floating tags were promoted from only the triggering release event, so dropped/coalesced events or stale/missing series could leave `latest`, major, and major.minor tags incorrect indefinitely. | Fixed; `reconcile-release-tags.yml` paginates all GHCR package versions, admits only signed immutable exact stable SemVer tags with matching digest/version/source metadata, computes every maximum through the shared strict comparator, and repairs GHCR plus an eligible digest-verified Docker Hub mirror |
 
 ## D-01 Resolution
 
@@ -400,7 +401,7 @@ Request memory bounds:
 - Verification containers, volumes, and temporary images were removed. No required external tool was
   unavailable.
 
-## Immutable Version Tags and Serialized Promotion Resolution (this change)
+## Immutable Version Tags and Complete-State Reconciliation Resolution
 
 Container releases now separate the exact, immutable version tag from the floating tags so an
 out-of-order, retried, or concurrent release can never overwrite `latest`/`<major>`/`<major>.<minor>`
@@ -408,23 +409,23 @@ with an older image:
 
 - `release.yml`'s version-locked transaction publishes a unique candidate digest first and creates the
   exact version tag only after verification; different versions still build concurrently without racing.
-- A new serialized `promote-stable` job advances the floating tags to the freshly built digest with
-  `docker buildx imagetools create` — no rebuild, and the existing cosign signature/attestations remain
-  valid because the promoted tags reference the same signed digest. It runs only for stable releases
-  (prereleases stay exact-only) and only when the candidate is `>=` the current promoted stable version.
-- The current promoted stable version is read from trustworthy registry metadata (the `latest` tag's
-  `org.opencontainers.image.version` label), never from mutable workflow input; a missing `latest` is
-  treated as the first promotion, and any other read failure aborts rather than promoting blindly.
-- The fixed `ferrite-floating-tag-promotion` concurrency group (`cancel-in-progress: false`) serializes
-  the read-compare-write, and the `>=` gate (via `scripts/release-ordering.sh`) makes an older release
-  skip promotion instead of regressing `latest`.
+- `reconcile-release-tags.yml` runs after successful exact release workflows, on manual dispatch, and on
+  a conservative weekly repair schedule. One fixed `ferrite-release-tag-reconciliation` concurrency group
+  serializes the complete enumerate/verify/plan/apply cycle; pending events may coalesce safely because no
+  run depends on one event's release version.
+- The registry-writing job always checks out the repository's reviewed default branch, including for manual
+  dispatches. GHCR package versions are retrieved with `gh api --paginate --slurp` at 100 records per page. Floating,
+  candidate, v-prefixed, invalid, and prerelease tags are rejected as sources. Every exact stable source
+  must resolve to its API digest, carry consistent exact-version and one identical source-SHA label on every platform,
+  and pass the release workflow's Cosign identity verification. Selected sources are re-resolved and re-verified
+  immediately before each GHCR or Docker Hub mutation, so deletion of a separate signature artifact cannot exploit
+  a plan/apply time-of-check/time-of-use gap.
 - `scripts/release-ordering.sh` is the shared SemVer-precedence engine (`semver-cmp`/`ge`/`classify`),
-  with strict input validation so untrusted payloads cannot inject shell metacharacters.
-  `tests/test_release_ordering.sh` (24 checks) covers numeric and pre-release precedence, the `ge`
-  contract, all four `classify` outcomes, and injection rejection. `tests/test_release_promotion.sh`
-  (22 checks) statically verifies the split/serialized/imagetools architecture and functionally replays
-  promotion for `0.4.1` then a late `0.4.0`, equal retries, serialized concurrent candidates,
-  dual-registry promotion, and prerelease rejection.
+  and `scripts/reconcile-release-tags.py` delegates every validation/comparison to it while purely computing
+  the maxima for stable overall (`latest`), every major, and every major.minor series.
+- GHCR floating tags are applied to the selected signed digests without rebuilding and verified afterward.
+  Docker Hub runs only when explicitly enabled with both credentials, copies each selected GHCR digest with
+  `crane copy`, and independently verifies the destination digest.
 
 ## Release Ordering and Supersession Resolution (this change)
 
@@ -580,26 +581,26 @@ which would incorrectly skip a legitimate backport to an older series.
   registry-level retention/cleanup of `candidate-*` tags is a documented follow-up rather than implemented
   here, since it is a registry-hygiene concern, not a correctness gap — a candidate tag is never treated
   as, confused with, or promotable in place of, an exact release tag.
-- `promote-stable` now independently resolves and gates each of `latest`, `<major>`, and `<major>.<minor>`
-  against its OWN currently promoted version (`Resolve current per-tag promoted versions` /
-  `Promote floating tags to this digest`, replacing the previous single bundled `latest`-only gate).
-  A backport release (e.g. `1.9.1` published after `2.0.0`) now correctly leaves `latest` alone (`1.9.1` <
-  `2.0.0`) while still independently advancing `1` and `1.9` because `1.9.1` is newer than whatever they
-  currently point at.
+- Complete-state reconciliation independently computes each of `latest`, `<major>`, and `<major>.<minor>`
+  from all trusted exact tags. A backport (for example `1.9.2` published after `2.0.2`) leaves `latest`,
+  `2`, and `2.0` on `2.0.2` while selecting `1.9.2` for both `1` and `1.9`; a previously missing `1.8`
+  series is created from its own maximum in the same run.
 - `tests/test_exact_image_immutability.sh` (46 checks) functionally replays `check_existing` (first
   publish, verified idempotent match, mismatched version/checksum labels, an unsigned existing tag) and
   exact promotion (first publish, idempotent retry, a simulated concurrent same-version run, a digest
   mismatch on GHCR and independently on Docker Hub, a matching Docker Hub tag, a missing Docker Hub tag
   backfilled from verified GHCR, and invalid version/digest input) against a stateful fake registry and
   fake `cosign`.
-  `tests/test_release_promotion.sh` (32 checks) is rewritten for independent per-tag gating and adds the
-  exact 1.9.1-after-2.0.0 backport scenario, proving `latest` is skipped while `1` and `1.9` still advance.
+  `tests/test_release_reconciliation.sh` (63 checks) covers two paginated GHCR fixture pages, three rapid
+  releases, a backport, prerelease/candidate/floating rejection, missing series, unsigned exact sources,
+  stale GHCR/Docker Hub tags, and digest mismatches. Its functional replay deliberately drops every
+  intermediate release event and proves one final reconciliation repairs all floating tags.
   `tests/test_release_workflows.sh` is updated throughout for the candidate-tag build target.
 
 ## Final Verification Pass (trusted supersession, exact-image immutability, strict SemVer, independent floating tags)
 
-- `bash tests/run.sh` passes all 29/29 discovered suites, including the new `test_exact_image_immutability.sh`
-  and the rewritten `test_release_promotion.sh`, `test_release_workflows.sh`, `test_version_sync_ordering.sh`,
+- `bash tests/run.sh` passes all 29/29 discovered suites, including `test_exact_image_immutability.sh`,
+  `test_release_reconciliation.sh`, `test_release_workflows.sh`, `test_version_sync_ordering.sh`,
   `test_ops_release_tag_workflow.sh`, `test_version_supersession.sh`, and `test_release_ordering.sh`.
 - `actionlint .github/workflows/*.yml` passes with no findings, including the rewritten `release.yml`,
   `version-sync.yml`, `version-supersession.yml`, and `tag-ops-release.yml`.
@@ -620,14 +621,13 @@ This pass supersedes the earlier split-lock and unchanged-main-lease design whil
 metadata, cross-registry copy, strict SemVer, and secret-scan fixes from F-54/F-55/F-59/F-60.
 
 - **F-56 (full per-version transaction lock).** `release.yml` now has only `prepare`, one
-  `release-transaction`, and the independently serialized `promote-stable` job. The transaction uses
+  `release-transaction`, and no event-specific floating promotion job. The transaction uses
   `ferrite-release-exact-<version>` with `cancel-in-progress: false` and keeps that one lock from the
   existing-exact-tag check through candidate build, Trivy scan, Cosign signing/SBOM/SLSA attestation,
   signature and attestation verification, live smoke testing, and the final exact-tag read/compare/write.
   There is no separate build or exact-promotion job and therefore no interval in which a duplicate run can
-  enter after build serialization has ended but before a verified promotion completes. Floating tags remain
-  after exact success under `ferrite-floating-tag-promotion`, with independent per-tag registry-metadata
-  comparisons that prevent an older or out-of-order release from regressing `latest`, major, or major.minor.
+  enter after build serialization has ended but before a verified promotion completes. Floating tags are
+  derived afterward from the complete set of verified exact stable tags, not from this transaction's event.
 - **F-57 (event/ref trust pairing).** The trusted `prepare` step now validates the event/ref pair before
   checksum retrieval and before the registry-capable transaction can start. A push is accepted only when both
   the tag name and full ref are exactly `v<normalized-version>` / `refs/tags/v<normalized-version>`.
@@ -644,17 +644,18 @@ metadata, cross-registry copy, strict SemVer, and secret-scan fixes from F-54/F-
   unrelated `main` advance therefore cannot change the deterministic target, while duplicate same-version
   events cannot overwrite or rebind the existing annotated tag.
 
-Release-focused functional coverage now includes 192 checks in `tests/test_release_workflows.sh`, 46 checks in
-`tests/test_exact_image_immutability.sh`, 36 checks in `tests/test_ops_release_tag_workflow.sh`, and 32 checks in
-`tests/test_release_promotion.sh`. The tests extract and replay the real shell steps, including manual dispatch
+Release-focused functional coverage now includes 196 checks in `tests/test_release_workflows.sh`, 46 checks in
+`tests/test_exact_image_immutability.sh`, 36 checks in `tests/test_ops_release_tag_workflow.sh`, and 63 checks in
+`tests/test_release_reconciliation.sh`. The tests extract and replay the real shell steps, including manual dispatch
 from a tag rejection before checksum access, a push-ref/candidate mismatch, non-main configured default-branch
 acceptance, exact transaction step ordering, later unrelated `main` advancement, duplicate tag non-overwrite,
-idempotent/mismatched exact image behavior, cross-registry backfill, and floating-tag monotonicity.
+idempotent/mismatched exact image behavior, cross-registry backfill, paginated exact-tag discovery, and
+single-run repair after coalesced/dropped release events.
 
 ## Final Verification Pass (deterministic ops tags, paired release trust, full transaction lock)
 
 - `bash tests/test_release_workflows.sh`, `bash tests/test_exact_image_immutability.sh`,
-  `bash tests/test_ops_release_tag_workflow.sh`, and `bash tests/test_release_promotion.sh` pass.
+  `bash tests/test_ops_release_tag_workflow.sh`, and `bash tests/test_release_reconciliation.sh` pass.
 - `bash tests/run.sh` passes all 29/29 discovered suites.
 - `shellcheck --severity=warning scripts/*.sh tests/*.sh tests/lib/*.sh` and
   `actionlint .github/workflows/*.yml` pass with no findings.
