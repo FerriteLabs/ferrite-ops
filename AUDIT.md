@@ -713,10 +713,13 @@ directly AS the release's checksum whenever one was supplied, never downloading 
 the real tagged source at all.
 
 - **Shared multi-platform exact-tag label verification.** `scripts/verify-exact-image-labels.sh` is a new,
-  independently tested helper that normalizes `docker buildx imagetools inspect ... --format
-  '{{json .Image}}'` output — a single-platform `{"config": {...}}` object OR a multi-platform map of
-  `"<platform>": {"config": {...}}` — into a list of every platform's labels and requires ALL of them,
-  not just the first, to satisfy one of two modes:
+  independently tested helper that consumes both `docker buildx imagetools inspect ... --format
+  '{{json .Manifest}}'` descriptor metadata and `--format '{{json .Image}}'` config data. It excludes only
+  descriptors explicitly marked `vnd.docker.reference.type=attestation-manifest` (BuildKit provenance/SBOM
+  entries appear as synthetic `unknown/unknown` images without runtime labels), then normalizes a
+  single-platform `{"config": {...}}` object OR the remaining multi-platform
+  `"<platform>": {"config": {...}}` map into a list of every real runtime platform's labels and requires
+  ALL of them, not just the first, to satisfy one of two modes:
   - `exact <version> <sha256>`: every platform's `org.opencontainers.image.version` and
     `dev.ferritelabs.image.source-sha256` labels must equal the caller's specific known-correct values
     exactly. `release.yml`'s "Check existing exact GHCR tag" step now delegates to this mode with its own
@@ -733,16 +736,17 @@ the real tagged source at all.
   Both workflows' previously independently-written jq (one first-platform-only, one already
   all-platforms) are replaced by calls to this ONE shared script, so the two call sites can never drift
   again on what "this exact tag's labels are trustworthy" means. `tests/test_verify_exact_image_labels.sh`
-  (26 checks) exercises the shared helper directly against fixtures under
+  (30 checks) exercises the shared helper directly against fixtures under
   `tests/fixtures/verify-exact-image-labels/` covering a matching amd64+arm64 manifest, one platform with
   a mismatched version label, one platform with a mismatched checksum label, one platform missing its
   labels entirely, a single-platform image (both matching and mismatched), an empty (zero-platform)
-  image, and malformed input JSON — for both `exact` and `consistent` modes, plus usage/argument
-  validation and static wiring assertions against both workflows. `tests/test_exact_image_immutability.sh`
+  image, malformed input JSON, and matching/mismatched amd64+arm64 images with descriptor-marked
+  provenance/SBOM entries — for both `exact` and `consistent` modes, plus usage/argument validation and
+  static wiring assertions against both workflows. `tests/test_exact_image_immutability.sh`
   and `tests/test_release_reconciliation.sh` each gained real, end-to-end multi-platform
-  match/mismatched-platform/missing-label functional cases that extend their existing fake-registry
-  fixtures to return a genuine multi-platform `.Image` payload and replay the real, extracted workflow
-  step against it.
+  match/mismatched-platform/missing-label functional cases, plus a production-shaped attestation case,
+  that extend their existing fake-registry fixtures to return paired `.Manifest`/`.Image` payloads and
+  replay the real, extracted workflow step against them.
 
 - **Canonical source-checksum truth.** `scripts/compute-source-checksum.sh` is a new, independently tested
   helper that is now the ONLY place any release workflow downloads and hashes the tagged Ferrite source
@@ -778,8 +782,8 @@ the real tagged source at all.
 ## Final Verification Pass (multi-platform exact-tag labels and canonical checksum truth)
 
 - `bash tests/test_release_workflows.sh` (208 checks), `bash tests/test_exact_image_immutability.sh`
-  (55 checks), `bash tests/test_release_reconciliation.sh` (104 checks),
-  `bash tests/test_verify_exact_image_labels.sh` (26 checks, new), and
+  (56 checks), `bash tests/test_release_reconciliation.sh` (105 checks),
+  `bash tests/test_verify_exact_image_labels.sh` (30 checks, new), and
   `bash tests/test_compute_source_checksum.sh` (24 checks, new) all pass; `bash tests/test_audit_status.sh`
   passes.
 - `bash tests/run.sh` passes all 31/31 discovered suites (29 previous + the 2 new dedicated suites above).
@@ -789,7 +793,8 @@ the real tagged source at all.
   workflows (`release.yml`, `reconcile-release-tags.yml`, `version-sync.yml`, `release-orchestration.yml`).
 - `helm lint --strict` passes for both charts (unchanged by this change); D-02 remains the only deferred
   item.
-- `gitleaks detect --source . --no-git -v` reports no leaks in the working tree.
+- `gitleaks detect --source . --no-git -v` reports no leaks in the working tree, and
+  `gitleaks detect --source . --verbose --redact` reports no leaks across full history.
 - No production behavior outside the exact-tag label verification and source-checksum computation paths
   in these four workflows was changed; existing candidate-build, signing, attestation, smoke-test,
   Docker Hub, and floating-tag-reconciliation behavior is unchanged and still green.
