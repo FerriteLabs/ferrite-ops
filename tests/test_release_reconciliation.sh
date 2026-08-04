@@ -13,6 +13,7 @@ RECONCILE_YML="${REPO_ROOT}/.github/workflows/reconcile-release-tags.yml"
 HELPER="${REPO_ROOT}/scripts/reconcile-release-tags.py"
 ORDER="${REPO_ROOT}/scripts/release-ordering.sh"
 LABELS="${REPO_ROOT}/scripts/verify-exact-image-labels.sh"
+METADATA="${REPO_ROOT}/scripts/inspect-exact-image-metadata.sh"
 FIXTURE="${HERE}/fixtures/release-reconciliation/ghcr-pages.json"
 RELEASE_CONTENT="$(cat "$RELEASE_YML")"
 RECONCILE_CONTENT="$(cat "$RECONCILE_YML")"
@@ -54,6 +55,8 @@ assert_contains "$RECONCILE_CONTENT" "cosign verify" \
   "every exact source digest is signature-verified"
 assert_contains "$RECONCILE_CONTENT" "LABELS_SCRIPT: scripts/verify-exact-image-labels.sh" \
   "reconcile-release-tags.yml wires in the shared exact-tag label verification helper"
+assert_contains "$RECONCILE_CONTENT" "METADATA_SCRIPT: scripts/inspect-exact-image-metadata.sh" \
+  "reconcile-release-tags.yml wires in the shared digest-pinned metadata helper"
 assert_contains "$RECONCILE_CONTENT" 'bash "$LABELS_SCRIPT" consistent "$VERSION"' \
   "reconcile-release-tags.yml verifies each exact source's labels via the shared helper in 'consistent' mode"
 LABELS_SCRIPT_CONTENT="$(cat "${REPO_ROOT}/scripts/verify-exact-image-labels.sh")"
@@ -417,10 +420,18 @@ state_set() {
   # runtime platform configs plus descriptor-marked provenance/SBOM entries.
   local ref="$1" digest="$2" version="${3:-state}" source_sha="${4:-state}"
   local image_file="${5:--}" manifest_file="${6:--}"
+  local image pinned_ref
+  image="${ref%:*}"
+  pinned_ref="${image}@${digest}"
   awk -v ref="$ref" '$1 != ref' "$REGISTRY_STATE" >"${REGISTRY_STATE}.tmp" || true
   mv "${REGISTRY_STATE}.tmp" "$REGISTRY_STATE"
   printf '%s %s %s %s %s %s\n' \
     "$ref" "$digest" "$version" "$source_sha" "$image_file" "$manifest_file" \
+    >>"$REGISTRY_STATE"
+  awk -v ref="$pinned_ref" '$1 != ref' "$REGISTRY_STATE" >"${REGISTRY_STATE}.tmp" || true
+  mv "${REGISTRY_STATE}.tmp" "$REGISTRY_STATE"
+  printf '%s %s %s %s %s %s\n' \
+    "$pinned_ref" "$digest" "$version" "$source_sha" "$image_file" "$manifest_file" \
     >>"$REGISTRY_STATE"
 }
 
@@ -454,7 +465,7 @@ if (
   export PATH="${FAKE_BIN}:${PATH}"
   export REGISTRY_STATE SIGNED_DIGESTS
   export GHCR_IMAGE REPOSITORY="ferritelabs/ferrite-ops" DEFAULT_BRANCH="main"
-  export HELPER ORDER_SCRIPT="$ORDER" LABELS_SCRIPT="$LABELS"
+  export HELPER ORDER_SCRIPT="$ORDER" METADATA_SCRIPT="$METADATA" LABELS_SCRIPT="$LABELS"
   bash "$VERIFY_SCRIPT"
 ) >"${TMP}/verify.log" 2>&1; then
   harness_ok "all discovered exact sources pass digest, metadata, and signature verification"
@@ -474,7 +485,7 @@ if (
   export PATH="${FAKE_BIN}:${PATH}"
   export REGISTRY_STATE SIGNED_DIGESTS
   export GHCR_IMAGE REPOSITORY="ferritelabs/ferrite-ops" DEFAULT_BRANCH="main"
-  export HELPER ORDER_SCRIPT="$ORDER" LABELS_SCRIPT="$LABELS"
+  export HELPER ORDER_SCRIPT="$ORDER" METADATA_SCRIPT="$METADATA" LABELS_SCRIPT="$LABELS"
   bash "$VERIFY_SCRIPT"
 ) >"${TMP}/unsigned.log" 2>&1; then
   harness_fail "verification accepted an unsigned exact stable source"
@@ -494,7 +505,7 @@ if (
   export PATH="${FAKE_BIN}:${PATH}"
   export REGISTRY_STATE SIGNED_DIGESTS
   export GHCR_IMAGE REPOSITORY="ferritelabs/ferrite-ops" DEFAULT_BRANCH="main"
-  export HELPER ORDER_SCRIPT="$ORDER" LABELS_SCRIPT="$LABELS"
+  export HELPER ORDER_SCRIPT="$ORDER" METADATA_SCRIPT="$METADATA" LABELS_SCRIPT="$LABELS"
   bash "$VERIFY_SCRIPT"
 ) >"${TMP}/metadata-mismatch.log" 2>&1; then
   harness_fail "verification accepted an exact tag with mismatched version metadata"
@@ -524,7 +535,7 @@ if (
   export PATH="${FAKE_BIN}:${PATH}"
   export REGISTRY_STATE SIGNED_DIGESTS
   export GHCR_IMAGE REPOSITORY="ferritelabs/ferrite-ops" DEFAULT_BRANCH="main"
-  export HELPER ORDER_SCRIPT="$ORDER" LABELS_SCRIPT="$LABELS"
+  export HELPER ORDER_SCRIPT="$ORDER" METADATA_SCRIPT="$METADATA" LABELS_SCRIPT="$LABELS"
   bash "$VERIFY_SCRIPT"
 ) >"${TMP}/multi-match.log" 2>&1; then
   harness_ok "verification passes when every platform (amd64+arm64) of a multi-platform exact source reports matching version and source-checksum labels"
@@ -563,7 +574,7 @@ if (
   export PATH="${FAKE_BIN}:${PATH}"
   export REGISTRY_STATE SIGNED_DIGESTS
   export GHCR_IMAGE REPOSITORY="ferritelabs/ferrite-ops" DEFAULT_BRANCH="main"
-  export HELPER ORDER_SCRIPT="$ORDER" LABELS_SCRIPT="$LABELS"
+  export HELPER ORDER_SCRIPT="$ORDER" METADATA_SCRIPT="$METADATA" LABELS_SCRIPT="$LABELS"
   bash "$VERIFY_SCRIPT"
 ) >"${TMP}/attestation-match.log" 2>&1; then
   harness_ok "verification ignores descriptor-marked attestations while checking every real platform"
@@ -587,7 +598,7 @@ if (
   export PATH="${FAKE_BIN}:${PATH}"
   export REGISTRY_STATE SIGNED_DIGESTS
   export GHCR_IMAGE REPOSITORY="ferritelabs/ferrite-ops" DEFAULT_BRANCH="main"
-  export HELPER ORDER_SCRIPT="$ORDER" LABELS_SCRIPT="$LABELS"
+  export HELPER ORDER_SCRIPT="$ORDER" METADATA_SCRIPT="$METADATA" LABELS_SCRIPT="$LABELS"
   bash "$VERIFY_SCRIPT"
 ) >"${TMP}/multi-mismatch.log" 2>&1; then
   harness_fail "verification incorrectly accepted a multi-platform exact source with a mismatched arm64 source-checksum label"
@@ -608,7 +619,7 @@ if (
   export PATH="${FAKE_BIN}:${PATH}"
   export REGISTRY_STATE SIGNED_DIGESTS
   export GHCR_IMAGE REPOSITORY="ferritelabs/ferrite-ops" DEFAULT_BRANCH="main"
-  export HELPER ORDER_SCRIPT="$ORDER" LABELS_SCRIPT="$LABELS"
+  export HELPER ORDER_SCRIPT="$ORDER" METADATA_SCRIPT="$METADATA" LABELS_SCRIPT="$LABELS"
   bash "$VERIFY_SCRIPT"
 ) >"${TMP}/digest-mismatch.log" 2>&1; then
   harness_fail "verification accepted GHCR API and registry digest disagreement"

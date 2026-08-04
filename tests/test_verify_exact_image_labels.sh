@@ -19,6 +19,7 @@ REPO_ROOT="$(cd "${HERE}/.." && pwd)"
 source "${HERE}/lib/harness.sh"
 
 SCRIPT="${REPO_ROOT}/scripts/verify-exact-image-labels.sh"
+METADATA_SCRIPT="${REPO_ROOT}/scripts/inspect-exact-image-metadata.sh"
 FIXTURES="${HERE}/fixtures/verify-exact-image-labels"
 RELEASE_YML="${REPO_ROOT}/.github/workflows/release.yml"
 RECONCILE_YML="${REPO_ROOT}/.github/workflows/reconcile-release-tags.yml"
@@ -233,18 +234,22 @@ assert_eq "$UNKNOWN_EXIT" "$?" \
 # --- Wiring: both workflows delegate to this one shared script -------------
 assert_contains "$(cat "$RELEASE_YML")" "LABELS_SCRIPT: scripts/verify-exact-image-labels.sh" \
   "release.yml wires in the shared exact-tag label verification helper"
+assert_contains "$(cat "$RELEASE_YML")" "METADATA_SCRIPT: scripts/inspect-exact-image-metadata.sh" \
+  "release.yml wires in the shared digest-pinned metadata helper"
 assert_contains "$(cat "$RELEASE_YML")" 'bash "$LABELS_SCRIPT" exact "$VERSION" "$SHA256"' \
   "release.yml invokes the shared helper in 'exact' mode with its own known-correct labels"
 assert_contains "$(cat "$RECONCILE_YML")" "LABELS_SCRIPT: scripts/verify-exact-image-labels.sh" \
   "reconcile-release-tags.yml wires in the shared exact-tag label verification helper"
+assert_contains "$(cat "$RECONCILE_YML")" "METADATA_SCRIPT: scripts/inspect-exact-image-metadata.sh" \
+  "reconcile-release-tags.yml wires in the shared digest-pinned metadata helper"
 assert_contains "$(cat "$RECONCILE_YML")" 'bash "$LABELS_SCRIPT" consistent "$VERSION"' \
   "reconcile-release-tags.yml invokes the shared helper in 'consistent' mode (no independently known canonical checksum)"
 
 if command -v shellcheck >/dev/null 2>&1; then
-  if shellcheck --severity=warning "$SCRIPT"; then
-    harness_ok "shellcheck accepts the shared exact-tag label verification helper"
+  if shellcheck --severity=warning "$SCRIPT" "$METADATA_SCRIPT"; then
+    harness_ok "shellcheck accepts the shared exact-tag metadata helpers"
   else
-    harness_fail "shellcheck rejected the shared exact-tag label verification helper"
+    harness_fail "shellcheck rejected a shared exact-tag metadata helper"
   fi
 else
   echo "  skip: shellcheck not available."

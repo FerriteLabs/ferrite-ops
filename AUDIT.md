@@ -72,6 +72,7 @@
 | F-61 | P0 | Floating release tags | Floating tags were promoted from only the triggering release event, so dropped/coalesced events or stale/missing series could leave `latest`, major, and major.minor tags incorrect indefinitely. | Fixed; `reconcile-release-tags.yml` paginates all GHCR package versions, admits only signed immutable exact stable SemVer tags with matching digest/version/source metadata, computes every maximum through the shared strict comparator, and repairs GHCR plus an eligible digest-verified Docker Hub mirror |
 | F-62 | P0 | Reconciliation manual trigger | Privileged `workflow_dispatch` let a user select an arbitrary branch containing a modified reconciliation workflow, so default-branch checkout of the helper did not prevent attacker-controlled pre-checkout or workflow-defined registry steps. | Fixed; manual repair is exposed only as the narrowly named `reconcile-release-tags` `repository_dispatch`, which GitHub resolves from the default branch. An initial no-credential step validates the event type/action, default-branch ref, and exact default-branch `github.workflow_ref` before checkout, registry login, or writes; `workflow_dispatch` is absent |
 | F-63 | P0 | Docker Hub exact-tag certainty | Eligible exact releases treated ambiguous Docker Hub inspection failures as optional success, and scheduled reconciliation repaired only floating tags, so auth/network/rate-limit failures or a missed initial mirror could leave exact tags absent without failing or later repair. | Fixed; eligible Docker Hub exact-tag inspection now succeeds only on a verified digest match or a positively identified missing tag, with every other state fatal. Missing exact tags are copied from the signed, metadata-verified GHCR digest using `crane copy` and digest-verified; reconciliation audits all exact stable tags plus floating tags, no-ops on matches, refuses mismatched immutable exact tags, repairs floating mismatches, and fails closed on ambiguous inspection/verification errors |
+| F-64 | P0 | Exact-image metadata TOCTOU | `release.yml` and `reconcile-release-tags.yml` resolved an exact tag's manifest digest, then fetched its multi-platform `.Image` config/label view through the mutable tag again, so a tag move between requests could combine one object's digest/signature with another object's metadata. | Fixed; `scripts/inspect-exact-image-metadata.sh` resolves the tag once and performs every subsequent platform/config inspection through `IMAGE@DIGEST`. Both workflows consume that one payload and keep signature, attestation verification, metadata, copies, and recorded digest bound to the same immutable object; reconciliation's pre-apply source checks are digest-pinned too |
 
 ## D-01 Resolution
 
@@ -798,6 +799,53 @@ the real tagged source at all.
 - No production behavior outside the exact-tag label verification and source-checksum computation paths
   in these four workflows was changed; existing candidate-build, signing, attestation, smoke-test,
   Docker Hub, and floating-tag-reconciliation behavior is unchanged and still green.
+
+## Digest-Pinned Exact-Image Metadata Resolution (this change)
+
+The exact-tag verification paths still contained a registry TOCTOU gap after the multi-platform label
+hardening above. Both `release.yml` and `reconcile-release-tags.yml` first requested
+`IMAGE:VERSION --format '{{json .Manifest}}'` and recorded its digest, but then requested
+`IMAGE:VERSION --format '{{json .Image}}'` again for platform configs and labels. If the tag moved
+between those requests, the workflow could verify labels from a different object than the digest later
+used for signature/attestation verification, copying, promotion, or recorded desired state.
+
+- `scripts/inspect-exact-image-metadata.sh` is now the shared resolver for both workflows. Its only
+  tag-based registry request resolves the exact tag's manifest digest. It validates that digest, reads
+  the `.Image` platform/config view through `IMAGE@DIGEST`, and returns one JSON payload containing the
+  digest, manifest descriptors, and pinned image metadata. The existing
+  `scripts/verify-exact-image-labels.sh` consumes that same payload, so attestation-descriptor filtering
+  and every runtime platform label check apply to the immutable object selected by the first request.
+- `release.yml` carries the returned digest through existing signature and SBOM-attestation
+  verification, smoke testing, exact-tag promotion, optional cross-registry copy, and its
+  `existing_digest`/artifact output. `reconcile-release-tags.yml` records the same returned digest,
+  signature-verifies and copies `GHCR_IMAGE@DIGEST`, and now performs both pre-apply source availability
+  checks through `GHCR_IMAGE@DIGEST` rather than re-reading `GHCR_IMAGE:VERSION`.
+- `tests/fixtures/inspect-exact-image-metadata/moving-tag.json` models an exact tag that resolves to
+  object A on the manifest request and points to differently labeled object B before the image metadata
+  request. `tests/test_inspect_exact_image_metadata.sh` proves the shared resolver requests
+  `IMAGE:TAG` exactly once, then requests `IMAGE@A` for `.Image`, returns only object A's metadata, and
+  feeds a valid pinned payload to the shared label verifier. The existing release and reconciliation
+  fake registries now preserve digest-addressed objects independently of tags, so their extracted
+  workflow-step replays exercise the production digest-pinned path.
+
+## Final Verification Pass (digest-pinned exact-image metadata)
+
+- Release-focused suites pass: `bash tests/test_release_workflows.sh`,
+  `bash tests/test_exact_image_immutability.sh` (57 checks),
+  `bash tests/test_release_reconciliation.sh` (106 checks),
+  `bash tests/test_verify_exact_image_labels.sh` (32 checks), and
+  `bash tests/test_inspect_exact_image_metadata.sh` (14 checks, new).
+- `bash tests/run.sh` passes all 32/32 discovered suites.
+- `shellcheck --severity=warning scripts/*.sh tests/*.sh tests/lib/*.sh` and
+  `actionlint .github/workflows/*.yml` pass with no findings.
+- `cargo fmt --manifest-path playground-launcher/Cargo.toml --check`,
+  `cargo clippy --manifest-path playground-launcher/Cargo.toml --all-targets -- -D warnings`, and
+  `cargo test --manifest-path playground-launcher/Cargo.toml` pass (76/76 tests).
+- `helm lint --strict` and `helm template` pass for both charts, including the primary chart HA render.
+- Trivy reports zero HIGH/CRITICAL Dockerfile misconfigurations and zero HIGH/CRITICAL fixed
+  vulnerabilities in `ferrite:verification`; both gitleaks working-tree and full-history scans pass.
+- `docker build -t ferrite:verification .` succeeds, and the resulting `ferrite` and `ferrite-cli`
+  binaries both execute and report v0.4.0. D-02 remains the only deferred item.
 
 ## Deferred Items
 

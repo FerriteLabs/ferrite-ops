@@ -175,6 +175,7 @@ jobs:
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
           HELPER: scripts/reconcile-release-tags.py
           ORDER_SCRIPT: scripts/release-ordering.sh
+          METADATA_SCRIPT: scripts/inspect-exact-image-metadata.sh
           LABELS_SCRIPT: scripts/verify-exact-image-labels.sh
         run: |
           set -euo pipefail
@@ -183,9 +184,8 @@ jobs:
           while IFS=$'\t' read -r VERSION API_DIGEST; do
             [ -n "$VERSION" ] || continue
 
-            MANIFEST_JSON="$(docker buildx imagetools inspect \
-              "${GHCR_IMAGE}:${VERSION}" --format '{{json .Manifest}}')"
-            RESOLVED_DIGEST="$(printf '%s' "$MANIFEST_JSON" | jq -r '.digest // empty')"
+            METADATA_JSON="$(bash "$METADATA_SCRIPT" "$GHCR_IMAGE" "$VERSION")"
+            RESOLVED_DIGEST="$(printf '%s' "$METADATA_JSON" | jq -r '.digest // empty')"
             if [ "$RESOLVED_DIGEST" != "$API_DIGEST" ]; then
               echo "::error::Exact tag ${VERSION} resolved to ${RESOLVED_DIGEST:-<none>}, not GHCR API digest ${API_DIGEST}."
               exit 1
@@ -198,13 +198,10 @@ jobs:
             # "consistent" mode: every platform must agree with every other
             # platform on a well-formed source-checksum label, and every
             # platform's version label must equal this exact tag's own name.
-            RAW_IMAGE="$(docker buildx imagetools inspect \
-              "${GHCR_IMAGE}:${VERSION}" --format '{{json .Image}}')"
-            LABEL_PAYLOAD="$(jq -cn \
-              --argjson manifest "$MANIFEST_JSON" \
-              --argjson image "$RAW_IMAGE" \
-              '{manifest: $manifest, image: $image}')"
-            if ! printf '%s' "$LABEL_PAYLOAD" |
+            # The shared metadata helper resolved the tag once and read every
+            # platform/config label through GHCR_IMAGE@RESOLVED_DIGEST, so a
+            # tag move between registry requests cannot mix two objects.
+            if ! printf '%s' "$METADATA_JSON" |
               bash "$LABELS_SCRIPT" consistent "$VERSION"; then
               echo "::error::Exact tag ${VERSION} has missing, inconsistent, or invalid version/source metadata across its platform(s)."
               exit 1
@@ -272,12 +269,12 @@ jobs:
           while IFS=$'\t' read -r TAG VERSION DIGEST; do
             [ -n "$TAG" ] || continue
 
-            # Re-read the immutable exact source immediately before mutation.
+            # Re-read the planned immutable object immediately before mutation.
             SOURCE_DIGEST="$(docker buildx imagetools inspect \
-              "${GHCR_IMAGE}:${VERSION}" \
+              "${GHCR_IMAGE}@${DIGEST}" \
               --format '{{json .Manifest}}' | jq -r '.digest // empty')"
             if [ "$SOURCE_DIGEST" != "$DIGEST" ]; then
-              echo "::error::Exact source ${VERSION} changed during reconciliation (${SOURCE_DIGEST:-<none>} != ${DIGEST}); refusing to apply a stale plan."
+              echo "::error::Pinned exact source ${VERSION} could not be re-resolved during reconciliation (${SOURCE_DIGEST:-<none>} != ${DIGEST}); refusing to apply the plan."
               exit 1
             fi
 
@@ -328,10 +325,10 @@ jobs:
             [ -n "$TAG" ] || continue
 
             SOURCE_DIGEST="$(docker buildx imagetools inspect \
-              "${GHCR_IMAGE}:${VERSION}" \
+              "${GHCR_IMAGE}@${DIGEST}" \
               --format '{{json .Manifest}}' | jq -r '.digest // empty')"
             if [ "$SOURCE_DIGEST" != "$DIGEST" ]; then
-              echo "::error::Exact source ${VERSION} changed before Docker Hub reconciliation (${SOURCE_DIGEST:-<none>} != ${DIGEST}); refusing to apply a stale plan."
+              echo "::error::Pinned exact source ${VERSION} could not be re-resolved before Docker Hub reconciliation (${SOURCE_DIGEST:-<none>} != ${DIGEST}); refusing to apply the plan."
               exit 1
             fi
 

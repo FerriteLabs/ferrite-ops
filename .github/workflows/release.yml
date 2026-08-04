@@ -365,6 +365,7 @@ jobs:
           VERSION: ${{ needs.prepare.outputs.version }}
           SHA256: ${{ needs.prepare.outputs.sha256 }}
           CERTIFICATE_IDENTITY_REGEXP: ${{ needs.prepare.outputs.certificate_identity_regexp }}
+          METADATA_SCRIPT: scripts/inspect-exact-image-metadata.sh
           LABELS_SCRIPT: scripts/verify-exact-image-labels.sh
         run: |
           set -euo pipefail
@@ -372,8 +373,8 @@ jobs:
           ERR_LOG="$(mktemp)"
           trap 'rm -f "$ERR_LOG"' EXIT
 
-          MANIFEST_JSON=""
-          if ! MANIFEST_JSON="$(docker buildx imagetools inspect "${GHCR_IMAGE}:${VERSION}" --format '{{json .Manifest}}' 2>"$ERR_LOG")"; then
+          METADATA_JSON=""
+          if ! METADATA_JSON="$(bash "$METADATA_SCRIPT" "$GHCR_IMAGE" "$VERSION" 2>"$ERR_LOG")"; then
             if grep -qiE 'not found|manifest unknown|no such manifest|MANIFEST_UNKNOWN' "$ERR_LOG"; then
               echo "::notice::No existing ${GHCR_IMAGE}:${VERSION} tag; this is the first publish of this exact version."
               echo "idempotent=false" >> "$GITHUB_OUTPUT"
@@ -385,24 +386,21 @@ jobs:
             exit 1
           fi
 
-          MANIFEST_DIGEST="$(printf '%s' "$MANIFEST_JSON" | jq -r '.digest // empty')"
+          MANIFEST_DIGEST="$(printf '%s' "$METADATA_JSON" | jq -r '.digest // empty')"
           if [ -z "$MANIFEST_DIGEST" ]; then
             echo "::error::${GHCR_IMAGE}:${VERSION} exists but its manifest digest could not be determined."
             exit 1
           fi
-          RAW_IMAGE="$(docker buildx imagetools inspect "${GHCR_IMAGE}:${VERSION}" --format '{{json .Image}}')"
-          LABEL_PAYLOAD="$(jq -cn \
-            --argjson manifest "$MANIFEST_JSON" \
-            --argjson image "$RAW_IMAGE" \
-            '{manifest: $manifest, image: $image}')"
 
           # Shared with reconcile-release-tags.yml's own exact-source
-          # verification step so the two workflows cannot drift. The helper
-          # uses descriptor metadata from `.Manifest` to exclude only
-          # BuildKit provenance/SBOM attestation entries, then requires EVERY
-          # runtime platform config in `.Image` to carry this run's exact
-          # version/checksum labels.
-          if ! printf '%s' "$LABEL_PAYLOAD" |
+          # verification step so the two workflows cannot drift. Metadata was
+          # resolved once above and its `.Image` platform/config view was read
+          # through GHCR_IMAGE@MANIFEST_DIGEST, never the mutable tag. The
+          # label helper uses descriptor metadata from `.Manifest` to exclude
+          # only BuildKit provenance/SBOM attestation entries, then requires
+          # EVERY runtime platform config in `.Image` to carry this run's
+          # exact version/checksum labels.
+          if ! printf '%s' "$METADATA_JSON" |
             bash "$LABELS_SCRIPT" exact "$VERSION" "$SHA256" 2>"$ERR_LOG"; then
             echo "::error::${GHCR_IMAGE}:${VERSION} already exists but at least one platform's baked metadata does not match this release exactly (expected version='${VERSION}', sha256='${SHA256}'). Refusing to silently diverge from, or rebuild over, a mismatched or mixed-platform exact tag."
             cat "$ERR_LOG" >&2

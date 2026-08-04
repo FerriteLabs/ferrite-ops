@@ -105,7 +105,7 @@ assert_contains "$AUDIT_CONTENT" "1.9.2\` published after \`2.0.2" \
 assert_contains "$AUDIT_CONTENT" "29/29 discovered suites" \
   "AUDIT.md records the final 29-suite verification pass"
 
-for finding in F-54 F-55 F-56 F-57 F-58 F-59 F-60 F-61 F-62 F-63; do
+for finding in F-54 F-55 F-56 F-57 F-58 F-59 F-60 F-61 F-62 F-63 F-64; do
   assert_contains "$AUDIT_CONTENT" "| ${finding} |" \
     "AUDIT.md records release-hardening finding ${finding} as fixed"
 done
@@ -158,5 +158,14 @@ assert_contains "$AUDIT_CONTENT" "never trusted as truth on its own" \
   "AUDIT.md records that a supplied source checksum is never trusted as truth on its own"
 assert_contains "$AUDIT_CONTENT" "31/31 discovered suites" \
   "AUDIT.md records the full 31-suite verification pass"
+
+assert_contains "$AUDIT_CONTENT" "## Digest-Pinned Exact-Image Metadata Resolution" \
+  "AUDIT.md records the exact-image metadata TOCTOU resolution"
+assert_contains "$AUDIT_CONTENT" "scripts/inspect-exact-image-metadata.sh" \
+  "AUDIT.md records the shared digest-pinned metadata resolver"
+assert_contains "$AUDIT_CONTENT" "moving-tag.json" \
+  "AUDIT.md records the moving-tag regression fixture"
+assert_contains "$AUDIT_CONTENT" "32/32 discovered suites" \
+  "AUDIT.md records the full verification pass with the new regression suite"
 
 harness_summary

@@ -70,6 +70,8 @@ assert_not_contains "$CONTENT" "Skipping optional \${dest_image} promotion" \
   "eligible Docker Hub inspection errors can never silently succeed"
 assert_contains "$CONTENT" "LABELS_SCRIPT: scripts/verify-exact-image-labels.sh" \
   "release.yml wires in the shared exact-tag label verification helper"
+assert_contains "$CONTENT" "METADATA_SCRIPT: scripts/inspect-exact-image-metadata.sh" \
+  "release.yml wires in the shared digest-pinned exact-tag metadata helper"
 LABELS_SCRIPT_CONTENT="$(cat "${REPO_ROOT}/scripts/verify-exact-image-labels.sh")"
 assert_contains "$LABELS_SCRIPT_CONTENT" "dev.ferritelabs.image.source-sha256" \
   "the shared label-verification helper checks the baked source-checksum label of an existing exact tag"
@@ -293,10 +295,18 @@ manifest_set() {
   # entry via descriptor annotations.
   local full_ref="$1" digest="$2" version="$3" sha="$4"
   local image_file="${5:--}" manifest_file="${6:--}"
+  local image pinned_ref
+  image="${full_ref%:*}"
+  pinned_ref="${image}@${digest}"
   awk -v r="$full_ref" '$1!=r' "$REGISTRY_MANIFEST" > "${REGISTRY_MANIFEST}.tmp" 2>/dev/null || true
   mv "${REGISTRY_MANIFEST}.tmp" "$REGISTRY_MANIFEST"
   printf '%s %s %s %s %s %s\n' \
     "$full_ref" "$digest" "$version" "$sha" "$image_file" "$manifest_file" \
+    >> "$REGISTRY_MANIFEST"
+  awk -v r="$pinned_ref" '$1!=r' "$REGISTRY_MANIFEST" > "${REGISTRY_MANIFEST}.tmp" 2>/dev/null || true
+  mv "${REGISTRY_MANIFEST}.tmp" "$REGISTRY_MANIFEST"
+  printf '%s %s %s %s %s %s\n' \
+    "$pinned_ref" "$digest" "$version" "$sha" "$image_file" "$manifest_file" \
     >> "$REGISTRY_MANIFEST"
 }
 
@@ -321,6 +331,7 @@ run_check_existing() {
     export SHA256="$sha256"
     export CERTIFICATE_IDENTITY_REGEXP='^https://github\.com/ferritelabs/'
     export GITHUB_OUTPUT="$out"
+    export METADATA_SCRIPT="${REPO_ROOT}/scripts/inspect-exact-image-metadata.sh"
     export LABELS_SCRIPT="${REPO_ROOT}/scripts/verify-exact-image-labels.sh"
     bash "$CHECK_SCRIPT"
   ) >"${out}.log" 2>&1
