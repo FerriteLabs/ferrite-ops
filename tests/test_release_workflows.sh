@@ -245,6 +245,11 @@ for active_target in \
 done
 assert_contains "$ORCHESTRATION_CONTENT" "'^[0-9a-f]{64}$'" \
   "release-orchestration.yml validates supplied and computed source checksums"
+assert_eq "5" "$(grep -c 'bash "\$ORDER_SCRIPT" validate' "$ORCHESTRATION_YML")" \
+  "release-orchestration.yml's prepare job and all four downstream jobs call the shared strict-SemVer validator"
+assert_not_contains "$ORCHESTRATION_CONTENT" \
+  'grep -qE '"'"'^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?$'"'"'' \
+  "release-orchestration.yml no longer duplicates the inline SemVer regex anywhere"
 
 # No GitHub expression is allowed inside a run script in these privileged
 # release workflows. Untrusted values enter scripts only through step env.
@@ -992,6 +997,7 @@ run_orchestration_meta() {
     export INPUT_SHA256="$checksum"
     export REPOSITORY_OWNER="FerriteLabs"
     export GITHUB_OUTPUT="$output"
+    export ORDER_SCRIPT="${REPO_ROOT}/scripts/release-ordering.sh"
     bash "${EXTRACT_DIR}/orchestration_meta.sh"
   )
 }
@@ -1012,6 +1018,22 @@ if [[ ! -e "$MALICIOUS_MARKER" ]]; then
   harness_ok "release-orchestration.yml treats command substitutions as inert input data"
 else
   harness_fail "release-orchestration.yml executed a command substitution from input data"
+fi
+
+# Strict SemVer: the shared validator, not a locally duplicated regex, must
+# reject a leading zero in either the core or a numeric pre-release
+# identifier -- something the OLD locally duplicated regex silently accepted.
+if run_orchestration_meta "1.2.3-01" "$SYNC_SHA256" \
+  "${EXTRACT_DIR}/leading_zero_orchestration.out" >/dev/null 2>&1; then
+  harness_fail "release-orchestration.yml unexpectedly accepted a leading-zero pre-release identifier"
+else
+  harness_ok "release-orchestration.yml rejects a leading-zero numeric pre-release identifier via the shared validator"
+fi
+if run_orchestration_meta "01.2.3" "$SYNC_SHA256" \
+  "${EXTRACT_DIR}/leading_zero_core_orchestration.out" >/dev/null 2>&1; then
+  harness_fail "release-orchestration.yml unexpectedly accepted a leading-zero version core"
+else
+  harness_ok "release-orchestration.yml rejects a leading-zero version core via the shared validator"
 fi
 
 # Uppercase supplied checksums are normalized before being emitted.

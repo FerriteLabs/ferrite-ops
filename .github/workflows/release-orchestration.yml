@@ -30,15 +30,22 @@ jobs:
       tag: ${{ steps.meta.outputs.tag }}
       sha256: ${{ steps.meta.outputs.sha256 }}
     steps:
+      - uses: actions/checkout@v4
+
       - name: Compute release metadata
         id: meta
         env:
           INPUT_VERSION: ${{ github.event.client_payload.version || inputs.version }}
           INPUT_SHA256: ${{ github.event.client_payload.sha256 || inputs.sha256 }}
           REPOSITORY_OWNER: ${{ github.repository_owner }}
+          ORDER_SCRIPT: scripts/release-ordering.sh
         run: |
           set -euo pipefail
 
+          # This is the ONE place this workflow normalizes the version
+          # (stripping an optional leading "v"); every downstream job below
+          # consumes this job's already-normalized `version` output and only
+          # re-validates it (defense in depth), never re-normalizes it.
           VERSION="${INPUT_VERSION#v}"
           TAG="v${VERSION}"
 
@@ -47,10 +54,11 @@ jobs:
             exit 1
           fi
 
-          # Validate semver format
-          if ! printf '%s\n' "$VERSION" |
-            grep -qE '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?$'; then
-            echo "::error::Invalid semver: $VERSION"
+          # Trusted shared validator: strict SemVer 2.0, rejecting a leading
+          # zero in the core (e.g. "01.2.3") or in any purely-numeric
+          # pre-release identifier (e.g. "1.2.3-01").
+          if ! bash "$ORDER_SCRIPT" validate "$VERSION"; then
+            echo "::error::Invalid semver (fails strict SemVer 2.0 validation): $VERSION"
             exit 1
           fi
           if ! printf '%s\n' "$REPOSITORY_OWNER" | grep -qE '^[A-Za-z0-9_.-]+$'; then
@@ -85,6 +93,8 @@ jobs:
     needs: prepare
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
+
       - name: Trigger Homebrew tap update
         if: ${{ !(inputs.dry_run || false) }}
         env:
@@ -92,11 +102,11 @@ jobs:
           VERSION: ${{ needs.prepare.outputs.version }}
           SHA256: ${{ needs.prepare.outputs.sha256 }}
           REPOSITORY_OWNER: ${{ github.repository_owner }}
+          ORDER_SCRIPT: scripts/release-ordering.sh
         run: |
           set -euo pipefail
-          if ! printf '%s\n' "$VERSION" |
-            grep -qE '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?$'; then
-            echo "::error::Invalid normalized release version"
+          if ! bash "$ORDER_SCRIPT" validate "$VERSION"; then
+            echo "::error::Invalid normalized release version (fails strict SemVer 2.0 validation)"
             exit 1
           fi
           if ! printf '%s\n' "$SHA256" | grep -qE '^[0-9a-f]{64}$'; then
@@ -137,17 +147,19 @@ jobs:
     needs: prepare
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
+
       - name: Trigger docs version update
         if: ${{ !(inputs.dry_run || false) }}
         env:
           GH_TOKEN: ${{ secrets.CROSS_REPO_TOKEN }}
           VERSION: ${{ needs.prepare.outputs.version }}
           REPOSITORY_OWNER: ${{ github.repository_owner }}
+          ORDER_SCRIPT: scripts/release-ordering.sh
         run: |
           set -euo pipefail
-          if ! printf '%s\n' "$VERSION" |
-            grep -qE '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?$'; then
-            echo "::error::Invalid normalized release version"
+          if ! bash "$ORDER_SCRIPT" validate "$VERSION"; then
+            echo "::error::Invalid normalized release version (fails strict SemVer 2.0 validation)"
             exit 1
           fi
           if ! printf '%s\n' "$REPOSITORY_OWNER" | grep -qE '^[A-Za-z0-9_.-]+$'; then
@@ -183,17 +195,19 @@ jobs:
     needs: prepare
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
+
       - name: Trigger SDK repository updates
         if: ${{ !(inputs.dry_run || false) }}
         env:
           GH_TOKEN: ${{ secrets.CROSS_REPO_TOKEN }}
           VERSION: ${{ needs.prepare.outputs.version }}
           OWNER: ${{ github.repository_owner }}
+          ORDER_SCRIPT: scripts/release-ordering.sh
         run: |
           set -euo pipefail
-          if ! printf '%s\n' "$VERSION" |
-            grep -qE '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?$'; then
-            echo "::error::Invalid normalized release version"
+          if ! bash "$ORDER_SCRIPT" validate "$VERSION"; then
+            echo "::error::Invalid normalized release version (fails strict SemVer 2.0 validation)"
             exit 1
           fi
           if ! printf '%s\n' "$OWNER" | grep -qE '^[A-Za-z0-9_.-]+$'; then
@@ -265,11 +279,11 @@ jobs:
           UPDATE_HOMEBREW_RESULT: ${{ needs.update-homebrew.result }}
           UPDATE_DOCS_RESULT: ${{ needs.update-docs.result }}
           UPDATE_SDKS_RESULT: ${{ needs.update-sdks.result }}
+          ORDER_SCRIPT: scripts/release-ordering.sh
         run: |
           set -euo pipefail
-          if ! printf '%s\n' "$VERSION" |
-            grep -qE '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?$'; then
-            echo "::error::Invalid normalized release version"
+          if ! bash "$ORDER_SCRIPT" validate "$VERSION"; then
+            echo "::error::Invalid normalized release version (fails strict SemVer 2.0 validation)"
             exit 1
           fi
           if ! printf '%s\n' "$SHA256" | grep -qE '^[0-9a-f]{64}$'; then
