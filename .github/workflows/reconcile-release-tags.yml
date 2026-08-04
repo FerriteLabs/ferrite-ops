@@ -4,7 +4,8 @@ on:
   workflow_run:
     workflows: [Release]
     types: [completed]
-  workflow_dispatch:
+  repository_dispatch:
+    types: [reconcile-release-tags]
   schedule:
     # Weekly repair is intentionally conservative; every successful exact
     # release also triggers reconciliation immediately.
@@ -25,18 +26,76 @@ env:
 
 jobs:
   reconcile:
-    name: Reconcile Stable Floating Tags
-    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
+    name: Reconcile Stable Registry Tags
+    if: >-
+      (github.event_name == 'workflow_run' &&
+       github.event.workflow_run.conclusion == 'success') ||
+      github.event_name == 'schedule' ||
+      (github.event_name == 'repository_dispatch' &&
+       github.event.action == 'reconcile-release-tags')
     runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
     steps:
+      - name: Validate reconciliation trigger
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_ACTION: ${{ github.event.action }}
+          EVENT_REF: ${{ github.ref }}
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+          REPOSITORY: ${{ github.repository }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          WORKFLOW_RUN_NAME: ${{ github.event.workflow_run.name }}
+          WORKFLOW_RUN_CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+        run: |
+          set -euo pipefail
+
+          case "$EVENT_NAME" in
+            repository_dispatch)
+              if [ "$EVENT_ACTION" != "reconcile-release-tags" ]; then
+                echo "::error::Unexpected repository_dispatch action: ${EVENT_ACTION:-<empty>}."
+                exit 1
+              fi
+              ;;
+            workflow_run)
+              if [ "$EVENT_ACTION" != "completed" ] ||
+                [ "$WORKFLOW_RUN_NAME" != "Release" ] ||
+                [ "$WORKFLOW_RUN_CONCLUSION" != "success" ]; then
+                echo "::error::Unexpected workflow_run source or conclusion."
+                exit 1
+              fi
+              ;;
+            schedule)
+              ;;
+            *)
+              echo "::error::Unsupported reconciliation event: ${EVENT_NAME:-<empty>}."
+              exit 1
+              ;;
+          esac
+
+          if [ -z "$DEFAULT_BRANCH" ] ||
+            printf '%s' "$DEFAULT_BRANCH" | grep -q '[[:cntrl:]]'; then
+            echo "::error::Invalid repository default branch."
+            exit 1
+          fi
+
+          EXPECTED_REF="refs/heads/${DEFAULT_BRANCH}"
+          EXPECTED_WORKFLOW_REF="${REPOSITORY}/.github/workflows/reconcile-release-tags.yml@${EXPECTED_REF}"
+          if [ "$EVENT_REF" != "$EXPECTED_REF" ]; then
+            echo "::error::Reconciliation must run on ${EXPECTED_REF}, not ${EVENT_REF:-<empty>}."
+            exit 1
+          fi
+          if [ "$WORKFLOW_REF" != "$EXPECTED_WORKFLOW_REF" ]; then
+            echo "::error::Reconciliation must use the default-branch workflow definition."
+            exit 1
+          fi
+
       - uses: actions/checkout@v4
         with:
-          # workflow_dispatch may be invoked while viewing another ref; the
-          # registry-writing job always executes the reviewed default-branch
-          # helper/workflow implementation.
+          # repository_dispatch, workflow_run, and schedule all execute the
+          # reviewed default-branch workflow definition. Pin the helper
+          # checkout to the same reviewed branch.
           ref: ${{ github.event.repository.default_branch }}
 
       - name: Set up Docker Buildx
@@ -194,6 +253,17 @@ jobs:
           jq -r '.[] | "\(.tag) -> \(.version) @ \(.digest)"' \
             floating-tag-plan.json
 
+          jq -n \
+            --slurpfile exact verified-exact-tags.json \
+            --slurpfile floating floating-tag-plan.json \
+            '($exact[0] | map({
+              kind: "exact",
+              tag: .version,
+              version: .version,
+              digest: .digest
+            })) + ($floating[0] | map(. + {kind: "floating"}))' \
+            > dockerhub-tag-plan.json
+
       - name: Apply and verify GHCR floating tags
         env:
           GHCR_IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
@@ -247,7 +317,7 @@ jobs:
             fi
           done < <(jq -r '.[] | [.tag, .version, .digest] | @tsv' floating-tag-plan.json)
 
-      - name: Copy and verify Docker Hub floating tags
+      - name: Audit and repair Docker Hub exact and floating tags
         if: steps.dockerhub.outputs.enabled == 'true'
         env:
           GHCR_IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
@@ -259,7 +329,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          while IFS=$'\t' read -r TAG VERSION DIGEST; do
+          while IFS=$'\t' read -r KIND TAG VERSION DIGEST; do
             [ -n "$TAG" ] || continue
 
             SOURCE_DIGEST="$(docker buildx imagetools inspect \
@@ -281,16 +351,48 @@ jobs:
               --certificate-identity-regexp="$CERTIFICATE_IDENTITY_REGEXP" \
               "${GHCR_IMAGE}@${DIGEST}" >/dev/null
 
-            echo "::notice::Copying ${VERSION} (${DIGEST}) from GHCR to Docker Hub tag ${TAG}."
-            crane copy \
-              "${GHCR_IMAGE}@${DIGEST}" \
-              "${DOCKERHUB_IMAGE}:${TAG}"
+            INSPECT_ERROR="$(mktemp)"
+            CURRENT_DIGEST=""
+            if CURRENT_DIGEST="$(crane digest "${DOCKERHUB_IMAGE}:${TAG}" 2>"$INSPECT_ERROR")"; then
+              rm -f "$INSPECT_ERROR"
+              if [ -z "$CURRENT_DIGEST" ]; then
+                echo "::error::Docker Hub returned an empty digest for ${TAG}."
+                exit 1
+              fi
+              if [ "$CURRENT_DIGEST" = "$DIGEST" ]; then
+                echo "::notice::Docker Hub ${KIND} tag ${TAG} already matches ${DIGEST}; no copy needed."
+                continue
+              fi
+              if [ "$KIND" = "exact" ]; then
+                echo "::error::Docker Hub exact tag ${TAG} points at ${CURRENT_DIGEST}, expected ${DIGEST}; refusing to overwrite an immutable exact tag."
+                exit 1
+              fi
+              echo "::notice::Repairing Docker Hub floating tag ${TAG} (${CURRENT_DIGEST} -> ${DIGEST})."
+            elif grep -qiE 'manifest unknown|no such manifest|MANIFEST_UNKNOWN|NAME_UNKNOWN|not found' "$INSPECT_ERROR"; then
+              rm -f "$INSPECT_ERROR"
+              echo "::notice::Docker Hub ${KIND} tag ${TAG} is missing; backfilling ${DIGEST}."
+            else
+              echo "::error::Could not determine Docker Hub ${KIND} tag ${TAG} state:"
+              cat "$INSPECT_ERROR" >&2
+              rm -f "$INSPECT_ERROR"
+              exit 1
+            fi
 
-            DESTINATION_DIGEST="$(crane digest "${DOCKERHUB_IMAGE}:${TAG}")"
+            echo "::notice::Copying verified GHCR ${VERSION} (${DIGEST}) to Docker Hub tag ${TAG}."
+            crane copy "${GHCR_IMAGE}@${DIGEST}" "${DOCKERHUB_IMAGE}:${TAG}"
+
+            VERIFY_ERROR="$(mktemp)"
+            if ! DESTINATION_DIGEST="$(crane digest "${DOCKERHUB_IMAGE}:${TAG}" 2>"$VERIFY_ERROR")"; then
+              echo "::error::Could not verify Docker Hub ${KIND} tag ${TAG} after copy:"
+              cat "$VERIFY_ERROR" >&2
+              rm -f "$VERIFY_ERROR"
+              exit 1
+            fi
+            rm -f "$VERIFY_ERROR"
             if [ "$DESTINATION_DIGEST" != "$DIGEST" ]; then
               echo "::error::Docker Hub destination ${TAG} resolved to ${DESTINATION_DIGEST:-<none>}, expected ${DIGEST}."
               exit 1
             fi
-          done < <(jq -r '.[] | [.tag, .version, .digest] | @tsv' floating-tag-plan.json)
+          done < <(jq -r '.[] | [.kind, .tag, .version, .digest] | @tsv' dockerhub-tag-plan.json)
 
-          echo "::notice::Docker Hub floating tags match the verified GHCR desired state."
+          echo "::notice::Docker Hub exact and floating tags match the verified GHCR desired state."

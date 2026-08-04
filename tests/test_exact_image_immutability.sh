@@ -64,6 +64,10 @@ assert_contains "$CONTENT" "Refusing to overwrite an existing exact version tag"
   "promote-exact refuses to overwrite an existing exact tag pointing at a different digest"
 assert_contains "$CONTENT" "already points at \${DIGEST}; nothing to promote (idempotent)" \
   "promote-exact treats a matching existing exact tag as an idempotent no-op"
+assert_contains "$CONTENT" "any other ambiguous inspection failure aborts the exact release" \
+  "eligible Docker Hub exact-tag inspection failures are documented as fatal"
+assert_not_contains "$CONTENT" "Skipping optional \${dest_image} promotion" \
+  "eligible Docker Hub inspection errors can never silently succeed"
 assert_contains "$CONTENT" "dev.ferritelabs.image.source-sha256" \
   "release.yml verifies the baked source-checksum label of an existing exact tag"
 assert_contains "$CONTENT" "cosign verify" \
@@ -224,6 +228,10 @@ set -euo pipefail
 
 if [ "${1:-}" = "digest" ]; then
   REF="$2"
+  if [ -n "${CRANE_DIGEST_ERROR:-}" ]; then
+    printf '%s\n' "$CRANE_DIGEST_ERROR" >&2
+    exit 1
+  fi
   LINE="$(awk -v r="$REF" '$1==r{print}' "$REGISTRY_MANIFEST" | tail -1)"
   if [ -z "$LINE" ]; then
     echo "Error: NAME_UNKNOWN: repository name not known: ${REF}" >&2
@@ -352,7 +360,8 @@ fi
 
 # === promote-exact ===========================================================
 run_promote_exact() {
-  local version="$1" digest="$2" dockerhub_enabled="${3:-false}" out="$4" corrupt_copy="${5:-false}"
+  local version="$1" digest="$2" dockerhub_enabled="${3:-false}" out="$4"
+  local corrupt_copy="${5:-false}" digest_error="${6:-}"
   : > "$out"
   : > "$DOCKER_LOG"
   (
@@ -365,6 +374,7 @@ run_promote_exact() {
     export DOCKERHUB_IMAGE="$DOCKERHUB_IMAGE"
     export DOCKERHUB_ENABLED="$dockerhub_enabled"
     export CRANE_CORRUPT_COPY="$corrupt_copy"
+    export CRANE_DIGEST_ERROR="$digest_error"
     bash "$PROMOTE_SCRIPT"
   ) >"$out" 2>&1
 }
@@ -464,6 +474,27 @@ else
   assert_contains "$(cat "${TMP}/dockerhub_corrupt.out")" "does not match the verified source digest" \
     "promote-exact detects and rejects a corrupted cross-registry Docker Hub copy"
 fi
+
+# --- Docker Hub: ambiguous inspection failures abort the exact release -----
+AMBIGUOUS_ERRORS=(
+  "Error: UNAUTHORIZED: authentication required"
+  "Error: Get https://registry-1.docker.io/v2/: dial tcp: i/o timeout"
+  "Error: TOOMANYREQUESTS: rate limit exceeded"
+)
+AMBIGUOUS_NAMES=("authentication" "network" "rate-limit")
+for index in "${!AMBIGUOUS_ERRORS[@]}"; do
+  version="0.8.${index}"
+  : > "$REGISTRY_MANIFEST"
+  if run_promote_exact "$version" "sha256:${ONES}" "true" \
+    "${TMP}/dockerhub_${AMBIGUOUS_NAMES[$index]}.out" "false" \
+    "${AMBIGUOUS_ERRORS[$index]}"; then
+    harness_fail "promote-exact silently accepted a Docker Hub ${AMBIGUOUS_NAMES[$index]} inspection failure"
+  else
+    assert_contains "$(cat "${TMP}/dockerhub_${AMBIGUOUS_NAMES[$index]}.out")" \
+      "Could not determine whether ${DOCKERHUB_IMAGE}:${version} already exists" \
+      "Docker Hub ${AMBIGUOUS_NAMES[$index]} ambiguity fails the exact release"
+  fi
+done
 
 # --- Invalid inputs are rejected defensively --------------------------------
 if run_promote_exact "not-a-version" "sha256:${ONES}" "false" "${TMP}/bad_version.out"; then

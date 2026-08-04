@@ -695,12 +695,13 @@ jobs:
           # referencing a manifest that may not resolve there), then
           # independently re-reads the destination digest and asserts it is
           # BYTE-IDENTICAL to the verified GHCR source digest before treating
-          # the promotion as successful. Optional end-to-end: any ambiguous
-          # inspection failure is a skipped warning (never fatal), but a
-          # genuine digest MISMATCH — whether pre-existing or produced by a
-          # corrupt copy — is always fatal; Docker Hub must never overwrite a
-          # different existing digest, nor be left pointing at a tag this
-          # workflow cannot prove matches the signed, verified source.
+          # the promotion as successful. Once Docker Hub mirroring is enabled
+          # and eligible, only a positively identified missing tag permits a
+          # copy. Authentication, network, rate-limit, malformed-response, or
+          # any other ambiguous inspection failure aborts the exact release.
+          # Docker Hub must never overwrite a different existing digest, nor
+          # be left in a state this workflow cannot prove matches the signed,
+          # verified source.
           promote_exact_tag_cross_registry() {
             local dest_image="$1" source_image="$2"
             local err_log existing_digest
@@ -715,7 +716,7 @@ jobs:
               echo "::error::${dest_image}:${VERSION} already exists but points at a DIFFERENT digest (${existing_digest} != ${DIGEST}). Refusing to overwrite an existing exact version tag."
               return 1
             fi
-            if grep -qiE 'not found|manifest unknown|no such manifest|MANIFEST_UNKNOWN|NAME_UNKNOWN|404' "$err_log"; then
+            if grep -qiE 'manifest unknown|no such manifest|MANIFEST_UNKNOWN|NAME_UNKNOWN|not found' "$err_log"; then
               rm -f "$err_log"
               echo "::notice::Promoting ${dest_image}:${VERSION} -> ${DIGEST} via a real cross-registry blob copy from verified source ${source_image}@${DIGEST}"
               crane copy "${source_image}@${DIGEST}" "${dest_image}:${VERSION}"
@@ -731,8 +732,7 @@ jobs:
             echo "::error::Could not determine whether ${dest_image}:${VERSION} already exists:"
             cat "$err_log" >&2
             rm -f "$err_log"
-            echo "::warning::Skipping optional ${dest_image} promotion due to the inspection error above."
-            return 0
+            return 1
           }
 
           promote_exact_tag "$GHCR_IMAGE"

@@ -111,8 +111,14 @@ assert_not_contains "$RELEASE_CONTENT" "promote-stable:" \
   "release.yml no longer performs event-specific floating-tag promotion"
 assert_contains "$RECONCILE_CONTENT" "workflows: [Release]" \
   "successful exact release completion triggers complete-state reconciliation"
+assert_contains "$RECONCILE_CONTENT" "types: [reconcile-release-tags]" \
+  "manual reconciliation uses only the narrow repository-dispatch event type"
+assert_not_contains "$RECONCILE_CONTENT" "workflow_dispatch:" \
+  "manual reconciliation cannot execute a branch-selected workflow definition"
 assert_contains "$RECONCILE_CONTENT" 'ref: ${{ github.event.repository.default_branch }}' \
   "registry reconciliation executes reviewed default-branch code"
+assert_contains "$RECONCILE_CONTENT" "EXPECTED_WORKFLOW_REF" \
+  "registry reconciliation validates the default-branch workflow ref before login"
 assert_contains "$RECONCILE_CONTENT" "group: ferrite-release-tag-reconciliation" \
   "floating-tag reconciliation is globally serialized"
 assert_contains "$RECONCILE_CONTENT" "cancel-in-progress: false" \
@@ -128,7 +134,9 @@ assert_contains "$RECONCILE_CONTENT" "cosign verify" \
 assert_contains "$RECONCILE_CONTENT" "docker buildx imagetools create" \
   "GHCR floating tags are moved to selected signed digests without rebuilding"
 assert_contains "$RECONCILE_CONTENT" "crane copy" \
-  "optional Docker Hub floating tags are copied cross-registry from GHCR"
+  "eligible Docker Hub exact and floating tags are copied cross-registry from GHCR"
+assert_contains "$RECONCILE_CONTENT" 'kind: "exact"' \
+  "Docker Hub reconciliation includes every verified exact stable tag"
 assert_not_contains "$RELEASE_CONTENT" 'type=raw,value=${{ inputs.tag }}' \
   "workflow_dispatch does not publish an unnormalized raw v-prefixed tag"
 assert_contains "$RELEASE_CONTENT" "latest=false" \
