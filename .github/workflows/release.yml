@@ -79,19 +79,6 @@ env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository_owner }}/ferrite
   DOCKERHUB_IMAGE: ferritelabs/ferrite
-  # Restricts every keyless cosign verification in this workflow to a
-  # signature minted by THIS EXACT repository's THIS EXACT workflow file
-  # (.github/workflows/release.yml), on one of the two refs this workflow is
-  # actually trusted to release from: a `v*` tag push (the real release
-  # trigger), or a dispatch (repository_dispatch from core, or a manual
-  # workflow_dispatch) running on `main` — GitHub Actions always executes
-  # dispatch events against the repository's default branch, so both
-  # dispatch trigger types are covered by the `heads/main` alternative.
-  # Deliberately NOT an org-wide regex: this can never match a signature
-  # minted by a different repository under the same owner, a fork, a
-  # different workflow file in this same repository, or a run on any other
-  # ref (a feature branch, a PR head, an arbitrary tag, etc.).
-  CERTIFICATE_IDENTITY_REGEXP: ^https://github\.com/${{ github.repository }}/\.github/workflows/release\.yml@refs/(heads/main|tags/v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?)$
 
 jobs:
   # ── Step 0: Derive and validate this run's normalized release version ──────
@@ -117,6 +104,7 @@ jobs:
       stable: ${{ steps.release_meta.outputs.stable }}
       candidate_tag: ${{ steps.release_meta.outputs.candidate_tag }}
       build_args: ${{ steps.release_meta.outputs.build_args }}
+      certificate_identity_regexp: ${{ steps.release_meta.outputs.certificate_identity_regexp }}
     steps:
       - uses: actions/checkout@v4
 
@@ -134,9 +122,11 @@ jobs:
         id: release_meta
         env:
           EVENT_NAME: ${{ github.event_name }}
+          WORKFLOW_REF: ${{ github.ref }}
           DISPATCH_VERSION: ${{ github.event.client_payload.version }}
           WORKFLOW_TAG: ${{ inputs.tag }}
-          REPOSITORY_OWNER: ${{ github.repository_owner }}
+          REPOSITORY: ${{ github.repository }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
           RUN_ID: ${{ github.run_id }}
           RUN_ATTEMPT: ${{ github.run_attempt }}
           ORDER_SCRIPT: scripts/release-ordering.sh
@@ -183,11 +173,63 @@ jobs:
             echo "::error::Version '${VERSION}' failed strict SemVer validation"
             exit 1
           fi
-          if ! printf '%s\n' "$REPOSITORY_OWNER" | grep -qE '^[A-Za-z0-9_.-]+$'; then
-            echo "::error::Invalid repository owner"
+          if ! printf '%s\n' "$REPOSITORY" | grep -qE '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$'; then
+            echo "::error::Invalid repository identity"
+            exit 1
+          fi
+          if [ -z "$DEFAULT_BRANCH" ] ||
+            ! git check-ref-format "refs/heads/${DEFAULT_BRANCH}" >/dev/null 2>&1; then
+            echo "::error::Could not determine a valid configured default branch"
             exit 1
           fi
 
+          # Pair each accepted event with the only ref it is trusted to use.
+          # This runs before checksum retrieval and before any job with
+          # registry credentials or write permissions can start.
+          case "$EVENT_NAME" in
+            push)
+              EXPECTED_REF="refs/tags/v${VERSION}"
+              if [ "$WORKFLOW_REF" != "$EXPECTED_REF" ] ||
+                [ "$RAW_VERSION" != "v${VERSION}" ]; then
+                echo "::error::Push releases must run on the exact candidate tag ${EXPECTED_REF}; got ref '${WORKFLOW_REF}' and tag '${RAW_VERSION}'."
+                exit 1
+              fi
+              ;;
+            repository_dispatch|workflow_dispatch)
+              DEFAULT_REF="refs/heads/${DEFAULT_BRANCH}"
+              if [ "$WORKFLOW_REF" != "refs/heads/main" ] &&
+                [ "$WORKFLOW_REF" != "$DEFAULT_REF" ]; then
+                echo "::error::Dispatch releases must run on refs/heads/main or the configured default branch ${DEFAULT_REF}; got '${WORKFLOW_REF}'."
+                exit 1
+              fi
+              ;;
+          esac
+
+          REGEX_REPOSITORY="$(python3 - "$REPOSITORY" <<'PYEOF'
+          import re
+          import sys
+          print(re.escape(sys.argv[1]))
+          PYEOF
+          )"
+          REGEX_VERSION="$(python3 - "$VERSION" <<'PYEOF'
+          import re
+          import sys
+          print(re.escape(sys.argv[1]))
+          PYEOF
+          )"
+          REGEX_DEFAULT_BRANCH="$(python3 - "$DEFAULT_BRANCH" <<'PYEOF'
+          import re
+          import sys
+          print(re.escape(sys.argv[1]))
+          PYEOF
+          )"
+          TRUSTED_REFS="tags/v${REGEX_VERSION}|heads/main"
+          if [ "$DEFAULT_BRANCH" != "main" ]; then
+            TRUSTED_REFS="${TRUSTED_REFS}|heads/${REGEX_DEFAULT_BRANCH}"
+          fi
+          CERTIFICATE_IDENTITY_REGEXP="^https://github\\.com/${REGEX_REPOSITORY}/\\.github/workflows/release\\.yml@refs/(${TRUSTED_REFS})$"
+
+          REPOSITORY_OWNER="${REPOSITORY%%/*}"
           TARBALL_URL="https://github.com/${REPOSITORY_OWNER}/ferrite/archive/refs/tags/v${VERSION}.tar.gz"
           echo "Computing source archive SHA256 for ${TARBALL_URL} ..."
           SHA256="$(curl -fsSL "$TARBALL_URL" | shasum -a 256 | awk '{print $1}')"
@@ -219,6 +261,7 @@ jobs:
             echo "major_minor=${MAJOR_MINOR}"
             echo "stable=${STABLE}"
             echo "candidate_tag=${CANDIDATE_TAG}"
+            echo "certificate_identity_regexp=${CERTIFICATE_IDENTITY_REGEXP}"
             echo "build_args<<FERRITE_BUILD_ARGS_EOF"
             printf 'FERRITE_VERSION=%s\n' "$VERSION"
             printf 'FERRITE_SOURCE_SHA256=%s\n' "$SHA256"
@@ -317,6 +360,7 @@ jobs:
           GHCR_IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           VERSION: ${{ needs.prepare.outputs.version }}
           SHA256: ${{ needs.prepare.outputs.sha256 }}
+          CERTIFICATE_IDENTITY_REGEXP: ${{ needs.prepare.outputs.certificate_identity_regexp }}
         run: |
           set -euo pipefail
 
@@ -526,7 +570,7 @@ jobs:
   verify:
     name: Verify Signatures & Attestations
     runs-on: ubuntu-latest
-    needs: build-and-push
+    needs: [prepare, build-and-push]
     permissions:
       contents: read
       packages: read
@@ -546,6 +590,7 @@ jobs:
         env:
           IMAGE: ${{ needs.build-and-push.outputs.image }}
           DIGEST: ${{ needs.build-and-push.outputs.digest }}
+          CERTIFICATE_IDENTITY_REGEXP: ${{ needs.prepare.outputs.certificate_identity_regexp }}
         run: |
           cosign verify \
             --certificate-oidc-issuer=https://token.actions.githubusercontent.com \
@@ -556,6 +601,7 @@ jobs:
         env:
           IMAGE: ${{ needs.build-and-push.outputs.image }}
           DIGEST: ${{ needs.build-and-push.outputs.digest }}
+          CERTIFICATE_IDENTITY_REGEXP: ${{ needs.prepare.outputs.certificate_identity_regexp }}
         run: |
           cosign verify-attestation \
             --type spdxjson \

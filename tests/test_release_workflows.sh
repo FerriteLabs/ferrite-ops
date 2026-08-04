@@ -88,42 +88,22 @@ assert_contains "$RELEASE_CONTENT" 'labels: |
 assert_eq "2" "$(grep -c 'org.opencontainers.image.version=\${{ needs.prepare.outputs.version }}' "$RELEASE_YML")" \
   "both the GHCR and Docker Hub candidate metadata steps explicitly set the real-SemVer version label"
 
-# --- Signature/attestation identity is restricted to THIS exact repository's
-# THIS exact workflow file, on only the two trusted refs (a `v*` tag push,
-# or a dispatch running on `main`) — never an org-wide regex. ---
-assert_contains "$RELEASE_CONTENT" 'CERTIFICATE_IDENTITY_REGEXP: ^https://github\.com/${{ github.repository }}/\.github/workflows/release\.yml@refs/(heads/main|tags/v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?)$' \
-  "release.yml's cosign identity regexp is scoped to this exact repository's release.yml on trusted refs only"
+# --- Event/ref trust and signature identity are derived together in prepare,
+# before any registry login/write job can start. ---
+assert_contains "$RELEASE_CONTENT" 'WORKFLOW_REF: ${{ github.ref }}' \
+  "release.yml passes the workflow ref into the trusted prepare step"
+assert_contains "$RELEASE_CONTENT" 'DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}' \
+  "release.yml reads the configured default branch for dispatch trust"
+assert_contains "$RELEASE_CONTENT" 'EXPECTED_REF="refs/tags/v${VERSION}"' \
+  "push releases require the exact v-prefixed normalized candidate tag ref"
+assert_contains "$RELEASE_CONTENT" 'Dispatch releases must run on refs/heads/main or the configured default branch' \
+  "dispatch releases reject historical tags and non-default branches before registry access"
+assert_contains "$RELEASE_CONTENT" 'certificate_identity_regexp: ${{ steps.release_meta.outputs.certificate_identity_regexp }}' \
+  "prepare exports a Cosign identity allowance derived from the trusted event/ref pairings"
 assert_not_contains "$RELEASE_CONTENT" 'CERTIFICATE_IDENTITY_REGEXP: ^https://github\.com/${{ github.repository_owner }}/$' \
   "release.yml no longer uses an org-wide cosign identity regexp"
-assert_eq "1" "$(grep -c 'CERTIFICATE_IDENTITY_REGEXP:' "$RELEASE_YML")" \
-  "the cosign identity regexp is defined exactly once (workflow-level env), not redeclared per step"
 assert_eq "3" "$(grep -c 'certificate-identity-regexp="\$CERTIFICATE_IDENTITY_REGEXP"' "$RELEASE_YML")" \
   "all three cosign verify/verify-attestation invocations consume the single shared identity regexp"
-
-# The regexp must actually match the two trusted identities (a real release
-# tag push, and a dispatch running on main) and reject everything else: a
-# different repository under the same owner, a fork, a different workflow
-# file in this same repository, and an untrusted ref.
-IDENTITY_REGEXP_LITERAL="$(
-  printf '%s' "$RELEASE_CONTENT" |
-    sed -n 's/^ *CERTIFICATE_IDENTITY_REGEXP: //p' | head -1 |
-    sed 's/\${{ github.repository }}/ferritelabs\/ferrite-ops/'
-)"
-assert_true "$(echo "https://github.com/ferritelabs/ferrite-ops/.github/workflows/release.yml@refs/tags/v1.2.3" | grep -qE "$IDENTITY_REGEXP_LITERAL"; echo $?)" \
-  "the identity regexp matches a real v1.2.3 tag-push signing identity"
-assert_true "$(echo "https://github.com/ferritelabs/ferrite-ops/.github/workflows/release.yml@refs/heads/main" | grep -qE "$IDENTITY_REGEXP_LITERAL"; echo $?)" \
-  "the identity regexp matches a dispatch-on-main signing identity"
-for untrusted in \
-  "https://github.com/ferritelabs/some-other-repo/.github/workflows/release.yml@refs/tags/v1.2.3" \
-  "https://github.com/some-fork/ferrite-ops/.github/workflows/release.yml@refs/tags/v1.2.3" \
-  "https://github.com/ferritelabs/ferrite-ops/.github/workflows/ci.yml@refs/tags/v1.2.3" \
-  "https://github.com/ferritelabs/ferrite-ops/.github/workflows/release.yml@refs/heads/feature-x"; do
-  if echo "$untrusted" | grep -qE "$IDENTITY_REGEXP_LITERAL"; then
-    harness_fail "the identity regexp incorrectly matched an untrusted identity: ${untrusted}"
-  else
-    harness_ok "the identity regexp correctly rejects an untrusted identity: ${untrusted}"
-  fi
-done
 
 assert_contains "$RELEASE_CONTENT" "promote-stable:" \
   "release.yml defines a dedicated floating-tag promotion job"
@@ -708,7 +688,8 @@ assert_tag_set() {
 }
 
 run_case() {
-  local name="$1" event_name="$2" client_payload_version="$3" input_tag="$4" ref_name="${5:-}"
+  local name="$1" event_name="$2" client_payload_version="$3" input_tag="$4"
+  local ref_name="${5:-}" workflow_ref="${6:-refs/heads/main}" default_branch="${7:-main}"
 
   local out_file="${EXTRACT_DIR}/output_${name}.txt"
   : > "$out_file"
@@ -716,9 +697,11 @@ run_case() {
     export GITHUB_REF_NAME="$ref_name"
     export GITHUB_OUTPUT="$out_file"
     export EVENT_NAME="$event_name"
+    export WORKFLOW_REF="$workflow_ref"
     export DISPATCH_VERSION="$client_payload_version"
     export WORKFLOW_TAG="$input_tag"
-    export REPOSITORY_OWNER="FerriteLabs"
+    export REPOSITORY="FerriteLabs/ferrite-ops"
+    export DEFAULT_BRANCH="$default_branch"
     export RUN_ID="$EXPECTED_RUN_ID"
     export RUN_ATTEMPT="$EXPECTED_RUN_ATTEMPT"
     export ORDER_SCRIPT="${REPO_ROOT}/scripts/release-ordering.sh"
@@ -726,7 +709,8 @@ run_case() {
   )
 }
 
-if run_case "push_tag" push "" "" "v${EXPECTED_VERSION}" >"${EXTRACT_DIR}/log_push_tag.txt" 2>&1; then
+if run_case "push_tag" push "" "" "v${EXPECTED_VERSION}" "refs/tags/v${EXPECTED_VERSION}" \
+  >"${EXTRACT_DIR}/log_push_tag.txt" 2>&1; then
   OUT="$(cat "${EXTRACT_DIR}/output_push_tag.txt")"
   assert_contains "$OUT" "version=${EXPECTED_VERSION}" "push-tag case derives active version from GITHUB_REF_NAME"
   assert_contains "$OUT" "major_minor=${EXPECTED_MAJOR_MINOR}" "push-tag case derives normalized major.minor tag"
@@ -735,6 +719,22 @@ if run_case "push_tag" push "" "" "v${EXPECTED_VERSION}" >"${EXTRACT_DIR}/log_pu
   assert_contains "$OUT" "FERRITE_VERSION=${EXPECTED_VERSION}" "push-tag case emits FERRITE_VERSION build-arg"
   assert_contains "$OUT" "FERRITE_SOURCE_SHA256=${EXPECTED_SHA256}" \
     "push-tag case computes the active release source SHA256"
+  IDENTITY_REGEXP="$(sed -n 's/^certificate_identity_regexp=//p' "${EXTRACT_DIR}/output_push_tag.txt")"
+  assert_true "$(echo "https://github.com/FerriteLabs/ferrite-ops/.github/workflows/release.yml@refs/tags/v${EXPECTED_VERSION}" | grep -qE "$IDENTITY_REGEXP"; echo $?)" \
+    "the derived identity regexp matches the exact normalized push tag"
+  assert_true "$(echo "https://github.com/FerriteLabs/ferrite-ops/.github/workflows/release.yml@refs/heads/main" | grep -qE "$IDENTITY_REGEXP"; echo $?)" \
+    "the derived identity regexp matches trusted dispatches on main"
+  for untrusted in \
+    "https://github.com/FerriteLabs/ferrite-ops/.github/workflows/release.yml@refs/tags/v9.9.9" \
+    "https://github.com/FerriteLabs/ferrite-ops/.github/workflows/release.yml@refs/heads/feature-x" \
+    "https://github.com/FerriteLabs/ferrite-ops/.github/workflows/ci.yml@refs/tags/v${EXPECTED_VERSION}" \
+    "https://github.com/other/ferrite-ops/.github/workflows/release.yml@refs/tags/v${EXPECTED_VERSION}"; do
+    if echo "$untrusted" | grep -qE "$IDENTITY_REGEXP"; then
+      harness_fail "the derived identity regexp incorrectly matched an untrusted identity: ${untrusted}"
+    else
+      harness_ok "the derived identity regexp rejects an untrusted identity: ${untrusted}"
+    fi
+  done
   assert_tag_set push_tag "$EXPECTED_CANDIDATE_TAG"
 else
   harness_fail "push-tag case unexpectedly failed: $(cat "${EXTRACT_DIR}/log_push_tag.txt")"
@@ -751,6 +751,50 @@ if run_case "workflow_dispatch" workflow_dispatch "" "v${EXPECTED_VERSION}" >"${
   assert_tag_set workflow_dispatch "$EXPECTED_CANDIDATE_TAG"
 else
   harness_fail "workflow_dispatch case unexpectedly failed: $(cat "${EXTRACT_DIR}/log_workflow_dispatch.txt")"
+fi
+
+if run_case "workflow_dispatch_default_branch" workflow_dispatch "" "v${EXPECTED_VERSION}" \
+  "" "refs/heads/trunk" "trunk" >"${EXTRACT_DIR}/log_workflow_dispatch_default_branch.txt" 2>&1; then
+  DEFAULT_IDENTITY_REGEXP="$(
+    sed -n 's/^certificate_identity_regexp=//p' \
+      "${EXTRACT_DIR}/output_workflow_dispatch_default_branch.txt"
+  )"
+  assert_true "$(echo "https://github.com/FerriteLabs/ferrite-ops/.github/workflows/release.yml@refs/heads/trunk" | grep -qE "$DEFAULT_IDENTITY_REGEXP"; echo $?)" \
+    "dispatch accepts the exact configured non-main default branch and includes it in Cosign identity trust"
+else
+  harness_fail "workflow_dispatch unexpectedly rejected the exact configured non-main default branch: $(cat "${EXTRACT_DIR}/log_workflow_dispatch_default_branch.txt")"
+fi
+
+TAG_DISPATCH_CURL_MARKER="${EXTRACT_DIR}/tag_dispatch_curl_called"
+export TAG_DISPATCH_CURL_MARKER
+if (
+  curl() {
+    touch "$TAG_DISPATCH_CURL_MARKER"
+    return 1
+  }
+  export -f curl
+  run_case "workflow_dispatch_tag_ref" workflow_dispatch "" "v${EXPECTED_VERSION}" \
+    "v${EXPECTED_VERSION}" "refs/tags/v${EXPECTED_VERSION}"
+) >"${EXTRACT_DIR}/log_workflow_dispatch_tag_ref.txt" 2>&1; then
+  harness_fail "workflow_dispatch unexpectedly accepted a historical tag ref"
+else
+  assert_contains "$(cat "${EXTRACT_DIR}/log_workflow_dispatch_tag_ref.txt")" \
+    "Dispatch releases must run on refs/heads/main or the configured default branch" \
+    "manual dispatch on a tag is rejected with a clear trust error"
+fi
+if [ -e "$TAG_DISPATCH_CURL_MARKER" ]; then
+  harness_fail "manual dispatch on a tag reached checksum retrieval before being rejected"
+else
+  harness_ok "manual dispatch on a tag is rejected before checksum retrieval or registry-capable jobs"
+fi
+
+if run_case "push_ref_mismatch" push "" "" "v${EXPECTED_VERSION}" \
+  "refs/tags/v9.9.9" >"${EXTRACT_DIR}/log_push_ref_mismatch.txt" 2>&1; then
+  harness_fail "push release unexpectedly accepted a tag ref that did not match the candidate"
+else
+  assert_contains "$(cat "${EXTRACT_DIR}/log_push_ref_mismatch.txt")" \
+    "Push releases must run on the exact candidate tag" \
+    "push release rejects a ref/candidate mismatch"
 fi
 
 # --- Normalized concurrency (item 3): a "v"-prefixed input and its bare
@@ -800,7 +844,8 @@ else
   harness_fail "prerelease case unexpectedly failed: $(cat "${EXTRACT_DIR}/log_prerelease.txt")"
 fi
 
-if run_case "bad_semver" push "" "" "not-a-version" >"${EXTRACT_DIR}/log_bad_semver.txt" 2>&1; then
+if run_case "bad_semver" push "" "" "not-a-version" "refs/tags/vnot-a-version" \
+  >"${EXTRACT_DIR}/log_bad_semver.txt" 2>&1; then
   harness_fail "push-tag case with an invalid semver unexpectedly succeeded"
 else
   assert_contains "$(cat "${EXTRACT_DIR}/log_bad_semver.txt")" "Invalid semver" \
