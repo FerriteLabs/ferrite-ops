@@ -699,6 +699,101 @@ single-run repair after coalesced/dropped release events.
 - `docker build -t ferrite:verification .` succeeds, and both `ferrite --version` and `ferrite-cli --version`
   execute from the resulting runtime image, preserving the CI ABI/runtime verification.
 
+## Multi-Platform Exact-Tag Label Trust and Canonical Checksum Truth Resolution (this change)
+
+Two related trust gaps remained even after the exact-image-immutability and reconciliation hardening
+above: release.yml's own pre-build "Check existing exact GHCR tag" step only ever inspected the FIRST
+platform of a multi-platform `.Image` manifest when comparing an existing exact tag's baked labels
+against this run's version/checksum, silently ignoring every other platform; and three workflows that
+each needed the canonical Ferrite source-archive checksum (`version-sync.yml`, `release-orchestration.yml`,
+and — for its own always-computed value — `release.yml`) each duplicated their own inline
+download/validate logic, and two of them (`version-sync.yml`, `release-orchestration.yml`) would use a
+caller-supplied checksum from a `repository_dispatch` payload or manual `workflow_dispatch` input
+directly AS the release's checksum whenever one was supplied, never downloading or comparing it against
+the real tagged source at all.
+
+- **Shared multi-platform exact-tag label verification.** `scripts/verify-exact-image-labels.sh` is a new,
+  independently tested helper that normalizes `docker buildx imagetools inspect ... --format
+  '{{json .Image}}'` output — a single-platform `{"config": {...}}` object OR a multi-platform map of
+  `"<platform>": {"config": {...}}` — into a list of every platform's labels and requires ALL of them,
+  not just the first, to satisfy one of two modes:
+  - `exact <version> <sha256>`: every platform's `org.opencontainers.image.version` and
+    `dev.ferritelabs.image.source-sha256` labels must equal the caller's specific known-correct values
+    exactly. `release.yml`'s "Check existing exact GHCR tag" step now delegates to this mode with its own
+    freshly computed version/checksum, closing the previous first-platform-only gap: a mixed-platform
+    manifest (say, a correct amd64 config paired with a stale or corrupted arm64 config) now fails the
+    idempotency check instead of silently passing.
+  - `consistent <version>`: every platform's version label must equal the exact tag's own name, every
+    platform's source-checksum label must be a well-formed 64-hex-digit value, and every platform must
+    share the exact same checksum value as every other platform. `reconcile-release-tags.yml`'s "Verify
+    every exact stable GHCR source" step now delegates to this mode — reconciliation has no independently
+    known canonical checksum for an arbitrary historical exact tag, but still refuses one whose platforms
+    disagree with each other.
+
+  Both workflows' previously independently-written jq (one first-platform-only, one already
+  all-platforms) are replaced by calls to this ONE shared script, so the two call sites can never drift
+  again on what "this exact tag's labels are trustworthy" means. `tests/test_verify_exact_image_labels.sh`
+  (26 checks) exercises the shared helper directly against fixtures under
+  `tests/fixtures/verify-exact-image-labels/` covering a matching amd64+arm64 manifest, one platform with
+  a mismatched version label, one platform with a mismatched checksum label, one platform missing its
+  labels entirely, a single-platform image (both matching and mismatched), an empty (zero-platform)
+  image, and malformed input JSON — for both `exact` and `consistent` modes, plus usage/argument
+  validation and static wiring assertions against both workflows. `tests/test_exact_image_immutability.sh`
+  and `tests/test_release_reconciliation.sh` each gained real, end-to-end multi-platform
+  match/mismatched-platform/missing-label functional cases that extend their existing fake-registry
+  fixtures to return a genuine multi-platform `.Image` payload and replay the real, extracted workflow
+  step against it.
+
+- **Canonical source-checksum truth.** `scripts/compute-source-checksum.sh` is a new, independently tested
+  helper that is now the ONLY place any release workflow downloads and hashes the tagged Ferrite source
+  archive. It ALWAYS downloads `https://github.com/<owner>/ferrite/archive/refs/tags/v<version>.tar.gz`
+  and computes its SHA256 itself; a caller-supplied checksum is never trusted as truth on its own. If one
+  is supplied, the helper first validates its shape (rejecting anything that is not exactly 64 lowercase
+  hexadecimal characters before any network access, so a malformed or malicious value can never even reach
+  the download step) and then requires it to match the freshly computed canonical value byte-for-byte;
+  any mismatch fails the run loudly instead of silently accepting the supplied value, and a download
+  failure fails closed rather than silently proceeding without a canonical checksum.
+  `version-sync.yml`'s "Extract version and source checksum" step and `release-orchestration.yml`'s
+  "Compute release metadata" step both now call this helper with their own optional supplied checksum
+  input; `release.yml`'s "Determine release version and source checksum" step (which has no
+  caller-supplied checksum input of its own) calls the same helper for its own always-computed value, so
+  all three workflows share the exact same download/validate/compare behavior instead of three
+  independently duplicated implementations.
+
+  `tests/test_compute_source_checksum.sh` (24 checks) fakes `curl` to avoid any real network access and
+  functionally proves: a correct supplied checksum is confirmed and accepted (including an uppercase
+  variant, normalized to lowercase); a syntactically valid but WRONG supplied checksum is rejected with a
+  clear diagnostic and nothing printed to stdout; a syntactically invalid supplied checksum is rejected
+  before any download is attempted; no supplied checksum still yields the canonical computed value; a
+  download failure fails closed with a clear diagnostic, including when a syntactically valid checksum WAS
+  supplied (a supplied value can never substitute for a successful canonical download); malicious
+  command-substitution input is treated as inert data; and static assertions confirm all three workflows
+  wire in the shared helper and no longer trust a supplied checksum directly. `tests/test_release_workflows.sh`
+  was updated throughout: every place it previously supplied an arbitrary, hardcoded checksum for a
+  synthetic (non-existent) release tag now fakes `curl` to return deterministic content and uses THAT
+  content's real SHA256 as the expected canonical value, since the new shared helper genuinely downloads
+  and hashes rather than trusting a supplied literal; it also gained explicit mismatch/no-supplied/download-
+  failure cases replaying the real extracted `version-sync.yml` step end to end.
+
+## Final Verification Pass (multi-platform exact-tag labels and canonical checksum truth)
+
+- `bash tests/test_release_workflows.sh` (208 checks), `bash tests/test_exact_image_immutability.sh`
+  (55 checks), `bash tests/test_release_reconciliation.sh` (104 checks),
+  `bash tests/test_verify_exact_image_labels.sh` (26 checks, new), and
+  `bash tests/test_compute_source_checksum.sh` (24 checks, new) all pass; `bash tests/test_audit_status.sh`
+  passes.
+- `bash tests/run.sh` passes all 31/31 discovered suites (29 previous + the 2 new dedicated suites above).
+- `shellcheck --severity=warning scripts/*.sh tests/*.sh tests/lib/*.sh` and
+  `actionlint .github/workflows/*.yml` pass with no findings, including the two new shared scripts
+  (`scripts/verify-exact-image-labels.sh`, `scripts/compute-source-checksum.sh`) and the four rewired
+  workflows (`release.yml`, `reconcile-release-tags.yml`, `version-sync.yml`, `release-orchestration.yml`).
+- `helm lint --strict` passes for both charts (unchanged by this change); D-02 remains the only deferred
+  item.
+- `gitleaks detect --source . --no-git -v` reports no leaks in the working tree.
+- No production behavior outside the exact-tag label verification and source-checksum computation paths
+  in these four workflows was changed; existing candidate-build, signing, attestation, smoke-test,
+  Docker Hub, and floating-tag-reconciliation behavior is unchanged and still green.
+
 ## Deferred Items
 
 | ID | Description | Reason deferred |

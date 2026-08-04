@@ -146,4 +146,17 @@ assert_not_contains "$GRAFANA_README_CONTENT" "Authorization: Bearer YOUR_API_KE
 assert_contains "$AUDIT_CONTENT" "D-02 is the only deferred item." \
   "AUDIT.md still leaves only D-02 deferred after this change"
 
+assert_contains "$AUDIT_CONTENT" "## Multi-Platform Exact-Tag Label Trust and Canonical Checksum Truth Resolution" \
+  "AUDIT.md records the multi-platform exact-tag label and canonical checksum truth resolution"
+assert_contains "$AUDIT_CONTENT" "scripts/verify-exact-image-labels.sh" \
+  "AUDIT.md records the shared multi-platform exact-tag label verification helper"
+assert_contains "$AUDIT_CONTENT" "scripts/compute-source-checksum.sh" \
+  "AUDIT.md records the shared canonical source-checksum helper"
+assert_contains "$AUDIT_CONTENT" "closing the previous first-platform-only gap" \
+  "AUDIT.md records the release.yml first-platform-only exact-tag label gap being closed"
+assert_contains "$AUDIT_CONTENT" "never trusted as truth on its own" \
+  "AUDIT.md records that a supplied source checksum is never trusted as truth on its own"
+assert_contains "$AUDIT_CONTENT" "31/31 discovered suites" \
+  "AUDIT.md records the full 31-suite verification pass"
+
 harness_summary
