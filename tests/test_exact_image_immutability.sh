@@ -21,8 +21,8 @@ CONTENT="$(cat "$RELEASE_YML")"
 DOCKERFILE_CONTENT="$(cat "$DOCKERFILE")"
 
 # --- Static checks -----------------------------------------------------------
-# Concurrency is enforced at JOB level (build-and-push, promote-exact), keyed
-# on the `prepare` job's normalized, validated version output — NOT a
+# Concurrency is enforced by one release-transaction job, keyed on the
+# `prepare` job's normalized, validated version output — NOT a
 # workflow-level group keyed on the raw triggering event. A raw-event-keyed
 # group would give a `v1.2.3` tag push and an equivalent `1.2.3`
 # workflow_dispatch input two DIFFERENT group strings and never serialize
@@ -33,29 +33,33 @@ DOCKERFILE_CONTENT="$(cat "$DOCKERFILE")"
 assert_contains "$CONTENT" "prepare:" \
   "release.yml defines a trusted prepare job that runs before any build"
 assert_contains "$CONTENT" "needs: prepare" \
-  "build-and-push depends on the prepare job"
+  "release-transaction depends on the prepare job"
 assert_contains "$CONTENT" "group: ferrite-release-exact-\${{ needs.prepare.outputs.version }}" \
-  "build-and-push's concurrency group is keyed on prepare's normalized version"
-assert_contains "$CONTENT" "group: ferrite-release-exact-\${{ needs.build-and-push.outputs.version }}" \
-  "promote-exact's concurrency group is keyed on the same normalized version"
+  "the release transaction's concurrency group is keyed on prepare's normalized version"
+assert_eq "1" "$(grep -c 'group: ferrite-release-exact-' "$RELEASE_YML")" \
+  "one per-version lock covers the complete exact release transaction"
 assert_not_contains "$CONTENT" "github.event_name == 'push' && github.ref_name || github.event.client_payload.version || inputs.tag" \
   "release.yml no longer keys any concurrency group on the raw, un-normalized triggering event"
 assert_contains "$CONTENT" "cancel-in-progress: false" \
   "release.yml never cancels an in-flight release run for the same version"
 assert_contains "$CONTENT" 'candidate_tag: ${{ steps.release_meta.outputs.candidate_tag }}' \
-  "build-and-push exposes the unique candidate tag as a job output"
+  "prepare exposes the unique candidate tag to the release transaction"
 assert_contains "$CONTENT" 'CANDIDATE_TAG="candidate-${RUN_ID}-${RUN_ATTEMPT}"' \
   "the candidate tag is unique per run id AND retry attempt"
 assert_contains "$CONTENT" "id: check_existing" \
-  "build-and-push checks for an existing exact GHCR tag before building anything"
+  "release-transaction checks for an existing exact GHCR tag before building anything"
 assert_contains "$CONTENT" 'if: steps.check_existing.outputs.idempotent != '"'"'true'"'"'' \
   "the build/scan/sign/attest steps are skipped entirely when idempotent"
 assert_contains "$CONTENT" "Scan candidate image with Trivy" \
   "the candidate is scanned with Trivy before signing/attesting"
-assert_contains "$CONTENT" "promote-exact:" \
-  "release.yml defines a dedicated exact-tag promotion job"
-assert_contains "$CONTENT" "needs: [build-and-push, verify, smoke-test]" \
-  "the exact tag is promoted only after build, verify, AND smoke-test all succeed"
+assert_contains "$CONTENT" "release-transaction:" \
+  "release.yml defines one locked exact release transaction"
+assert_not_contains "$CONTENT" "promote-exact:" \
+  "exact promotion is not split into a second job with a lock gap"
+assert_not_contains "$CONTENT" "build-and-push:" \
+  "candidate build is not split from exact promotion"
+assert_contains "$CONTENT" "Smoke test verified image" \
+  "the locked release transaction smoke-tests before exact promotion"
 assert_contains "$CONTENT" "Refusing to overwrite an existing exact version tag" \
   "promote-exact refuses to overwrite an existing exact tag pointing at a different digest"
 assert_contains "$CONTENT" "already points at \${DIGEST}; nothing to promote (idempotent)" \
@@ -86,7 +90,7 @@ import sys, yaml
 release_path, out_path = sys.argv[1:]
 with open(release_path) as f:
     doc = yaml.safe_load(f)
-steps = doc["jobs"]["build-and-push"]["steps"]
+steps = doc["jobs"]["release-transaction"]["steps"]
 run = next(s["run"] for s in steps if s.get("name") == "Check existing exact GHCR tag")
 with open(out_path, "w") as f:
     f.write(run)
@@ -103,7 +107,7 @@ import sys, yaml
 release_path, out_path = sys.argv[1:]
 with open(release_path) as f:
     doc = yaml.safe_load(f)
-steps = doc["jobs"]["promote-exact"]["steps"]
+steps = doc["jobs"]["release-transaction"]["steps"]
 run = next(s["run"] for s in steps if s.get("name") == "Promote the verified digest to the exact immutable version tag")
 with open(out_path, "w") as f:
     f.write(run)

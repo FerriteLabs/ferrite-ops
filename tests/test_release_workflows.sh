@@ -107,7 +107,7 @@ assert_eq "3" "$(grep -c 'certificate-identity-regexp="\$CERTIFICATE_IDENTITY_RE
 
 assert_contains "$RELEASE_CONTENT" "promote-stable:" \
   "release.yml defines a dedicated floating-tag promotion job"
-assert_contains "$RELEASE_CONTENT" "if: needs.build-and-push.outputs.stable == 'true'" \
+assert_contains "$RELEASE_CONTENT" "if: needs.release-transaction.outputs.stable == 'true'" \
   "release.yml promotes floating tags only for stable releases; prereleases stay exact-only"
 assert_contains "$RELEASE_CONTENT" "group: ferrite-floating-tag-promotion" \
   "release.yml serializes floating-tag promotion so concurrent releases cannot race"
@@ -131,10 +131,12 @@ assert_contains "$RELEASE_CONTENT" "candidate-\${RUN_ID}-\${RUN_ATTEMPT}" \
   "release.yml derives a unique candidate tag from the run id and attempt"
 assert_contains "$RELEASE_CONTENT" "dev.ferritelabs.image.source-sha256" \
   "release.yml verifies the baked source-checksum label of an existing exact tag"
-assert_contains "$RELEASE_CONTENT" "promote-exact:" \
-  "release.yml defines a dedicated exact-tag promotion job"
-assert_contains "$RELEASE_CONTENT" "needs: [build-and-push, verify, smoke-test]" \
-  "release.yml only promotes the exact tag after build, verify, AND smoke-test all succeed"
+assert_contains "$RELEASE_CONTENT" "release-transaction:" \
+  "release.yml defines one exact release transaction job"
+assert_not_contains "$RELEASE_CONTENT" "promote-exact:" \
+  "release.yml has no separate exact-promotion job that could create a lock gap"
+assert_not_contains "$RELEASE_CONTENT" "build-and-push:" \
+  "release.yml has no separate build job that releases the version lock before promotion"
 assert_contains "$RELEASE_CONTENT" "Refusing to overwrite an existing exact version tag" \
   "release.yml refuses to overwrite an existing exact tag that points at a different digest"
 
@@ -369,28 +371,44 @@ with open(release_yml_path) as f:
 
 # "Determine release version and source checksum" now runs in the
 # dedicated, trusted `prepare` job — BEFORE any build/scan/registry job —
-# so that build-and-push, verify, smoke-test, and promote-exact can all key
-# their own job-level concurrency on prepare's normalized `version` output.
+# so the complete release-transaction can key one job-level concurrency lock
+# on prepare's normalized `version` output.
 prepare_steps = doc["jobs"]["prepare"]["steps"]
 script = next(s["run"] for s in prepare_steps if s.get("name") == "Determine release version and source checksum")
-if doc["jobs"]["build-and-push"].get("needs") != "prepare":
-    raise SystemExit("build-and-push must depend on the prepare job")
-build_concurrency = doc["jobs"]["build-and-push"].get("concurrency", {})
-if "needs.prepare.outputs.version" not in build_concurrency.get("group", ""):
-    raise SystemExit("build-and-push must key its job-level concurrency on prepare's normalized version")
-if build_concurrency.get("cancel-in-progress") is not False:
-    raise SystemExit("build-and-push's concurrency group must queue (not cancel) an in-flight run for the same version")
+transaction = doc["jobs"]["release-transaction"]
+if transaction.get("needs") != "prepare":
+    raise SystemExit("release-transaction must depend on the prepare job")
+transaction_concurrency = transaction.get("concurrency", {})
+if "needs.prepare.outputs.version" not in transaction_concurrency.get("group", ""):
+    raise SystemExit("release-transaction must key its one job-level concurrency lock on prepare's normalized version")
+if transaction_concurrency.get("cancel-in-progress") is not False:
+    raise SystemExit("release-transaction must queue (not cancel) an in-flight run for the same version")
 
-steps = doc["jobs"]["build-and-push"]["steps"]
+steps = transaction["steps"]
 metadata_index = next(i for i, s in enumerate(steps) if s.get("id") == "meta")
 if metadata_index < 0:
     raise SystemExit("docker/metadata-action step not found")
 
-promote_exact_concurrency = doc["jobs"]["promote-exact"].get("concurrency", {})
-if "needs.build-and-push.outputs.version" not in promote_exact_concurrency.get("group", ""):
-    raise SystemExit("promote-exact must key its job-level concurrency on the normalized version")
-if promote_exact_concurrency.get("cancel-in-progress") is not False:
-    raise SystemExit("promote-exact's concurrency group must queue (not cancel) an in-flight run for the same version")
+for forbidden_job in ("build-and-push", "verify", "smoke-test", "promote-exact"):
+    if forbidden_job in doc["jobs"]:
+        raise SystemExit(f"{forbidden_job} must be consolidated into release-transaction")
+
+required_order = [
+    "Build and push candidate (amd64 + arm64)",
+    "Scan candidate image with Trivy",
+    "Sign container image with Cosign (keyless OIDC)",
+    "Attest SBOM with Cosign (keyless OIDC)",
+    "Verify container signature",
+    "Verify SBOM attestation",
+    "Smoke test verified image",
+    "Promote the verified digest to the exact immutable version tag",
+]
+indices = [
+    next(i for i, step in enumerate(steps) if step.get("name") == name)
+    for name in required_order
+]
+if indices != sorted(indices):
+    raise SystemExit("release-transaction steps are not ordered build -> sign/attest -> verify -> smoke -> exact promotion")
 
 metadata_tags = next(s["with"]["tags"] for s in steps if s.get("id") == "meta")
 required_tags = [
@@ -442,7 +460,7 @@ with open(combine_tags_out_path, "w") as f:
 
 build_step = next(s for s in steps if s.get("id") == "build")
 if build_step["with"]["tags"] != "${{ steps.meta_combined.outputs.tags }}":
-    raise SystemExit("build-and-push step must use the combined tag list, not the raw GHCR-only meta output")
+    raise SystemExit("release-transaction build step must use the combined tag list, not the raw GHCR-only meta output")
 
 with open(release_out_path, "w") as f:
     f.write(script)
@@ -798,11 +816,11 @@ else
 fi
 
 # --- Normalized concurrency (item 3): a "v"-prefixed input and its bare
-# equivalent MUST normalize to the exact same version, since build-and-push
-# and promote-exact key their job-level concurrency group directly on this
+# equivalent MUST normalize to the exact same version, since the complete
+# release-transaction keys its job-level concurrency group directly on this
 # output -- if "v1.2.3" and "1.2.3" produced different `version=` values,
 # the two spellings would never serialize against each other and could race
-# the same release's build/promote-exact pipeline concurrently.
+# the same release transaction concurrently.
 if run_case "workflow_dispatch_bare" workflow_dispatch "" "${EXPECTED_VERSION}" \
   >"${EXTRACT_DIR}/log_workflow_dispatch_bare.txt" 2>&1; then
   VERSION_V="$(grep -E '^version=' "${EXTRACT_DIR}/output_workflow_dispatch.txt" | head -1)"

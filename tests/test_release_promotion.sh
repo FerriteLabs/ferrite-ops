@@ -20,7 +20,7 @@ CONTENT="$(cat "$RELEASE_YML")"
 # --- Static architecture checks --------------------------------------------
 assert_contains "$CONTENT" "promote-stable:" \
   "release.yml defines a dedicated floating-tag promotion job"
-assert_contains "$CONTENT" "if: needs.build-and-push.outputs.stable == 'true'" \
+assert_contains "$CONTENT" "if: needs.release-transaction.outputs.stable == 'true'" \
   "promotion runs only for stable releases; prereleases stay exact-only"
 assert_contains "$CONTENT" "group: ferrite-floating-tag-promotion" \
   "promotion is serialized by a fixed concurrency group"
@@ -34,8 +34,8 @@ assert_contains "$CONTENT" "Resolve current per-tag promoted versions" \
   "promotion independently resolves each floating tag's own currently promoted version"
 assert_not_contains "$CONTENT" "client_payload.*promoted" \
   "promotion never trusts workflow input for the current promoted version"
-assert_contains "$CONTENT" "needs: [build-and-push, promote-exact]" \
-  "floating-tag promotion runs only after the exact tag has itself been promoted"
+assert_contains "$CONTENT" "needs: release-transaction" \
+  "floating-tag promotion runs only after the locked exact release transaction succeeds"
 assert_contains "$CONTENT" "should_promote()" \
   "promotion gates each floating tag independently"
 

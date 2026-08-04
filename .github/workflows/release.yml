@@ -29,12 +29,12 @@ on:
 #      event value: a `v1.2.3` tag push and a `1.2.3` workflow_dispatch input
 #      describe the exact SAME release but would produce two DIFFERENT raw
 #      concurrency-group strings and never serialize against each other.
-#      Instead, build-and-push and promote-exact each carry their own
-#      job-level `concurrency:` keyed on prepare's normalized version, so
-#      any two runs — however differently the version was spelled — that
-#      resolve to the same normalized version always queue behind each
-#      other rather than racing.
-#   1. build-and-push — first checks whether the exact version tag already
+#      Instead, one release-transaction job carries a job-level
+#      `concurrency:` keyed on prepare's normalized version, so any two runs
+#      — however differently the version was spelled — that resolve to the
+#      same normalized version always queue behind each other for the ENTIRE
+#      candidate-build-through-exact-promotion transaction.
+#   1. release-transaction — first checks whether the exact version tag already
 #      exists on GHCR (a previous, successful run of this exact version). If
 #      it does, its signature and its baked version/source-checksum labels
 #      are verified against what this run would publish: a match is treated
@@ -46,27 +46,29 @@ on:
 #      — never the exact version tag itself — then scans it with Trivy,
 #      signs it with cosign, and generates/attaches/attests its SBOM and SLSA
 #      provenance, all against that candidate tag/digest.
-#   2. verify / smoke-test — verify the signature and SBOM attestation and
-#      run a live smoke test against the resolved digest (the candidate's, or
-#      the pre-existing tag's, in the idempotent case).
-#   3. promote-exact — ONLY after every prior job has succeeded, this job
+#      It then verifies the signature and SBOM attestation and runs a live
+#      smoke test against the resolved digest (the candidate's, or the
+#      pre-existing tag's, in the idempotent case).
+#   2. Exact promotion — ONLY after every prior transaction step succeeds,
+#      the same locked job
 #      promotes that fully verified digest to the real, immutable exact
 #      version tag with `docker buildx imagetools create` (no rebuild). It
 #      re-checks immediately beforehand whether the exact tag already exists;
 #      an existing tag with a matching digest is left alone (idempotent
 #      no-op), and one with a *different* digest is refused outright — on
 #      GHCR and, independently, on the optional Docker Hub mirror (copied
-#      with a real cross-registry blob copy — see the promote-exact job
+#      with a real cross-registry blob copy — see the exact-promotion step
 #      below — and digest-verified after the copy, since `imagetools create`
 #      does not reliably copy blob content across DIFFERENT registries).
-#      Because promote-exact only runs once build-and-push, verify, and
-#      smoke-test have all succeeded, a failed run can never leave an
+#      Because exact promotion remains inside the version-locked transaction
+#      and runs only once build, verify, and smoke-test have all succeeded,
+#      a failed run can never leave an
 #      unverified exact tag behind: the exact tag is the LAST thing this
 #      workflow ever writes, not the first. The throwaway candidate tag is
 #      NOT the exact tag and is left in the registry as a harmless,
 #      clearly-named build artifact; registry-level retention/cleanup of
 #      candidate-* tags is intentionally out of scope here (see AUDIT.md).
-#   4. promote-stable — a cheap, serialized digest-promotion job that
+#   3. promote-stable — a cheap, serialized digest-promotion job that
 #      independently advances each of the floating `latest`, `<major>`, and
 #      `<major>.<minor>` tags to this release's digest, but only for stable
 #      releases, and only for the floating tags whose OWN currently promoted
@@ -86,8 +88,8 @@ jobs:
   # the triggering event, strips an optional leading "v", and validates it
   # (both a loose shape check and the shared strict-SemVer validator). Every
   # other job consumes this job's `version` output instead of re-deriving it
-  # from raw event data, and build-and-push/promote-exact each key their own
-  # job-level `concurrency:` group on this exact, normalized value — so a
+  # from raw event data, and release-transaction keys its one job-level
+  # `concurrency:` group on this exact, normalized value — so a
   # `v1.2.3` tag push and a `1.2.3` workflow_dispatch input, which describe
   # the identical release but would otherwise produce two different raw
   # strings, always serialize against each other instead of racing.
@@ -116,8 +118,8 @@ jobs:
       # images are always built from the exact version this workflow run
       # is releasing. Also derives a unique, throwaway candidate tag for
       # this specific run/attempt — the exact version tag is never pushed
-      # directly; it is only ever created later, by promote-exact, from a
-      # fully verified candidate digest.
+      # directly; it is only created at the end of the locked transaction
+      # from a fully verified candidate digest.
       - name: Determine release version and source checksum
         id: release_meta
         env:
@@ -268,16 +270,15 @@ jobs:
             echo "FERRITE_BUILD_ARGS_EOF"
           } >> "$GITHUB_OUTPUT"
 
-  build-and-push:
-    name: Build & Push Docker Image
+  release-transaction:
+    name: Release Transaction
     needs: prepare
     runs-on: ubuntu-latest
-    # Serializes the exact-tag pipeline (this job, and promote-exact below)
-    # across ANY run that resolves to this SAME normalized version — however
-    # differently its raw input was spelled — so a duplicate/retried/
-    # differently-formatted trigger for the same release always queues
-    # behind an in-flight one (and then observes it as an idempotent
-    # no-op via check_existing) instead of racing it.
+    # One lock covers the complete exact-release transaction: existing-tag
+    # check, candidate build, scan, signing/attestation, verification, smoke
+    # test, and exact-tag promotion. A duplicate run cannot enter after a
+    # build lock is released but before promotion because there is no lock
+    # gap and no second exact-promotion job.
     concurrency:
       group: ferrite-release-exact-${{ needs.prepare.outputs.version }}
       cancel-in-progress: false
@@ -287,7 +288,7 @@ jobs:
       id-token: write
       attestations: write
     outputs:
-      digest: ${{ steps.check_existing.outputs.idempotent == 'true' && steps.check_existing.outputs.existing_digest || steps.build.outputs.digest }}
+      digest: ${{ steps.artifact.outputs.digest }}
       image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
       version: ${{ needs.prepare.outputs.version }}
       major: ${{ needs.prepare.outputs.major }}
@@ -423,8 +424,8 @@ jobs:
 
       # The steps below publish ONLY a unique, throwaway candidate tag — the
       # exact, immutable version tag itself is never pushed here; it is only
-      # ever created by promote-exact, once every verification step below
-      # AND the standalone verify/smoke-test jobs have all succeeded. Every
+      # ever created at the end of this same locked transaction, once every
+      # verification and smoke-test step below has succeeded. Every
       # step in this block is skipped entirely when check_existing found an
       # already-verified, matching exact tag (idempotent no-op): no rebuild,
       # no re-signing, no re-attesting.
@@ -512,13 +513,33 @@ jobs:
           provenance: true
           sbom: true
 
+      - name: Resolve candidate or existing exact digest
+        id: artifact
+        env:
+          IDEMPOTENT: ${{ steps.check_existing.outputs.idempotent }}
+          EXISTING_DIGEST: ${{ steps.check_existing.outputs.existing_digest }}
+          BUILT_DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+
+          if [ "$IDEMPOTENT" = "true" ]; then
+            DIGEST="$EXISTING_DIGEST"
+          else
+            DIGEST="$BUILT_DIGEST"
+          fi
+          if ! printf '%s\n' "$DIGEST" | grep -qE '^sha256:[0-9a-f]{64}$'; then
+            echo "::error::Release transaction could not resolve a valid image digest"
+            exit 1
+          fi
+          echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
+
       # --- Supply Chain Security (candidate only) ---
 
       - name: Scan candidate image with Trivy
         if: steps.check_existing.outputs.idempotent != 'true'
         uses: aquasecurity/trivy-action@0.28.0
         with:
-          image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.build.outputs.digest }}
+          image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.artifact.outputs.digest }}
           format: table
           severity: CRITICAL,HIGH
           exit-code: '1'
@@ -526,7 +547,7 @@ jobs:
       - name: Sign container image with Cosign (keyless OIDC)
         if: steps.check_existing.outputs.idempotent != 'true'
         env:
-          DIGEST: ${{ steps.build.outputs.digest }}
+          DIGEST: ${{ steps.artifact.outputs.digest }}
         run: |
           cosign sign --yes \
             "${REGISTRY}/${IMAGE_NAME}@${DIGEST}"
@@ -535,7 +556,7 @@ jobs:
         if: steps.check_existing.outputs.idempotent != 'true'
         uses: anchore/sbom-action@v0
         with:
-          image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.build.outputs.digest }}
+          image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.artifact.outputs.digest }}
           format: spdx-json
           output-file: sbom-spdx.json
           upload-artifact: true
@@ -543,7 +564,7 @@ jobs:
       - name: Attach SBOM to container image
         if: steps.check_existing.outputs.idempotent != 'true'
         env:
-          DIGEST: ${{ steps.build.outputs.digest }}
+          DIGEST: ${{ steps.artifact.outputs.digest }}
         run: |
           cosign attach sbom \
             --sbom sbom-spdx.json \
@@ -552,7 +573,7 @@ jobs:
       - name: Attest SBOM with Cosign (keyless OIDC)
         if: steps.check_existing.outputs.idempotent != 'true'
         env:
-          DIGEST: ${{ steps.build.outputs.digest }}
+          DIGEST: ${{ steps.artifact.outputs.digest }}
         run: |
           cosign attest --yes \
             --predicate sbom-spdx.json \
@@ -564,32 +585,15 @@ jobs:
         uses: actions/attest-build-provenance@v2
         with:
           subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          subject-digest: ${{ steps.build.outputs.digest }}
+          subject-digest: ${{ steps.artifact.outputs.digest }}
           push-to-registry: true
 
-  verify:
-    name: Verify Signatures & Attestations
-    runs-on: ubuntu-latest
-    needs: [prepare, build-and-push]
-    permissions:
-      contents: read
-      packages: read
-      id-token: write
-    steps:
-      - name: Install Cosign
-        uses: sigstore/cosign-installer@v3
-
-      - name: Log in to GitHub Container Registry
-        uses: docker/login-action@v3
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
+      # Re-verify both a fresh candidate and an idempotently reused exact
+      # digest before any live execution or exact-tag write.
       - name: Verify container signature
         env:
-          IMAGE: ${{ needs.build-and-push.outputs.image }}
-          DIGEST: ${{ needs.build-and-push.outputs.digest }}
+          IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          DIGEST: ${{ steps.artifact.outputs.digest }}
           CERTIFICATE_IDENTITY_REGEXP: ${{ needs.prepare.outputs.certificate_identity_regexp }}
         run: |
           cosign verify \
@@ -599,8 +603,8 @@ jobs:
 
       - name: Verify SBOM attestation
         env:
-          IMAGE: ${{ needs.build-and-push.outputs.image }}
-          DIGEST: ${{ needs.build-and-push.outputs.digest }}
+          IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          DIGEST: ${{ steps.artifact.outputs.digest }}
           CERTIFICATE_IDENTITY_REGEXP: ${{ needs.prepare.outputs.certificate_identity_regexp }}
         run: |
           cosign verify-attestation \
@@ -609,88 +613,37 @@ jobs:
             --certificate-identity-regexp="$CERTIFICATE_IDENTITY_REGEXP" \
             "${IMAGE}@${DIGEST}"
 
-  smoke-test:
-    name: Smoke Test Published Image
-    runs-on: ubuntu-latest
-    needs: build-and-push
-    steps:
-      - name: Pull and test image
+      - name: Smoke test verified image
         env:
-          IMAGE: ${{ needs.build-and-push.outputs.image }}
-          DIGEST: ${{ needs.build-and-push.outputs.digest }}
+          IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          DIGEST: ${{ steps.artifact.outputs.digest }}
         run: |
+          set -euo pipefail
+          trap "docker rm -f ferrite-smoke >/dev/null 2>&1 || true" EXIT
+
           docker pull "${IMAGE}@${DIGEST}"
           docker run -d --name ferrite-smoke -p 6399:6379 "${IMAGE}@${DIGEST}"
           sleep 5
-          # Verify server responds to PING
-          echo "PING" | nc -q 1 localhost 6399 | grep -q "PONG" || \
-            (echo "Smoke test failed: PING did not return PONG" && exit 1)
+          if ! echo "PING" | nc -q 1 localhost 6399 | grep -q "PONG"; then
+            echo "::error::Smoke test failed: PING did not return PONG"
+            exit 1
+          fi
           echo "Smoke test passed"
-          docker stop ferrite-smoke
 
-  # ── Promote the verified candidate to the exact, immutable version tag ────
-  # Runs ONLY after build-and-push, verify, and smoke-test have all
-  # succeeded, so a failed run can never leave an unverified exact tag
-  # behind — this job is the ONLY place that ever creates or touches the
-  # exact version tag, and it is the last thing this workflow does before
-  # promote-stable. It re-checks immediately beforehand whether the exact
-  # tag already exists on each registry: a match is left untouched
-  # (idempotent no-op), and a different digest is refused outright rather
-  # than overwritten.
-  promote-exact:
-    name: Promote Verified Candidate to Exact Version Tag
-    runs-on: ubuntu-latest
-    needs: [build-and-push, verify, smoke-test]
-    # Same normalized-version group as build-and-push above: any other run
-    # (however its input was spelled) that resolves to this exact normalized
-    # version queues behind this promotion rather than racing its
-    # read-compare-write against an existing exact tag.
-    concurrency:
-      group: ferrite-release-exact-${{ needs.build-and-push.outputs.version }}
-      cancel-in-progress: false
-    permissions:
-      contents: read
-      packages: write
-    steps:
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Log in to GitHub Container Registry
-        uses: docker/login-action@v3
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Log in to Docker Hub
-        uses: docker/login-action@v3
-        if: needs.build-and-push.outputs.dockerhub_enabled == 'true'
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-
-      # `docker buildx imagetools create` does not reliably copy blob
-      # content BETWEEN different registries — it can create a manifest
-      # list referencing digests, but the underlying layer/config blobs must
-      # already exist in the destination registry. That holds for GHCR (the
-      # source digest was pushed there directly) but not necessarily for an
-      # optional Docker Hub backfill, so crane — a real, pinned OCI registry
-      # client that performs an actual all-platform blob copy — is used
-      # instead for that cross-registry case only. Entirely conditional on
-      # Docker Hub eligibility, exactly like the login step above.
+      # Docker Hub exact-tag backfill needs a real cross-registry blob copy.
       - name: Set up crane
-        if: needs.build-and-push.outputs.dockerhub_enabled == 'true'
+        if: steps.dockerhub.outputs.enabled == 'true'
         uses: imjasonh/setup-crane@v0.7
         with:
           version: v0.21.8
 
       - name: Promote the verified digest to the exact immutable version tag
         env:
-          VERSION: ${{ needs.build-and-push.outputs.version }}
-          DIGEST: ${{ needs.build-and-push.outputs.digest }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+          DIGEST: ${{ steps.artifact.outputs.digest }}
           GHCR_IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           DOCKERHUB_IMAGE: ${{ env.DOCKERHUB_IMAGE }}
-          DOCKERHUB_ENABLED: ${{ needs.build-and-push.outputs.dockerhub_enabled }}
+          DOCKERHUB_ENABLED: ${{ steps.dockerhub.outputs.enabled }}
         run: |
           set -euo pipefail
 
@@ -812,8 +765,8 @@ jobs:
   promote-stable:
     name: Promote Floating Tags
     runs-on: ubuntu-latest
-    needs: [build-and-push, promote-exact]
-    if: needs.build-and-push.outputs.stable == 'true'
+    needs: release-transaction
+    if: needs.release-transaction.outputs.stable == 'true'
     permissions:
       contents: read
       packages: write
@@ -835,7 +788,7 @@ jobs:
 
       - name: Log in to Docker Hub
         uses: docker/login-action@v3
-        if: needs.build-and-push.outputs.dockerhub_enabled == 'true'
+        if: needs.release-transaction.outputs.dockerhub_enabled == 'true'
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
@@ -850,8 +803,8 @@ jobs:
         id: current
         env:
           GHCR_IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          MAJOR: ${{ needs.build-and-push.outputs.major }}
-          MAJOR_MINOR: ${{ needs.build-and-push.outputs.major_minor }}
+          MAJOR: ${{ needs.release-transaction.outputs.major }}
+          MAJOR_MINOR: ${{ needs.release-transaction.outputs.major_minor }}
         run: |
           set -euo pipefail
 
@@ -902,16 +855,16 @@ jobs:
       # part of the floating-tag set.
       - name: Promote floating tags to this digest
         env:
-          CANDIDATE: ${{ needs.build-and-push.outputs.version }}
-          MAJOR: ${{ needs.build-and-push.outputs.major }}
-          MAJOR_MINOR: ${{ needs.build-and-push.outputs.major_minor }}
+          CANDIDATE: ${{ needs.release-transaction.outputs.version }}
+          MAJOR: ${{ needs.release-transaction.outputs.major }}
+          MAJOR_MINOR: ${{ needs.release-transaction.outputs.major_minor }}
           LATEST_CURRENT: ${{ steps.current.outputs.latest }}
           MAJOR_CURRENT: ${{ steps.current.outputs.major }}
           MAJOR_MINOR_CURRENT: ${{ steps.current.outputs.major_minor }}
-          DIGEST: ${{ needs.build-and-push.outputs.digest }}
+          DIGEST: ${{ needs.release-transaction.outputs.digest }}
           GHCR_IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           DOCKERHUB_IMAGE: ${{ env.DOCKERHUB_IMAGE }}
-          DOCKERHUB_ENABLED: ${{ needs.build-and-push.outputs.dockerhub_enabled }}
+          DOCKERHUB_ENABLED: ${{ needs.release-transaction.outputs.dockerhub_enabled }}
           ORDER_SCRIPT: scripts/release-ordering.sh
         run: |
           set -euo pipefail
