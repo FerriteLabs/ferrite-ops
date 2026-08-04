@@ -49,6 +49,7 @@ RELEASE_CONTENT="$(cat "$RELEASE_YML")"
 RECONCILE_CONTENT="$(cat "$RECONCILE_YML")"
 VERSION_SYNC_CONTENT="$(cat "$VERSION_SYNC_YML")"
 ORCHESTRATION_CONTENT="$(cat "$ORCHESTRATION_YML")"
+CHECKSUM_SCRIPT_CONTENT="$(cat "${REPO_ROOT}/scripts/compute-source-checksum.sh")"
 LABELS_SCRIPT_CONTENT="$(cat "${REPO_ROOT}/scripts/verify-exact-image-labels.sh")"
 
 # --- Static checks: release.yml ---------------------------------------------
@@ -58,10 +59,14 @@ assert_contains "$RELEASE_CONTENT" "build-args: \${{ needs.prepare.outputs.build
   "release.yml passes the derived FERRITE_VERSION/FERRITE_SOURCE_SHA256 to docker/build-push-action"
 assert_contains "$RELEASE_CONTENT" 'grep -qE' \
   "release.yml validates the derived version against a semver pattern"
-assert_contains "$RELEASE_CONTENT" "'^[0-9a-f]{64}$'" \
-  "release.yml validates computed source checksums as exactly 64 hexadecimal characters"
-assert_contains "$RELEASE_CONTENT" "shasum -a 256" \
-  "release.yml computes the source archive checksum"
+assert_contains "$RELEASE_CONTENT" "CHECKSUM_SCRIPT: scripts/compute-source-checksum.sh" \
+  "release.yml wires in the shared canonical-checksum helper"
+assert_contains "$RELEASE_CONTENT" 'bash "$CHECKSUM_SCRIPT"' \
+  "release.yml delegates checksum computation to the shared helper"
+assert_contains "$CHECKSUM_SCRIPT_CONTENT" "'^[0-9a-f]{64}$'" \
+  "the shared checksum helper validates checksums as exactly 64 hexadecimal characters"
+assert_contains "$CHECKSUM_SCRIPT_CONTENT" "shasum -a 256" \
+  "the shared checksum helper computes the source archive checksum"
 assert_contains "$RELEASE_CONTENT" "GITHUB_REF_NAME" \
   "release.yml derives the version from the push-tag ref for tag pushes"
 assert_contains "$RELEASE_CONTENT" "github.event.client_payload.version" \
@@ -217,10 +222,10 @@ assert_contains "$VERSION_SYNC_CONTENT" "ARG FERRITE_VERSION=" \
   "version-sync.yml updates each Dockerfile's FERRITE_VERSION default"
 assert_contains "$VERSION_SYNC_CONTENT" 'grep -qE' \
   "version-sync.yml validates the version against a semver pattern"
-assert_contains "$VERSION_SYNC_CONTENT" "'^[0-9a-f]{64}$'" \
-  "version-sync.yml validates supplied and computed source checksums"
-assert_contains "$VERSION_SYNC_CONTENT" "shasum -a 256" \
-  "version-sync.yml computes the source checksum when not explicitly provided"
+assert_contains "$VERSION_SYNC_CONTENT" "CHECKSUM_SCRIPT: scripts/compute-source-checksum.sh" \
+  "version-sync.yml wires in the shared canonical-checksum helper"
+assert_contains "$VERSION_SYNC_CONTENT" 'bash "$CHECKSUM_SCRIPT" "$REPOSITORY_OWNER" "$VERSION" "$INPUT_SHA256"' \
+  "version-sync.yml always computes the canonical checksum via the shared helper, passing any supplied value only for comparison"
 assert_contains "$VERSION_SYNC_CONTENT" "charts/ferrite-sidecar/Chart.yaml" \
   "version-sync.yml keeps the sidecar appVersion synchronized"
 assert_contains "$VERSION_SYNC_CONTENT" "ferrite-ops-v\${VERSION}" \
@@ -248,8 +253,10 @@ for active_target in \
   assert_contains "$VERSION_SYNC_CONTENT" "$active_target" \
     "version-sync.yml includes ${active_target} in the release transaction"
 done
-assert_contains "$ORCHESTRATION_CONTENT" "'^[0-9a-f]{64}$'" \
-  "release-orchestration.yml validates supplied and computed source checksums"
+assert_contains "$ORCHESTRATION_CONTENT" "CHECKSUM_SCRIPT: scripts/compute-source-checksum.sh" \
+  "release-orchestration.yml wires in the shared canonical-checksum helper"
+assert_contains "$ORCHESTRATION_CONTENT" 'bash "$CHECKSUM_SCRIPT" "$REPOSITORY_OWNER" "$VERSION" "$INPUT_SHA256"' \
+  "release-orchestration.yml always computes the canonical checksum via the shared helper, passing any supplied value only for comparison"
 assert_eq "5" "$(grep -c 'bash "\$ORDER_SCRIPT" validate' "$ORCHESTRATION_YML")" \
   "release-orchestration.yml's prepare job and all four downstream jobs call the shared strict-SemVer validator"
 assert_not_contains "$ORCHESTRATION_CONTENT" \
@@ -746,6 +753,7 @@ run_case() {
     export RUN_ID="$EXPECTED_RUN_ID"
     export RUN_ATTEMPT="$EXPECTED_RUN_ATTEMPT"
     export ORDER_SCRIPT="${REPO_ROOT}/scripts/release-ordering.sh"
+    export CHECKSUM_SCRIPT="${REPO_ROOT}/scripts/compute-source-checksum.sh"
     bash "${EXTRACT_DIR}/release_meta.sh"
   )
 }
@@ -1003,6 +1011,7 @@ run_version_sync_meta() {
     export INPUT_SHA256="$checksum"
     export REPOSITORY_OWNER="FerriteLabs"
     export GITHUB_OUTPUT="$output"
+    export CHECKSUM_SCRIPT="${REPO_ROOT}/scripts/compute-source-checksum.sh"
     bash "${EXTRACT_DIR}/version_sync_meta.sh"
   )
 }
@@ -1034,10 +1043,21 @@ fi
 # real payload shape and applies the full active-release transaction from
 # it — the scenario core actually triggers on every release.
 FERRITE_RELEASE_VERSION="9.9.9"
-FERRITE_RELEASE_SHA256="bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-if run_version_sync_meta "$FERRITE_RELEASE_VERSION" "$FERRITE_RELEASE_SHA256" \
-  "${EXTRACT_DIR}/ferrite_release_meta.out" \
-  >"${EXTRACT_DIR}/log_ferrite_release_meta.txt" 2>&1; then
+# The shared checksum helper now ALWAYS downloads and computes the canonical
+# source archive checksum itself (see compute-source-checksum.sh), so this
+# fake, non-existent tag's payload checksum must match a fake but
+# deterministic "download" rather than an arbitrary literal: fake `curl` to
+# return fixed content and use ITS real SHA256 as the payload's supplied
+# (and expected canonical) checksum.
+FERRITE_RELEASE_CONTENT="ferrite-release-dispatch-fixture"
+FERRITE_RELEASE_SHA256="$(printf '%s' "$FERRITE_RELEASE_CONTENT" | shasum -a 256 | awk '{print $1}')"
+if (
+  curl() { printf '%s' "$FERRITE_RELEASE_CONTENT"; }
+  export -f curl
+  export FERRITE_RELEASE_CONTENT
+  run_version_sync_meta "$FERRITE_RELEASE_VERSION" "$FERRITE_RELEASE_SHA256" \
+    "${EXTRACT_DIR}/ferrite_release_meta.out"
+) >"${EXTRACT_DIR}/log_ferrite_release_meta.txt" 2>&1; then
   META_OUT="$(cat "${EXTRACT_DIR}/ferrite_release_meta.out")"
   assert_contains "$META_OUT" "version=${FERRITE_RELEASE_VERSION}" \
     "version-sync.yml extracts the version from a ferrite-release dispatch payload"
@@ -1084,6 +1104,7 @@ run_orchestration_meta() {
     export REPOSITORY_OWNER="FerriteLabs"
     export GITHUB_OUTPUT="$output"
     export ORDER_SCRIPT="${REPO_ROOT}/scripts/release-ordering.sh"
+    export CHECKSUM_SCRIPT="${REPO_ROOT}/scripts/compute-source-checksum.sh"
     bash "${EXTRACT_DIR}/orchestration_meta.sh"
   )
 }
@@ -1122,14 +1143,69 @@ else
   harness_ok "release-orchestration.yml rejects a leading-zero version core via the shared validator"
 fi
 
-# Uppercase supplied checksums are normalized before being emitted.
-UPPER_SHA256="AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-if run_version_sync_meta "v9.8.7" "$UPPER_SHA256" \
-  "${EXTRACT_DIR}/normalized_sync.out" >/dev/null 2>&1; then
-  assert_contains "$(cat "${EXTRACT_DIR}/normalized_sync.out")" "sha256=${SYNC_SHA256}" \
+# Uppercase supplied checksums are normalized before being emitted, and a
+# valid uppercase value that matches the canonical computed checksum
+# (case-insensitively) is accepted rather than rejected as a mismatch.
+NORMALIZATION_CONTENT="ferrite-checksum-normalization-fixture"
+NORMALIZATION_SHA256="$(printf '%s' "$NORMALIZATION_CONTENT" | shasum -a 256 | awk '{print $1}')"
+UPPER_SHA256="$(printf '%s' "$NORMALIZATION_SHA256" | tr 'a-f' 'A-F')"
+if (
+  curl() { printf '%s' "$NORMALIZATION_CONTENT"; }
+  export -f curl
+  export NORMALIZATION_CONTENT
+  run_version_sync_meta "v9.8.7" "$UPPER_SHA256" \
+    "${EXTRACT_DIR}/normalized_sync.out"
+) >/dev/null 2>&1; then
+  assert_contains "$(cat "${EXTRACT_DIR}/normalized_sync.out")" "sha256=${NORMALIZATION_SHA256}" \
     "version-sync.yml normalizes a valid supplied checksum to lowercase"
 else
-  harness_fail "version-sync.yml rejected a valid uppercase checksum"
+  harness_fail "version-sync.yml rejected a valid uppercase checksum matching the canonical computed source"
+fi
+
+# A syntactically valid but WRONG supplied checksum (right shape, does not
+# match the canonical computed source) must be rejected outright rather than
+# silently trusted or silently replaced.
+MISMATCH_SHA256="ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+if (
+  curl() { printf '%s' "$NORMALIZATION_CONTENT"; }
+  export -f curl
+  export NORMALIZATION_CONTENT
+  run_version_sync_meta "v9.8.7" "$MISMATCH_SHA256" \
+    "${EXTRACT_DIR}/mismatch_sync.out"
+) >"${EXTRACT_DIR}/log_mismatch_sync.txt" 2>&1; then
+  harness_fail "version-sync.yml unexpectedly accepted a syntactically valid but mismatched supplied checksum"
+else
+  assert_contains "$(cat "${EXTRACT_DIR}/log_mismatch_sync.txt")" "does not match the canonical computed checksum" \
+    "version-sync.yml rejects a syntactically valid supplied checksum that does not match the canonical download"
+fi
+
+# No supplied checksum at all: the canonical value is downloaded and
+# computed from scratch.
+if (
+  curl() { printf '%s' "$NORMALIZATION_CONTENT"; }
+  export -f curl
+  export NORMALIZATION_CONTENT
+  run_version_sync_meta "v9.8.7" "" \
+    "${EXTRACT_DIR}/no_supplied_sync.out"
+) >"${EXTRACT_DIR}/log_no_supplied_sync.txt" 2>&1; then
+  assert_contains "$(cat "${EXTRACT_DIR}/no_supplied_sync.out")" "sha256=${NORMALIZATION_SHA256}" \
+    "version-sync.yml computes the canonical checksum end to end when none is supplied"
+else
+  harness_fail "version-sync.yml unexpectedly failed with no supplied checksum: $(cat "${EXTRACT_DIR}/log_no_supplied_sync.txt")"
+fi
+
+# A download failure (network error, missing tag, ...) must fail the sync
+# rather than silently proceeding without a canonical checksum.
+if (
+  curl() { return 22; }
+  export -f curl
+  run_version_sync_meta "v9.8.7" "" \
+    "${EXTRACT_DIR}/download_failure_sync.out"
+) >"${EXTRACT_DIR}/log_download_failure_sync.txt" 2>&1; then
+  harness_fail "version-sync.yml unexpectedly succeeded despite a canonical source download failure"
+else
+  assert_contains "$(cat "${EXTRACT_DIR}/log_download_failure_sync.txt")" "failed to download or hash the canonical source archive" \
+    "version-sync.yml fails closed when the canonical source archive cannot be downloaded"
 fi
 
 if command -v actionlint >/dev/null 2>&1; then

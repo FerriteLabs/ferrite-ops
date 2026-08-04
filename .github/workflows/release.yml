@@ -130,6 +130,7 @@ jobs:
           RUN_ID: ${{ github.run_id }}
           RUN_ATTEMPT: ${{ github.run_attempt }}
           ORDER_SCRIPT: scripts/release-ordering.sh
+          CHECKSUM_SCRIPT: scripts/compute-source-checksum.sh
         run: |
           set -euo pipefail
 
@@ -229,15 +230,19 @@ jobs:
           fi
           CERTIFICATE_IDENTITY_REGEXP="^https://github\\.com/${REGEX_REPOSITORY}/\\.github/workflows/release\\.yml@refs/(${TRUSTED_REFS})$"
 
+          # Shared with version-sync.yml and release-orchestration.yml so
+          # every workflow that needs the canonical Ferrite source checksum
+          # computes it the exact same way. release.yml has no
+          # caller-supplied checksum input of its own; the helper always
+          # downloads and computes the canonical value fresh.
           REPOSITORY_OWNER="${REPOSITORY%%/*}"
-          TARBALL_URL="https://github.com/${REPOSITORY_OWNER}/ferrite/archive/refs/tags/v${VERSION}.tar.gz"
-          echo "Computing source archive SHA256 for ${TARBALL_URL} ..."
-          SHA256="$(curl -fsSL "$TARBALL_URL" | shasum -a 256 | awk '{print $1}')"
-          SHA256="$(printf '%s' "$SHA256" | tr 'A-F' 'a-f')"
-          if ! printf '%s\n' "$SHA256" | grep -qE '^[0-9a-f]{64}$'; then
-            echo "::error::Failed to obtain a valid SHA256 checksum for the source tarball"
+          CHECKSUM_ERR_LOG="$(mktemp)"
+          trap 'rm -f "$CHECKSUM_ERR_LOG"' EXIT
+          if ! SHA256="$(bash "$CHECKSUM_SCRIPT" "$REPOSITORY_OWNER" "$VERSION" 2>"$CHECKSUM_ERR_LOG")"; then
+            echo "::error::$(cat "$CHECKSUM_ERR_LOG")"
             exit 1
           fi
+          cat "$CHECKSUM_ERR_LOG" >&2
 
           echo "::notice::Building Ferrite v${VERSION} (source SHA256: ${SHA256})"
 

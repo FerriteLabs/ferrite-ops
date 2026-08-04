@@ -45,6 +45,7 @@ jobs:
           WORKFLOW_VERSION: ${{ inputs.version }}
           INPUT_SHA256: ${{ github.event.client_payload.sha256 || inputs.sha256 }}
           REPOSITORY_OWNER: ${{ github.repository_owner }}
+          CHECKSUM_SCRIPT: scripts/compute-source-checksum.sh
         run: |
           set -euo pipefail
 
@@ -74,19 +75,20 @@ jobs:
             exit 1
           fi
 
-          if [ -n "$INPUT_SHA256" ]; then
-            SHA256="$INPUT_SHA256"
-          else
-            TARBALL_URL="https://github.com/${REPOSITORY_OWNER}/ferrite/archive/refs/tags/v${VERSION}.tar.gz"
-            echo "Computing source archive SHA256 for ${TARBALL_URL} ..."
-            SHA256="$(curl -fsSL "$TARBALL_URL" | shasum -a 256 | awk '{print $1}')"
-          fi
-
-          SHA256="$(printf '%s' "$SHA256" | tr 'A-F' 'a-f')"
-          if ! printf '%s\n' "$SHA256" | grep -qE '^[0-9a-f]{64}$'; then
-            echo "::error::SHA256 must be exactly 64 hexadecimal characters"
+          # The shared checksum helper ALWAYS downloads and computes the
+          # canonical source archive checksum itself; a supplied INPUT_SHA256
+          # (from a repository_dispatch payload or a manual workflow_dispatch
+          # input) is never trusted as truth on its own. If supplied, the
+          # helper validates its shape and then requires it to match the
+          # freshly computed canonical value byte-for-byte, failing loudly on
+          # any mismatch instead of silently accepting an unverified value.
+          CHECKSUM_ERR_LOG="$(mktemp)"
+          trap 'rm -f "$CHECKSUM_ERR_LOG"' EXIT
+          if ! SHA256="$(bash "$CHECKSUM_SCRIPT" "$REPOSITORY_OWNER" "$VERSION" "$INPUT_SHA256" 2>"$CHECKSUM_ERR_LOG")"; then
+            echo "::error::$(cat "$CHECKSUM_ERR_LOG")"
             exit 1
           fi
+          cat "$CHECKSUM_ERR_LOG" >&2
 
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
           echo "sha256=${SHA256}" >> "$GITHUB_OUTPUT"
