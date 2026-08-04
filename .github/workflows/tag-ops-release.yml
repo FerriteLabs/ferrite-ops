@@ -43,7 +43,10 @@ jobs:
             exit 1
           fi
           test "$(grep -c '^FERRITE_VERSION=' "$ACTIVE_RELEASE")" -eq 1
-          VERSION="$(sed -n 's/^FERRITE_VERSION=//p' "$ACTIVE_RELEASE")"
+          RAW_VERSION="$(sed -n 's/^FERRITE_VERSION=//p' "$ACTIVE_RELEASE")"
+          # Normalize exactly once for the entire workflow. The tag job
+          # consumes this output and never strips a prefix again.
+          VERSION="${RAW_VERSION#v}"
           # The trusted shared validator (not a locally duplicated regex)
           # enforces strict SemVer 2.0: it rejects a leading zero in the
           # core (e.g. "01.2.3") AND in any purely-numeric pre-release
@@ -95,6 +98,7 @@ jobs:
         id: release
         env:
           MERGED_SHA: ${{ github.sha }}
+          VERSION: ${{ needs.resolve.outputs.version }}
           ORDER_SCRIPT: scripts/release-ordering.sh
         run: |
           set -euo pipefail
@@ -121,8 +125,15 @@ jobs:
 
           test "$(grep -c '^FERRITE_VERSION=' "$ACTIVE_RELEASE")" -eq 1
           test "$(grep -c '^FERRITE_SOURCE_SHA256=' "$ACTIVE_RELEASE")" -eq 1
-          VERSION="$(sed -n 's/^FERRITE_VERSION=//p' "$ACTIVE_RELEASE")"
+          RAW_VERSION="$(sed -n 's/^FERRITE_VERSION=//p' "$ACTIVE_RELEASE")"
           SHA256="$(sed -n 's/^FERRITE_SOURCE_SHA256=//p' "$ACTIVE_RELEASE")"
+          case "$RAW_VERSION" in
+            "$VERSION"|"v${VERSION}") ;;
+            *)
+              echo "::error::active-release.env changed after the resolve job (${RAW_VERSION} != ${VERSION})"
+              exit 1
+              ;;
+          esac
           # Trusted shared validator (see the "resolve" job above): rejects
           # leading zeros in the core or in a numeric pre-release identifier.
           if ! bash "$ORDER_SCRIPT" validate "$VERSION"; then

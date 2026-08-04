@@ -64,6 +64,8 @@ assert_contains "$CONTENT" "resolve:" \
   "ops tag workflow resolves the canonical version in its own job"
 assert_contains "$CONTENT" "needs.resolve.outputs.version" \
   "ops tag workflow keys its concurrency group on the resolved canonical version"
+assert_eq "1" "$(grep -c 'VERSION="${RAW_VERSION#v}"' "$WORKFLOW")" \
+  "ops tag workflow normalizes an optional leading v exactly once"
 
 if ! command -v python3 >/dev/null 2>&1 ||
   ! python3 -c "import yaml" >/dev/null 2>&1; then
@@ -176,6 +178,23 @@ else
   harness_fail "resolve job unexpectedly failed"
 fi
 
+# The single normalization point accepts both canonical spellings and emits
+# the same bare SemVer used by concurrency and all downstream validation.
+PREFIXED_FIXTURE="${TMP}/prefixed-fixture"
+cp -R "$FIXTURE" "$PREFIXED_FIXTURE"
+sed -i.bak "s/^FERRITE_VERSION=.*/FERRITE_VERSION=v${EXPECTED_VERSION}/" "${PREFIXED_FIXTURE}/active-release.env"
+rm -f "${PREFIXED_FIXTURE}/active-release.env.bak"
+if (
+  cd "$PREFIXED_FIXTURE" &&
+    GITHUB_OUTPUT="${TMP}/prefixed_resolve.out" \
+      ORDER_SCRIPT="${REPO_ROOT}/scripts/release-ordering.sh" bash "$RESOLVE_SCRIPT"
+); then
+  assert_contains "$(cat "${TMP}/prefixed_resolve.out")" "version=${EXPECTED_VERSION}" \
+    "resolve job normalizes a v-prefixed canonical version exactly once"
+else
+  harness_fail "resolve job unexpectedly rejected a valid v-prefixed canonical version"
+fi
+
 # --- resolve job: strict SemVer via the shared validator, not a locally
 # duplicated regex -- rejects a leading zero in the core or in a numeric
 # pre-release identifier, which the OLD locally duplicated regex accepted.
@@ -192,6 +211,20 @@ if (
 else
   assert_contains "$(cat "${TMP}/leading_zero_resolve.log")" "strict SemVer" \
     "resolve job rejects a leading-zero numeric pre-release identifier via the shared validator"
+fi
+LEADING_ZERO_CORE_FIXTURE="${TMP}/leading-zero-core-fixture"
+cp -R "$FIXTURE" "$LEADING_ZERO_CORE_FIXTURE"
+sed -i.bak "s/^FERRITE_VERSION=.*/FERRITE_VERSION=01.2.3/" "${LEADING_ZERO_CORE_FIXTURE}/active-release.env"
+rm -f "${LEADING_ZERO_CORE_FIXTURE}/active-release.env.bak"
+if (
+  cd "$LEADING_ZERO_CORE_FIXTURE" &&
+    GITHUB_OUTPUT="${TMP}/leading_zero_core_resolve.out" \
+      ORDER_SCRIPT="${REPO_ROOT}/scripts/release-ordering.sh" bash "$RESOLVE_SCRIPT"
+) >"${TMP}/leading_zero_core_resolve.log" 2>&1; then
+  harness_fail "resolve job unexpectedly accepted a leading-zero version core (01.2.3)"
+else
+  assert_contains "$(cat "${TMP}/leading_zero_core_resolve.log")" "strict SemVer" \
+    "resolve job rejects a leading-zero version core via the shared validator"
 fi
 
 # --- main-tip validation: passes when this push IS the current tip ---------
@@ -224,7 +257,7 @@ OUTPUT="${TMP}/release.out"
 
 if (
   cd "$FIXTURE" &&
-    MERGED_SHA="$MERGED_SHA" GITHUB_OUTPUT="$OUTPUT" \
+    MERGED_SHA="$MERGED_SHA" VERSION="$EXPECTED_VERSION" GITHUB_OUTPUT="$OUTPUT" \
       ORDER_SCRIPT="${REPO_ROOT}/scripts/release-ordering.sh" bash "$VALIDATE_SCRIPT"
 ); then
   assert_contains "$(cat "$OUTPUT")" "version=${EXPECTED_VERSION}" \
@@ -309,7 +342,7 @@ sed -i.bak "s/appVersion: \"${EXPECTED_VERSION}\"/appVersion: \"9.9.9\"/" \
 rm -f "${FIXTURE}/charts/ferrite/Chart.yaml.bak"
 if (
   cd "$FIXTURE" &&
-    MERGED_SHA="$MERGED_SHA" GITHUB_OUTPUT="${TMP}/drift.out" \
+    MERGED_SHA="$MERGED_SHA" VERSION="$EXPECTED_VERSION" GITHUB_OUTPUT="${TMP}/drift.out" \
       ORDER_SCRIPT="${REPO_ROOT}/scripts/release-ordering.sh" bash "$VALIDATE_SCRIPT"
 ); then
   harness_fail "ops tag validation unexpectedly accepted chart/appVersion drift"
