@@ -103,4 +103,21 @@ assert_contains "$AUDIT_CONTENT" "1.9.1\` published after \`2.0.0" \
 assert_contains "$AUDIT_CONTENT" "29/29 discovered suites" \
   "AUDIT.md records the final 29-suite verification pass"
 
+for finding in F-54 F-55 F-56 F-57 F-58 F-59; do
+  assert_contains "$AUDIT_CONTENT" "| ${finding} |" \
+    "AUDIT.md records release-hardening finding ${finding} as fixed"
+done
+assert_contains "$AUDIT_CONTENT" "## Candidate Metadata, Cross-Registry Backfill, Normalized Concurrency, Identity Scoping, Atomic Tagging, and Strict SemVer Resolution" \
+  "AUDIT.md records this change's release-hardening resolution section"
+assert_contains "$AUDIT_CONTENT" "org.opencontainers.image.version=\${{ needs.prepare.outputs.version }}" \
+  "AUDIT.md records the explicit candidate OCI version label override"
+assert_contains "$AUDIT_CONTENT" "imjasonh/setup-crane" \
+  "AUDIT.md records the pinned crane cross-registry blob copy tool"
+assert_contains "$AUDIT_CONTENT" "ferrite-release-exact-<version>" \
+  "AUDIT.md records the normalized-version job-level concurrency group"
+assert_contains "$AUDIT_CONTENT" "force-with-lease" \
+  "AUDIT.md records the atomic lease-guarded ops tag push"
+assert_contains "$AUDIT_CONTENT" "D-02 is the only deferred item." \
+  "AUDIT.md still leaves only D-02 deferred after this change"
+
 harness_summary

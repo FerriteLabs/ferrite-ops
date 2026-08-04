@@ -62,6 +62,12 @@
 | F-51 | P1 | RPM prereleases | Version sync accepted prerelease SemVer and wrote the hyphenated value directly into RPM `Version`, which is not the repository's RPM versioning policy. | Fixed; stable `x.y.z` releases update `Version` and reset `Release` to `1%{?dist}`, while prereleases explicitly skip the RPM spec byte-for-byte; stable and `0.5.0-rc.1` functional replays pass |
 | F-52 | P1 | Playground container health | `Dockerfile.playground` health depended on `/api/health`, so saturation of the public HTTP/backend path could mark a healthy private Ferrite child unhealthy. | Fixed; the image healthcheck executes `ferrite-cli -p 6380 PING` directly against the loopback child, removes the curl-only runtime dependency, and a real-image saturation probe proves the internal check still returns `PONG` when all public HTTP connection slots are occupied |
 | F-53 | P1 | HTTP database selection | `/api/execute` allowed `SELECT` even though every HTTP command uses a new backend connection, so success falsely implied database selection would persist. | Fixed; HTTP `SELECT` returns `409` with a stateless-HTTP explanation before forwarding, while one persistent public RESP connection retains `SELECT` state and a fresh RESP connection remains on database 0 |
+| F-54 | P1 | Release image metadata | Candidate build images relied on `docker/metadata-action`'s auto-derived `org.opencontainers.image.version` label, which for a bare `type=raw` candidate tag bakes in the throwaway `candidate-<run id>-<run attempt>` string rather than the real release SemVer, corrupting `check_existing`'s idempotent-match comparison and `promote-stable`'s per-tag floating version gating once promoted. | Fixed; both the GHCR and Docker Hub candidate metadata steps explicitly set `org.opencontainers.image.version` to the real normalized SemVer via metadata-action's label-overwrite input |
+| F-55 | P2 | Docker Hub cross-registry backfill | `promote-exact`'s optional Docker Hub backfill copied a digest from GHCR to Docker Hub with `docker buildx imagetools create`, which does not reliably copy blob content BETWEEN different registries — it can create a manifest list referencing digests that must already exist at the destination. | Fixed; the cross-registry backfill now uses a pinned `crane` (`imjasonh/setup-crane`) to perform a real all-platform blob copy, and independently re-reads the destination digest afterward to assert it is byte-identical to the verified GHCR source digest before treating the promotion as successful; the GHCR-only (same-registry) promotion is unchanged |
+| F-56 | P1 | Release concurrency | `release.yml`'s only concurrency group was keyed directly on the raw, un-normalized triggering event value, so a `v1.2.3` tag push and an equivalent `1.2.3` `workflow_dispatch` input produced two different group strings and could build/promote the same release concurrently. | Fixed; a new trusted `prepare` job derives and validates the normalized version before any build, and `build-and-push`/`promote-exact` each carry their own job-level concurrency group keyed on that normalized version, so any two runs resolving to the same release always serialize regardless of how the version was spelled |
+| F-57 | P2 | Signature/attestation identity | Keyless cosign verification used an org-wide `^https://github\.com/<owner>/` identity regexp, which would accept a signature minted by ANY repository under the same owner, on any workflow file, on any ref. | Fixed; the identity regexp is scoped to this exact repository's `.github/workflows/release.yml`, on only the two refs this workflow is actually trusted to release from (a `v*` tag push, or a dispatch running on `main`) |
+| F-58 | P0 | Ops tag creation race | `tag-ops-release.yml` validated that origin's `main` still matched the triggering commit, then created and pushed the annotated tag as a SEPARATE later step, leaving a race window in which main could advance between the two and still be tagged. | Fixed; the tag creation and the main-tip comparison are combined into one atomic `git push --atomic --force-with-lease=refs/heads/main:<sha>` invocation, so the tag is created only if origin's main still equals the triggering commit at the moment of the push itself, with no window between check and effect |
+| F-59 | P2 | SemVer validation duplication | `release-orchestration.yml` and `tag-ops-release.yml` validated versions with locally duplicated, looser inline regexes instead of the shared `scripts/release-ordering.sh` validator, silently accepting a leading zero in the core or in a numeric pre-release identifier that the shared validator rejects. | Fixed; every version-accepting step in both workflows now calls `scripts/release-ordering.sh validate`, and each workflow normalizes (strips a leading `v`) exactly once, in its own `prepare`/`resolve` job |
 
 ## D-01 Resolution
 
@@ -609,6 +615,81 @@ which would incorrectly skip a legitimate backport to an older series.
 - No production behavior outside the release/version-sync/supersession workflows, the shared ordering
   script, and the Dockerfile's ARG/LABEL scoping was changed; existing Helm, Compose, GitOps, Terraform,
   and playground coverage is unchanged and still green.
+
+## Candidate Metadata, Cross-Registry Backfill, Normalized Concurrency, Identity Scoping, Atomic Tagging, and Strict SemVer Resolution (this change)
+
+Six further release-hardening gaps were closed in this pass:
+
+- **F-54 (candidate OCI metadata).** `release.yml`'s GHCR and Docker Hub candidate metadata-action steps now
+  explicitly set `labels: | org.opencontainers.image.version=${{ needs.prepare.outputs.version }}`, overriding
+  metadata-action's auto-derived label (which would otherwise bake in the throwaway candidate tag string).
+  `check_existing`'s idempotent-match comparison and `promote-stable`'s per-tag floating-version resolution
+  both read this exact label back from the registry and require it to be a real SemVer value.
+- **F-55 (Docker Hub cross-registry backfill).** `promote-exact`'s optional Docker Hub backfill (used when an
+  idempotent retry needs to backfill a mirror that was disabled during the original release) now installs a
+  pinned `crane` (`imjasonh/setup-crane@v0.7`, crane `v0.21.8`) and performs `crane copy` — a real all-platform
+  blob copy — instead of a cross-registry `docker buildx imagetools create`, which does not reliably copy blob
+  content between different registries. After the copy, `crane digest` independently re-reads the destination
+  and asserts it is byte-identical to the verified GHCR source digest before the promotion is treated as
+  successful; a mismatch (including a simulated corrupted copy in the functional test) is fatal. The
+  same-registry GHCR promotion is unchanged and still uses `docker buildx imagetools create`. Docker Hub
+  remains entirely conditional on the existing `DOCKERHUB_ENABLED`-plus-credentials eligibility gate.
+- **F-56 (normalized concurrency).** A new, trusted `prepare` job is now the ONE place `release.yml` derives
+  and validates (via `scripts/release-ordering.sh validate`) this run's release version, BEFORE any build, scan,
+  sign, or registry write. `build-and-push` and `promote-exact` each carry their own job-level `concurrency:`
+  group keyed on this normalized version (`ferrite-release-exact-<version>`), replacing the previous
+  workflow-level group that was keyed directly on the raw, un-normalized triggering event. A `v1.2.3` tag push
+  and an equivalent `1.2.3` `workflow_dispatch` input now always resolve to the identical group and therefore
+  always serialize against each other — the exact race the old raw-event-keyed group could not prevent.
+- **F-57 (signature/attestation identity).** The `CERTIFICATE_IDENTITY_REGEXP` used by every `cosign
+  verify`/`verify-attestation` call in `release.yml` is now defined once, at workflow level, scoped to
+  `^https://github\.com/${{ github.repository }}/\.github/workflows/release\.yml@refs/(heads/main|tags/v...)$`
+  — this exact repository, this exact workflow file, and only the two refs release.yml is actually trusted to
+  release from (a `v*` tag push, or a dispatch running on `main`). This replaces the previous org-wide
+  `^https://github\.com/<owner>/` regexp, which would have accepted a signature minted by any repository under
+  the same owner, on any workflow file, on any ref.
+- **F-58 (atomic ops tag creation).** `tag-ops-release.yml`'s final tag-creation step now combines the
+  remote-main comparison and the tag push into one atomic `git push --atomic
+  --force-with-lease="refs/heads/main:${MERGED_SHA}"` invocation (pushing a same-commit no-op update to `main`
+  purely to carry the compare-and-swap check, alongside the new tag ref). Because `--atomic` means every ref
+  update in the push either all succeed or all fail together, a stale lease (main having advanced past the
+  validated commit between the earlier checks and this push actually executing) now rejects the tag creation
+  too, closing the race window the previous two-separate-steps design left open. Non-overwrite behavior for an
+  already-existing tag is unchanged (checked both locally and via `git ls-remote` before tagging).
+- **F-59 (strict SemVer everywhere).** `release-orchestration.yml`'s `prepare` job and all three downstream
+  notification jobs (`update-homebrew`, `update-docs`, `update-sdks`) plus its `verify` summary job, and
+  `tag-ops-release.yml`'s `resolve` and `tag` jobs, now all call the shared, trusted `scripts/release-ordering.sh
+  validate` (checked out via `actions/checkout@v4`, added where missing) instead of a locally duplicated,
+  looser inline regex. Both workflows still normalize (strip an optional leading `v`) in exactly one place —
+  `release-orchestration.yml`'s `prepare` job, and `tag-ops-release.yml`'s `resolve` job — with every other job
+  only re-validating the already-normalized value.
+
+Tests: `tests/test_release_workflows.sh` (183 checks) gained explicit static assertions for the candidate
+metadata label override, the scoped identity regexp (plus a live regexp-match/no-match check against real and
+untrusted signing identities), the normalized concurrency groups, and functional leading-zero-rejection replays
+for `release-orchestration.yml`. `tests/test_exact_image_immutability.sh` (44 checks) gained a fake `crane`
+binary and functional replays of the Docker Hub cross-registry backfill (missing mirror, matching digest,
+mismatched digest, and a simulated corrupted copy), plus updated static concurrency assertions.
+`tests/test_ops_release_tag_workflow.sh` (38 checks) gained a functional replay that advances a cloned
+remote's `main` strictly between this run's earlier validation and its own tag-creation push, proving the
+atomic lease-guarded push rejects the tag (and leaves none behind on origin) even though nothing in this run's
+own local state changed, plus a leading-zero rejection replay for the `resolve` job.
+
+## Final Verification Pass (candidate metadata, cross-registry backfill, normalized concurrency, identity scoping, atomic tagging, strict SemVer)
+
+- `bash tests/run.sh` passes all 29/29 discovered suites, including the updated `test_release_workflows.sh`
+  (183 checks), `test_exact_image_immutability.sh` (44 checks), and `test_ops_release_tag_workflow.sh`
+  (38 checks).
+- `actionlint .github/workflows/*.yml` passes with no findings, including the restructured `release.yml`
+  (`prepare` job, job-level concurrency, scoped cosign identity, crane-based Docker Hub backfill),
+  `release-orchestration.yml` (checkout added to every version-validating job, shared strict-SemVer calls), and
+  `tag-ops-release.yml` (atomic lease-guarded push, shared strict-SemVer calls).
+- `shellcheck --severity=warning scripts/*.sh tests/*.sh tests/lib/*.sh` passes with no findings.
+- `helm lint charts/ferrite charts/ferrite-sidecar` both pass (unchanged by this change; re-verified since
+  D-02 remains the only deferred chart-related item).
+- No production runtime code (playground, RESP proxy, response budgets, request memory) was touched by this
+  change; only `release.yml`, `release-orchestration.yml`, `tag-ops-release.yml`, and their tests were
+  modified.
 
 ## Deferred Items
 
