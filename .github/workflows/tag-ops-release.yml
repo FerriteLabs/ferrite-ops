@@ -29,6 +29,8 @@ jobs:
       version: ${{ steps.version.outputs.version }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
 
       - name: Read canonical version from this push
         id: version
@@ -73,26 +75,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ github.sha }}
           fetch-depth: 0
-
-      # main can advance again between this push firing and this job
-      # reaching the tagging step (e.g. a rapid follow-up release-metadata
-      # push, or this run simply queuing behind the concurrency group above).
-      # Re-validate that this push is still main's current tip immediately
-      # before tagging, so a superseded push can never be tagged after a
-      # newer canonical release has already landed.
-      - name: Validate this push is still the current main tip
-        env:
-          MERGED_SHA: ${{ github.sha }}
-        run: |
-          set -euo pipefail
-
-          git fetch --no-tags --depth=1 origin main
-          CURRENT_MAIN="$(git rev-parse origin/main)"
-          if [ "$CURRENT_MAIN" != "$MERGED_SHA" ]; then
-            echo "::error::main has advanced past this push (${MERGED_SHA} -> ${CURRENT_MAIN}); a later release-metadata push already superseded this one. Refusing to tag a non-tip commit."
-            exit 1
-          fi
 
       - name: Validate canonical ops release
         id: release
@@ -217,23 +201,15 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git tag -a "$OPS_TAG" "$MERGED_SHA" -m "Ferrite ops release ${VERSION}"
 
-          # Atomically re-verify-and-push: --force-with-lease=refs/heads/main:<sha>
-          # asserts, AS PART OF THIS SINGLE PUSH, that origin's main is still
-          # exactly the commit already validated above -- closing the race
-          # window between that earlier validation and this push actually
-          # landing (e.g. a rapid follow-up release-metadata push landing on
-          # main in between). --atomic means every ref update in this one
-          # push either all succeed or all fail together, so a stale lease
-          # rejects the tag creation too -- the tag is never left behind
-          # without the lease having held. The main ref update itself is a
-          # same-commit no-op (main is only ever compared here, never
-          # advanced or rewritten by this workflow); it exists purely to
-          # carry the compare-and-swap check.
-          if ! git push --atomic \
-            --force-with-lease="refs/heads/main:${MERGED_SHA}" \
-            origin \
-            "${MERGED_SHA}:refs/heads/main" \
-            "refs/tags/${OPS_TAG}"; then
-            echo "::error::Atomic push rejected: origin/main advanced past ${MERGED_SHA} before the tag could be pushed, or the tag ref itself was rejected. Refusing to tag a commit main has since superseded."
+          # The immutable target is the push event's exact SHA, not whatever
+          # commit main happens to point at when this queued job eventually
+          # runs. The version-scoped concurrency group serializes duplicate
+          # events for this tag, the remote preflight above gives a clear
+          # error for an existing tag, and this ordinary non-force ref push
+          # is the final server-side non-overwrite guard if another writer
+          # creates the same tag between the preflight and this command.
+          if ! git push origin \
+            "refs/tags/${OPS_TAG}:refs/tags/${OPS_TAG}"; then
+            echo "::error::Immutable ops tag push was rejected. The tag may have been created concurrently; refusing to overwrite or rebind it."
             exit 1
           fi
