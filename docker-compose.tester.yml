@@ -1,0 +1,31 @@
+services:
+  ferrite:
+    image: ${FERRITE_TEST_IMAGE:-ghcr.io/ferritelabs/ferrite:0.4.0}
+    ports:
+      - "${FERRITE_TEST_PORT:-6379}:6379"
+      - "${FERRITE_TEST_METRICS_PORT:-9090}:9090"
+    volumes:
+      - ferrite-tester-data:/var/lib/ferrite/data
+    environment:
+      FERRITE_DATA_DIR: /var/lib/ferrite/data
+      FERRITE_BIND: 0.0.0.0
+      FERRITE_METRICS_BIND: 0.0.0.0
+      RUST_LOG: ferrite=info
+    healthcheck:
+      test: ["CMD", "ferrite-cli", "PING"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
+    deploy:
+      resources:
+        limits:
+          cpus: "${FERRITE_TEST_CPUS:-2.0}"
+          memory: "${FERRITE_TEST_MEMORY:-2G}"
+        reservations:
+          cpus: "0.25"
+          memory: "256M"
+
+volumes:
+  ferrite-tester-data:
+    driver: local

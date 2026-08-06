@@ -35,6 +35,25 @@ helm install ferrite charts/ferrite
 ./scripts/quickstart.sh
 ```
 
+### External Tester Quick Start
+
+For the v0.4 non-production cohort, follow the
+[canonical Tester Program](https://github.com/ferritelabs/ferrite/blob/main/TESTER_PROGRAM.md)
+and use the isolated, volume-preserving tester environment:
+
+```bash
+export FERRITE_TEST_IMAGE='ghcr.io/ferritelabs/ferrite:0.4.0' # or exact campaign digest
+./scripts/tester.sh start
+./scripts/tester.sh smoke
+./scripts/tester.sh durability
+./scripts/tester.sh diagnostics
+./scripts/tester.sh stop
+```
+
+Use `./scripts/tester.sh reset` only when you are ready to delete the tester
+volume. General deployment and operations guidance below remains authoritative
+outside the tester program.
+
 ### Custom runtime configuration
 
 By default `docker compose up` mounts nothing over `/etc/ferrite/ferrite.toml`,
