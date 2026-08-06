@@ -794,6 +794,8 @@ OUTPUT="$(
     FERRITE_TEST_METRICS_PORT=also-invalid \
     FERRITE_TEST_CPUS=not-a-cpu \
     FERRITE_TEST_MEMORY=not-memory \
+    COMPOSE_REMOVE_ORPHANS=1 \
+    FAKE_EXPECT_REMOVE_ORPHANS=0 \
     bash "$TESTER" stop 2>&1
 )"
 STATUS=$?
@@ -917,6 +919,8 @@ OUTPUT="$(
     FERRITE_TEST_METRICS_PORT=also-invalid \
     FERRITE_TEST_CPUS=not-a-cpu \
     FERRITE_TEST_MEMORY=not-memory \
+    COMPOSE_REMOVE_ORPHANS=1 \
+    FAKE_EXPECT_REMOVE_ORPHANS=0 \
     FERRITE_TEST_RESET_CONFIRM=1 \
     bash "$TESTER" reset 2>&1
 )"

@@ -111,6 +111,13 @@ if [[ "${1:-}" == "image" && "${2:-}" == "inspect" ]]; then
 fi
 
 [[ "${1:-}" == "compose" ]] || exit 0
+
+if [[ -n "${FAKE_EXPECT_REMOVE_ORPHANS:-}" &&
+      "${COMPOSE_REMOVE_ORPHANS:-}" != "$FAKE_EXPECT_REMOVE_ORPHANS" ]]; then
+  echo "expected COMPOSE_REMOVE_ORPHANS=${FAKE_EXPECT_REMOVE_ORPHANS}, got ${COMPOSE_REMOVE_ORPHANS:-<unset>}" >&2
+  exit 12
+fi
+
 shift
 
 if [[ "${1:-}" == "version" ]]; then

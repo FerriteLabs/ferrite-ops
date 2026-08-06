@@ -411,7 +411,7 @@ release_project_lock() {
 require_compose() {
   command -v docker >/dev/null 2>&1 ||
     die "Docker is required; install Docker Engine or Docker Desktop"
-  docker compose version >/dev/null 2>&1 ||
+  COMPOSE_REMOVE_ORPHANS=0 docker compose version >/dev/null 2>&1 ||
     die "Docker Compose v2 is required ('docker compose')"
 }
 
@@ -475,7 +475,7 @@ ops_tooling_commit() {
 }
 
 compose() {
-  docker compose \
+  COMPOSE_REMOVE_ORPHANS=0 docker compose \
     --project-name "$FERRITE_TEST_PROJECT" \
     --file "$COMPOSE_FILE" \
     --profile "$TESTER_COMPOSE_PROFILE" \
