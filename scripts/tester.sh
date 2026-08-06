@@ -483,7 +483,12 @@ compose() {
 }
 
 compose_teardown() {
-  FERRITE_TEST_IMAGE="$TEARDOWN_DUMMY_IMAGE" compose "$@"
+  FERRITE_TEST_IMAGE="$TEARDOWN_DUMMY_IMAGE" \
+    FERRITE_TEST_PORT=6379 \
+    FERRITE_TEST_METRICS_PORT=9090 \
+    FERRITE_TEST_CPUS=1.0 \
+    FERRITE_TEST_MEMORY=1G \
+    compose "$@"
 }
 
 ownership_collision() {

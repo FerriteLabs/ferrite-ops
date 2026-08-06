@@ -792,6 +792,8 @@ OUTPUT="$(
     FAKE_NETWORK_EXISTS=1 \
     FERRITE_TEST_PORT=not-a-port \
     FERRITE_TEST_METRICS_PORT=also-invalid \
+    FERRITE_TEST_CPUS=not-a-cpu \
+    FERRITE_TEST_MEMORY=not-memory \
     bash "$TESTER" stop 2>&1
 )"
 STATUS=$?
@@ -913,6 +915,8 @@ OUTPUT="$(
     FAKE_NETWORK_EXISTS=1 \
     FERRITE_TEST_PORT=not-a-port \
     FERRITE_TEST_METRICS_PORT=also-invalid \
+    FERRITE_TEST_CPUS=not-a-cpu \
+    FERRITE_TEST_MEMORY=not-memory \
     FERRITE_TEST_RESET_CONFIRM=1 \
     bash "$TESTER" reset 2>&1
 )"
