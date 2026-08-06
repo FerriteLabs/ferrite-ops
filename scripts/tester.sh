@@ -20,6 +20,8 @@ export FERRITE_TEST_PROJECT="${FERRITE_TEST_PROJECT:-ferrite-tester}"
 # exposing the tester service, while image validation remains here.
 export FERRITE_TEST_WRAPPER_GUARD="tester.sh"
 TESTER_COMPOSE_PROFILE="tester"
+OWNERSHIP_LABEL_KEY="com.ferritelabs.tester.wrapper-guard"
+OWNERSHIP_LABEL_VALUE="tester.sh"
 
 # Host reachability probe settings. Docker health only proves the in-container
 # check passed; these govern the host-side verification that the published
@@ -233,6 +235,69 @@ compose_teardown() {
   FERRITE_TEST_IMAGE="$TEARDOWN_DUMMY_IMAGE" compose "$@"
 }
 
+ownership_collision() {
+  local resource_type="$1" resource_name="$2" actual_label="$3"
+  [[ -n "$actual_label" ]] || actual_label="<missing>"
+  die "${resource_type} '${resource_name}' collides with Compose project '${FERRITE_TEST_PROJECT}': expected ownership label '${OWNERSHIP_LABEL_KEY}=${OWNERSHIP_LABEL_VALUE}', found '${actual_label}'. Change FERRITE_TEST_PROJECT to use a different isolated project name."
+}
+
+verify_named_resource_ownership() {
+  local resource_type="$1" resource_name="$2"
+  local names label found
+  found=0
+
+  names="$(
+    docker "$resource_type" ls \
+      --filter "name=${resource_name}" \
+      --format '{{.Name}}'
+  )" || die "could not list Docker ${resource_type} resources while verifying project ownership"
+
+  while IFS= read -r name; do
+    if [[ "$name" == "$resource_name" ]]; then
+      found=1
+      break
+    fi
+  done <<<"$names"
+
+  ((found == 1)) || return 0
+
+  label="$(
+    docker "$resource_type" inspect \
+      --format '{{index .Labels "com.ferritelabs.tester.wrapper-guard"}}' \
+      "$resource_name" 2>/dev/null
+  )" || die "could not inspect Docker ${resource_type} '${resource_name}' while verifying project ownership"
+
+  [[ "$label" == "$OWNERSHIP_LABEL_VALUE" ]] ||
+    ownership_collision "Docker ${resource_type}" "$resource_name" "$label"
+}
+
+verify_project_ownership() {
+  local container_ids container_id label
+  local volume_name="${FERRITE_TEST_PROJECT}_ferrite-tester-data"
+  local network_name="${FERRITE_TEST_PROJECT}_default"
+
+  container_ids="$(
+    docker container ls --all --quiet \
+      --filter "label=com.docker.compose.project=${FERRITE_TEST_PROJECT}" \
+      --filter "label=com.docker.compose.service=ferrite"
+  )" || die "could not list existing Docker containers while verifying project ownership"
+
+  while IFS= read -r container_id; do
+    [[ -n "$container_id" ]] || continue
+    label="$(
+      docker container inspect \
+        --format '{{index .Config.Labels "com.ferritelabs.tester.wrapper-guard"}}' \
+        "$container_id" 2>/dev/null
+    )" || die "could not inspect Docker container '${container_id}' while verifying project ownership"
+
+    [[ "$label" == "$OWNERSHIP_LABEL_VALUE" ]] ||
+      ownership_collision "Docker container" "$container_id" "$label"
+  done <<<"$container_ids"
+
+  verify_named_resource_ownership volume "$volume_name"
+  verify_named_resource_ownership network "$network_name"
+}
+
 validate_compose() {
   compose config >/dev/null
 }
@@ -347,6 +412,7 @@ start_environment() {
   validate_settings
   require_python
   require_compose
+  verify_project_ownership
   validate_compose
   echo "Starting ${FERRITE_TEST_PROJECT} with ${FERRITE_TEST_IMAGE}"
   compose pull ferrite
@@ -526,7 +592,8 @@ REPORT
 stop_environment() {
   validate_project
   require_compose
-  compose_teardown down --remove-orphans
+  verify_project_ownership
+  compose_teardown down
   echo "Tester containers removed; the named data volume was preserved."
 }
 
@@ -534,13 +601,14 @@ reset_environment() {
   local reply
   validate_project
   require_compose
+  verify_project_ownership
   echo "WARNING: reset permanently deletes the ${FERRITE_TEST_PROJECT} tester data volume." >&2
   if [[ "${FERRITE_TEST_RESET_CONFIRM:-}" != "1" ]]; then
     printf "Type RESET to continue: " >&2
     read -r reply || die "reset cancelled"
     [[ "$reply" == "RESET" ]] || die "reset cancelled"
   fi
-  compose_teardown down --volumes --remove-orphans
+  compose_teardown down --volumes
   echo "Tester containers and data volume removed."
 }
 

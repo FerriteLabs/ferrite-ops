@@ -22,6 +22,42 @@ if [[ "${1:-}" == "--version" ]]; then
   exit 0
 fi
 
+if [[ "${1:-}" == "container" && "${2:-}" == "ls" ]]; then
+  if [[ -n "${FAKE_PROJECT_CONTAINER_ID:-}" ]]; then
+    echo "$FAKE_PROJECT_CONTAINER_ID"
+  fi
+  exit 0
+fi
+
+if [[ "${1:-}" == "container" && "${2:-}" == "inspect" ]]; then
+  echo "${FAKE_CONTAINER_OWNERSHIP_LABEL:-tester.sh}"
+  exit 0
+fi
+
+if [[ "${1:-}" == "volume" && "${2:-}" == "ls" ]]; then
+  if [[ "${FAKE_VOLUME_EXISTS:-}" == "1" ]]; then
+    echo "${FERRITE_TEST_PROJECT:-ferrite-tester}_ferrite-tester-data"
+  fi
+  exit 0
+fi
+
+if [[ "${1:-}" == "volume" && "${2:-}" == "inspect" ]]; then
+  echo "${FAKE_VOLUME_OWNERSHIP_LABEL:-tester.sh}"
+  exit 0
+fi
+
+if [[ "${1:-}" == "network" && "${2:-}" == "ls" ]]; then
+  if [[ "${FAKE_NETWORK_EXISTS:-}" == "1" ]]; then
+    echo "${FERRITE_TEST_PROJECT:-ferrite-tester}_default"
+  fi
+  exit 0
+fi
+
+if [[ "${1:-}" == "network" && "${2:-}" == "inspect" ]]; then
+  echo "${FAKE_NETWORK_OWNERSHIP_LABEL:-tester.sh}"
+  exit 0
+fi
+
 if [[ "${1:-}" == "inspect" ]]; then
   if [[ "$*" == *".State.Health"* ]]; then
     echo "${FAKE_HEALTH_STATUS:-healthy}"

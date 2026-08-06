@@ -506,10 +506,15 @@ assert_eq "" "$NON_GIT_ARCHIVE" "no diagnostics archive is produced without veri
 # Stop/reset require only a valid project name and Compose availability. The
 # campaign image and port settings are irrelevant to cleanup, while an
 # internal parse-only image lets Compose process its required interpolation.
+# Existing project resources are accepted only when all carry the exact
+# tester.sh ownership label.
 : >"$FAKE_LOG"
 OUTPUT="$(
   run_tester_no_image \
     FAKE_EXPECT_COMPOSE_IMAGE="$TEARDOWN_DUMMY_IMAGE" \
+    FAKE_PROJECT_CONTAINER_ID=owned-ferrite-container \
+    FAKE_VOLUME_EXISTS=1 \
+    FAKE_NETWORK_EXISTS=1 \
     FERRITE_TEST_PORT=not-a-port \
     FERRITE_TEST_METRICS_PORT=also-invalid \
     bash "$TESTER" stop 2>&1
@@ -518,7 +523,11 @@ STATUS=$?
 CALLS="$(cat "$FAKE_LOG")"
 assert_eq 0 "$STATUS" "stop succeeds without a campaign image or valid runtime ports"
 assert_contains "$CALLS" "--profile tester" "stop always invokes Compose through the tester profile"
-assert_contains "$CALLS" "down --remove-orphans" "stop removes containers"
+assert_contains "$CALLS" "container inspect" "stop verifies an existing owned service container"
+assert_contains "$CALLS" "volume inspect" "stop verifies the deterministic owned volume"
+assert_contains "$CALLS" "network inspect" "stop verifies the deterministic owned network"
+assert_contains "$CALLS" "--profile tester down" "stop removes containers"
+assert_not_contains "$CALLS" "--remove-orphans" "stop does not remove unrelated orphan containers"
 assert_not_contains "$CALLS" " pull " "stop never pulls the teardown dummy image"
 assert_not_contains "$CALLS" " up " "stop never starts the teardown dummy image"
 assert_not_contains "$CALLS" "--volumes" "stop preserves the named volume"
@@ -527,7 +536,66 @@ assert_contains "$OUTPUT" "volume was preserved" "stop clearly states volume beh
 : >"$FAKE_LOG"
 OUTPUT="$(
   run_tester_no_image \
+    FAKE_PROJECT_CONTAINER_ID=foreign-ferrite-container \
+    FAKE_CONTAINER_OWNERSHIP_LABEL=another-wrapper \
+    bash "$TESTER" stop 2>&1
+)"
+STATUS=$?
+CALLS="$(cat "$FAKE_LOG")"
+assert_nonzero "$STATUS" "stop rejects a foreign Compose-project service container"
+assert_contains "$OUTPUT" "Docker container 'foreign-ferrite-container' collides" "foreign-container collision identifies the resource"
+assert_contains "$OUTPUT" "Change FERRITE_TEST_PROJECT" "foreign-container collision advises changing the project"
+assert_not_contains "$CALLS" "--profile tester down" "foreign-container rejection occurs before down"
+
+: >"$FAKE_LOG"
+OUTPUT="$(
+  run_tester_no_image \
+    FAKE_VOLUME_EXISTS=1 \
+    FAKE_VOLUME_OWNERSHIP_LABEL=another-wrapper \
+    bash "$TESTER" stop 2>&1
+)"
+STATUS=$?
+CALLS="$(cat "$FAKE_LOG")"
+assert_nonzero "$STATUS" "stop rejects a foreign deterministic tester volume"
+assert_contains "$OUTPUT" "Docker volume 'ferrite-tester_ferrite-tester-data' collides" "foreign-volume collision identifies the deterministic resource"
+assert_contains "$OUTPUT" "Change FERRITE_TEST_PROJECT" "foreign-volume collision advises changing the project"
+assert_not_contains "$CALLS" "--profile tester down" "foreign-volume rejection occurs before down"
+
+: >"$FAKE_LOG"
+OUTPUT="$(
+  run_tester_no_image \
+    FAKE_NETWORK_EXISTS=1 \
+    FAKE_NETWORK_OWNERSHIP_LABEL=another-wrapper \
+    FERRITE_TEST_RESET_CONFIRM=1 \
+    bash "$TESTER" reset 2>&1
+)"
+STATUS=$?
+CALLS="$(cat "$FAKE_LOG")"
+assert_nonzero "$STATUS" "reset rejects a foreign deterministic default network"
+assert_contains "$OUTPUT" "Docker network 'ferrite-tester_default' collides" "foreign-network collision identifies the deterministic resource"
+assert_contains "$OUTPUT" "Change FERRITE_TEST_PROJECT" "foreign-network collision advises changing the project"
+assert_not_contains "$CALLS" "--profile tester down" "foreign-network rejection occurs before down"
+
+: >"$FAKE_LOG"
+OUTPUT="$(
+  run_tester \
+    FAKE_PROJECT_CONTAINER_ID=foreign-ferrite-container \
+    FAKE_CONTAINER_OWNERSHIP_LABEL=another-wrapper \
+    bash "$TESTER" start 2>&1
+)"
+STATUS=$?
+CALLS="$(cat "$FAKE_LOG")"
+assert_nonzero "$STATUS" "start rejects a foreign Compose-project service container"
+assert_not_contains "$CALLS" " pull " "start ownership rejection occurs before pull"
+assert_not_contains "$CALLS" " up " "start ownership rejection occurs before up"
+
+: >"$FAKE_LOG"
+OUTPUT="$(
+  run_tester_no_image \
     FAKE_EXPECT_COMPOSE_IMAGE="$TEARDOWN_DUMMY_IMAGE" \
+    FAKE_PROJECT_CONTAINER_ID=owned-ferrite-container \
+    FAKE_VOLUME_EXISTS=1 \
+    FAKE_NETWORK_EXISTS=1 \
     FERRITE_TEST_PORT=not-a-port \
     FERRITE_TEST_METRICS_PORT=also-invalid \
     FERRITE_TEST_RESET_CONFIRM=1 \
@@ -536,7 +604,8 @@ OUTPUT="$(
 STATUS=$?
 CALLS="$(cat "$FAKE_LOG")"
 assert_eq 0 "$STATUS" "reset supports cleanup without a campaign image or valid runtime ports"
-assert_contains "$CALLS" "down --volumes --remove-orphans" "reset explicitly removes the volume"
+assert_contains "$CALLS" "down --volumes" "reset explicitly removes the volume"
+assert_not_contains "$CALLS" "--remove-orphans" "reset does not remove unrelated orphan containers"
 assert_not_contains "$CALLS" " pull " "reset never pulls the teardown dummy image"
 assert_not_contains "$CALLS" " up " "reset never starts the teardown dummy image"
 assert_contains "$OUTPUT" "permanently deletes" "reset prints a destructive warning"

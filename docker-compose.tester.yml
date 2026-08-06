@@ -1,9 +1,11 @@
+x-ferrite-tester-wrapper-guard: "${FERRITE_TEST_WRAPPER_GUARD:?Direct invocation is unsupported; use ./scripts/tester.sh}"
+
 services:
   ferrite:
     profiles: ["tester"]
     image: "${FERRITE_TEST_IMAGE:?FERRITE_TEST_IMAGE is required: set it to the exact repository-qualified sha256 digest reference (repository/path@sha256:<64 lowercase hex characters>), never a tag or latest}"
     labels:
-      com.ferritelabs.tester.wrapper-guard: "${FERRITE_TEST_WRAPPER_GUARD:?Direct invocation is unsupported; use ./scripts/tester.sh}"
+      com.ferritelabs.tester.wrapper-guard: tester.sh
     ports:
       - "127.0.0.1:${FERRITE_TEST_PORT:-6379}:6379"
       - "127.0.0.1:${FERRITE_TEST_METRICS_PORT:-9090}:9090"
@@ -32,3 +34,10 @@ services:
 volumes:
   ferrite-tester-data:
     driver: local
+    labels:
+      com.ferritelabs.tester.wrapper-guard: tester.sh
+
+networks:
+  default:
+    labels:
+      com.ferritelabs.tester.wrapper-guard: tester.sh
