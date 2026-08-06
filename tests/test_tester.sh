@@ -122,8 +122,29 @@ assert_empty_file "$FAKE_LOG" "malformed digest rejection occurs before Docker c
 OUTPUT="$(run_tester FERRITE_TEST_IMAGE="ghcr.io/ferritelabs/ferrite:" bash "$TESTER" start 2>&1)"
 STATUS=$?
 assert_nonzero "$STATUS" "start rejects a malformed empty tag"
-assert_contains "$OUTPUT" "explicit tag or sha256 digest" "malformed empty tag rejection requests an exact reference"
+assert_contains "$OUTPUT" "malformed image tag" "malformed empty tag rejection identifies the tag"
 assert_empty_file "$FAKE_LOG" "malformed empty tag rejection occurs before Docker calls"
+
+: >"$FAKE_LOG"
+OUTPUT="$(run_tester FERRITE_TEST_IMAGE="ghcr.io/ferritelabs/ferrite:-candidate" bash "$TESTER" start 2>&1)"
+STATUS=$?
+assert_nonzero "$STATUS" "start rejects a malformed tag prefix"
+assert_contains "$OUTPUT" "malformed image tag" "malformed tag rejection is actionable"
+assert_empty_file "$FAKE_LOG" "malformed tag rejection occurs before Docker calls"
+
+: >"$FAKE_LOG"
+OUTPUT="$(run_tester FERRITE_TEST_IMAGE="ghcr.io/ferritelabs//ferrite:candidate" bash "$TESTER" start 2>&1)"
+STATUS=$?
+assert_nonzero "$STATUS" "start rejects a malformed repository path"
+assert_contains "$OUTPUT" "malformed repository path" "malformed repository rejection is actionable"
+assert_empty_file "$FAKE_LOG" "malformed repository rejection occurs before Docker calls"
+
+: >"$FAKE_LOG"
+OUTPUT="$(run_tester FERRITE_TEST_IMAGE="@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" bash "$TESTER" start 2>&1)"
+STATUS=$?
+assert_nonzero "$STATUS" "start rejects a digest without a repository"
+assert_contains "$OUTPUT" "repository name before the digest" "missing repository rejection is actionable"
+assert_empty_file "$FAKE_LOG" "missing repository rejection occurs before Docker calls"
 
 # Start validates Compose, pulls the exact image, starts only Ferrite, and waits.
 : >"$FAKE_LOG"
@@ -190,6 +211,7 @@ STATUS=$?
 assert_nonzero "$STATUS" "durability refuses to run without FERRITE_TEST_ENABLE_DURABILITY=1"
 assert_contains "$OUTPUT" "FERRITE_TEST_ENABLE_DURABILITY=1" "durability gate names the required opt-in variable"
 assert_contains "$OUTPUT" "campaign-specific" "durability gate explains it is an optional, campaign-specific diagnostic"
+assert_contains "$OUTPUT" "may not persist data across restart" "durability gate explains the current persistence limitation"
 assert_empty_file "$FAKE_LOG" "durability gate rejection occurs before Docker calls"
 
 # Durability restarts the service, waits again, verifies, and removes its key,

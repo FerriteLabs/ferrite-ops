@@ -44,7 +44,13 @@ volume-preserving tester environment — there is no default branch or image;
 both must be supplied by the campaign owner:
 
 ```bash
+git clone https://github.com/ferritelabs/ferrite-ops.git
+cd ferrite-ops
 git checkout <CAMPAIGN_OPS_REF>   # exact tag or commit the campaign owner supplied; never main
+test -x scripts/tester.sh && ./scripts/tester.sh --help >/dev/null || {
+  echo "scripts/tester.sh is missing or not runnable at <CAMPAIGN_OPS_REF>" >&2
+  exit 1
+}
 export FERRITE_TEST_IMAGE='<CAMPAIGN_IMAGE_DIGEST>' # exact tag/digest the campaign owner supplied; never latest
 ./scripts/tester.sh start
 ./scripts/tester.sh smoke
@@ -59,7 +65,8 @@ unset, an implicit/floating `latest` reference, or a malformed tag/digest.
 Only run `./scripts/tester.sh durability` if the campaign owner has explicitly
 enabled it (`FERRITE_TEST_ENABLE_DURABILITY=1`); it is an optional,
 campaign-specific diagnostic track, not part of the core tester path, and the
-script refuses to run it otherwise.
+script refuses to run it otherwise. Current candidate images may not persist
+data across restart, so durability is not a core expected pass.
 
 Use `./scripts/tester.sh reset` only when you are ready to delete the tester
 volume. General deployment and operations guidance below remains authoritative

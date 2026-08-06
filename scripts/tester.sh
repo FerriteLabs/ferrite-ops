@@ -63,24 +63,56 @@ validate_uint_range() {
 
 validate_image() {
   local image="${FERRITE_TEST_IMAGE:-}"
-  local lower leaf digest
+  local lower leaf digest reference name tag segment
 
   [[ -n "$image" ]] ||
     die "FERRITE_TEST_IMAGE is required; set it to the exact campaign image tag or digest (never latest). There is no default."
 
   [[ "$image" != *[[:space:]]* ]] ||
     die "FERRITE_TEST_IMAGE must be one exact image reference"
+  [[ "$image" != *"://"* ]] ||
+    die "FERRITE_TEST_IMAGE must be an image reference without a URL scheme"
 
   lower="$(printf '%s' "$image" | tr '[:upper:]' '[:lower:]')"
   if [[ "$lower" == "latest" || "$lower" == *":latest" ]]; then
     die "FERRITE_TEST_IMAGE must never use latest; use the campaign tag or digest"
   fi
 
+  reference="$image"
   if [[ "$image" == *"@"* ]]; then
+    [[ "$image" != *@*@* ]] ||
+      die "FERRITE_TEST_IMAGE contains more than one digest separator"
+    reference="${image%@*}"
     digest="${image##*@}"
+    [[ -n "$reference" ]] ||
+      die "FERRITE_TEST_IMAGE must include a repository name before the digest"
     [[ "$digest" =~ ^sha256:[0-9a-fA-F]{64}$ ]] ||
       die "image digests must use the full sha256:<64 hex characters> form"
-  else
+  fi
+
+  [[ "$reference" != /* && "$reference" != */ && "$reference" != *"//"* ]] ||
+    die "FERRITE_TEST_IMAGE contains a malformed repository path"
+
+  leaf="${reference##*/}"
+  name="$reference"
+  if [[ "$leaf" == *":"* ]]; then
+    tag="${leaf##*:}"
+    name="${reference%:*}"
+    [[ "$tag" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$ ]] ||
+      die "FERRITE_TEST_IMAGE contains a malformed image tag"
+  elif [[ "$image" != *"@"* ]]; then
+    die "FERRITE_TEST_IMAGE must include an explicit tag or sha256 digest"
+  fi
+
+  IFS='/' read -r -a image_segments <<<"$name"
+  ((${#image_segments[@]} > 0)) ||
+    die "FERRITE_TEST_IMAGE must include a repository name"
+  for segment in "${image_segments[@]}"; do
+    [[ "$segment" =~ ^[a-z0-9]+([._-][a-z0-9]+)*(:[0-9]+)?$ ]] ||
+      die "FERRITE_TEST_IMAGE contains a malformed repository path"
+  done
+
+  if [[ "$image" != *"@"* ]]; then
     leaf="${image##*/}"
     [[ "$leaf" == *":"* && -n "${leaf##*:}" ]] ||
       die "FERRITE_TEST_IMAGE must include an explicit tag or sha256 digest"
@@ -256,7 +288,7 @@ run_durability() {
   # of the required core tester path; it must be explicitly opted into by
   # the campaign owner before it runs.
   [[ "${FERRITE_TEST_ENABLE_DURABILITY:-}" == "1" ]] ||
-    die "durability is an optional, campaign-specific diagnostic; set FERRITE_TEST_ENABLE_DURABILITY=1 only if the campaign owner has explicitly enabled this track. It is not part of the required core tester path."
+    die "durability is an optional, campaign-specific diagnostic because current candidate images may not persist data across restart; set FERRITE_TEST_ENABLE_DURABILITY=1 only if the campaign owner has explicitly enabled this track. It is not part of the required core tester path."
 
   validate_settings
   require_compose
