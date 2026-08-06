@@ -132,17 +132,42 @@ def _closed_before_reply(host: str, port: int) -> ProbeError:
     )
 
 
+def _remaining(deadline: float, message: str, exit_code: int) -> float:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise ProbeError(message, exit_code)
+    return remaining
+
+
+def _http_socket(
+    connection: http.client.HTTPConnection,
+    response: http.client.HTTPResponse | None = None,
+) -> socket.socket:
+    if connection.sock is not None:
+        return connection.sock
+    if response is not None and response.fp is not None:
+        raw = getattr(response.fp, "raw", None)
+        response_socket = getattr(raw, "_sock", None)
+        if isinstance(response_socket, socket.socket):
+            return response_socket
+    raise ProbeError(
+        "metrics probe lost its HTTP socket before the response completed.",
+        EXIT_METRICS,
+    )
+
+
 def _read_resp_line(connection: socket.socket, host: str, port: int, deadline: float) -> str:
     buffer = bytearray()
     while b"\r\n" not in buffer:
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            raise ProbeError(
+        remaining = _remaining(
+            deadline,
+            (
                 f"{host}:{port} accepted the connection but sent no complete RESP "
                 "reply before the timeout. The port may be published to a "
-                "different service than Ferrite.",
-                EXIT_RESP,
-            )
+                "different service than Ferrite."
+            ),
+            EXIT_RESP,
+        )
         connection.settimeout(remaining)
         try:
             chunk = connection.recv(MAX_RESP_REPLY_BYTES)
@@ -180,7 +205,14 @@ def probe_resp(host: str, port: int, timeout: float) -> str:
     """Send RESP PING to host:port and require an exact ``+PONG`` reply."""
     deadline = time.monotonic() + timeout
     try:
-        connection = socket.create_connection((host, port), timeout=timeout)
+        connection = socket.create_connection(
+            (host, port),
+            timeout=_remaining(
+                deadline,
+                f"timed out before connecting to {host}:{port}.",
+                EXIT_RESP,
+            ),
+        )
     except OSError as exc:
         raise ProbeError(
             f"Redis-compatible port probe failed: {_connection_hint(host, port, exc)}",
@@ -188,7 +220,13 @@ def probe_resp(host: str, port: int, timeout: float) -> str:
         ) from exc
 
     try:
-        connection.settimeout(max(deadline - time.monotonic(), MIN_TIMEOUT))
+        connection.settimeout(
+            _remaining(
+                deadline,
+                f"timed out before sending PING to {host}:{port}.",
+                EXIT_RESP,
+            )
+        )
         try:
             connection.sendall(PING_COMMAND)
         except OSError as exc:
@@ -219,14 +257,36 @@ def probe_resp(host: str, port: int, timeout: float) -> str:
 
 def probe_metrics(host: str, port: int, timeout: float, path: str = "/metrics") -> int:
     """GET ``path`` on host:port and require a 2xx status with a body."""
+    deadline = time.monotonic() + timeout
+    url = f"http://{host}:{port}{path}"
     connection = http.client.HTTPConnection(host, port, timeout=timeout)
     try:
         try:
+            connection.timeout = _remaining(
+                deadline,
+                f"metrics probe total deadline expired before connecting to {url}.",
+                EXIT_METRICS,
+            )
+            connection.connect()
+            _http_socket(connection).settimeout(
+                _remaining(
+                    deadline,
+                    f"metrics probe total deadline expired before requesting {url}.",
+                    EXIT_METRICS,
+                )
+            )
             connection.request("GET", path, headers={"Accept": "text/plain"})
+            _http_socket(connection).settimeout(
+                _remaining(
+                    deadline,
+                    f"metrics probe total deadline expired before response headers from {url}.",
+                    EXIT_METRICS,
+                )
+            )
             response = connection.getresponse()
         except socket.timeout as exc:
             raise ProbeError(
-                f"metrics probe timed out against http://{host}:{port}{path}. "
+                f"metrics probe timed out against {url}. "
                 "Confirm the metrics port is published and the container is healthy.",
                 EXIT_METRICS,
             ) from exc
@@ -237,18 +297,38 @@ def probe_metrics(host: str, port: int, timeout: float, path: str = "/metrics") 
             ) from exc
         except http.client.HTTPException as exc:
             raise ProbeError(
-                f"http://{host}:{port}{path} did not return a valid HTTP "
+                f"{url} did not return a valid HTTP "
                 f"response ({exc}). The published port is not serving the "
                 "Ferrite metrics endpoint.",
                 EXIT_METRICS,
             ) from exc
 
         status = response.status
+        body = bytearray()
+        response_socket = _http_socket(connection, response)
         try:
-            body = response.read(MAX_METRICS_BODY_BYTES)
-        except (socket.timeout, OSError, http.client.HTTPException) as exc:
+            while len(body) < MAX_METRICS_BODY_BYTES:
+                response_socket.settimeout(
+                    _remaining(
+                        deadline,
+                        f"metrics probe total deadline expired while reading the response body from {url}.",
+                        EXIT_METRICS,
+                    )
+                )
+                chunk = response.read1(MAX_METRICS_BODY_BYTES - len(body))
+                if not chunk:
+                    break
+                body.extend(chunk)
+        except ProbeError:
+            raise
+        except socket.timeout as exc:
             raise ProbeError(
-                f"failed reading the response body from http://{host}:{port}{path}: {exc}",
+                f"metrics probe total deadline expired while reading the response body from {url}.",
+                EXIT_METRICS,
+            ) from exc
+        except (OSError, http.client.HTTPException) as exc:
+            raise ProbeError(
+                f"failed reading the response body from {url}: {exc}",
                 EXIT_METRICS,
             ) from exc
     finally:
@@ -259,13 +339,13 @@ def probe_metrics(host: str, port: int, timeout: float, path: str = "/metrics") 
 
     if not 200 <= status < 300:
         raise ProbeError(
-            f"http://{host}:{port}{path} returned HTTP {status}, expected a 2xx "
+            f"{url} returned HTTP {status}, expected a 2xx "
             "status. Check the container logs with './scripts/tester.sh diagnostics'.",
             EXIT_METRICS,
         )
     if not body.strip():
         raise ProbeError(
-            f"http://{host}:{port}{path} returned HTTP {status} with an empty "
+            f"{url} returned HTTP {status} with an empty "
             "body. Metrics are not being exported by the candidate build.",
             EXIT_METRICS,
         )
@@ -310,7 +390,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         "--timeout",
         type=_timeout,
         default=5.0,
-        help="Per-attempt connect/read timeout in seconds (default: 5)",
+        help="Total wall-clock deadline per endpoint attempt in seconds (default: 5)",
     )
     parser.add_argument(
         "--retries",

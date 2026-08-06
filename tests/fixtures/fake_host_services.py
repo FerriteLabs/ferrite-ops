@@ -22,7 +22,7 @@ import threading
 import time
 
 RESP_MODES = ("pong", "error", "garbage", "hang", "close", "none")
-HTTP_MODES = ("ok", "empty", "error", "notfound", "hang", "none")
+HTTP_MODES = ("ok", "empty", "error", "notfound", "hang", "drip", "none")
 
 # Long enough that a bounded probe timeout always expires first, short enough
 # that a leaked fixture process cannot linger for an entire CI run.
@@ -71,6 +71,19 @@ class MetricsHandler(http.server.BaseHTTPRequestHandler):
     def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
         if self.mode == "hang":
             time.sleep(HANG_SECONDS)
+            return
+        if self.mode == "drip":
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Length", str(len(METRICS_BODY)))
+            self.end_headers()
+            try:
+                for byte in METRICS_BODY:
+                    self.wfile.write(bytes((byte,)))
+                    self.wfile.flush()
+                    time.sleep(0.15)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
             return
         if self.mode == "error":
             self.send_response(500)

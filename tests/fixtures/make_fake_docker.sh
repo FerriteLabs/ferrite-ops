@@ -55,7 +55,9 @@ if [[ "${1:-}" == "version" ]]; then
   exit 0
 fi
 
-while [[ "${1:-}" == "--project-name" || "${1:-}" == "--file" ]]; do
+while [[ "${1:-}" == "--project-name" ||
+         "${1:-}" == "--file" ||
+         "${1:-}" == "--profile" ]]; do
   shift 2
 done
 
@@ -63,7 +65,15 @@ command="${1:-}"
 shift || true
 
 case "$command" in
-  config | pull | up | down | restart)
+  down)
+    if [[ -n "${FAKE_EXPECT_COMPOSE_IMAGE:-}" &&
+          "${FERRITE_TEST_IMAGE:-}" != "$FAKE_EXPECT_COMPOSE_IMAGE" ]]; then
+      echo "expected FERRITE_TEST_IMAGE=${FAKE_EXPECT_COMPOSE_IMAGE}, got ${FERRITE_TEST_IMAGE:-<unset>}" >&2
+      exit 10
+    fi
+    exit 0
+    ;;
+  config | pull | up | restart)
     exit 0
     ;;
   ps)

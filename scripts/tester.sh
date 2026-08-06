@@ -15,6 +15,12 @@ export FERRITE_TEST_METRICS_PORT="${FERRITE_TEST_METRICS_PORT:-9090}"
 export FERRITE_TEST_READY_TIMEOUT="${FERRITE_TEST_READY_TIMEOUT:-60}"
 export FERRITE_TEST_PROJECT="${FERRITE_TEST_PROJECT:-ferrite-tester}"
 
+# docker-compose.tester.yml is an implementation detail of this wrapper. The
+# guard and profile prevent an accidental direct `docker compose up` from
+# exposing the tester service, while image validation remains here.
+export FERRITE_TEST_WRAPPER_GUARD="tester.sh"
+TESTER_COMPOSE_PROFILE="tester"
+
 # Host reachability probe settings. Docker health only proves the in-container
 # check passed; these govern the host-side verification that the published
 # loopback ports actually answer before `start` claims availability.
@@ -25,6 +31,11 @@ FERRITE_TEST_PROBE_RETRIES="${FERRITE_TEST_PROBE_RETRIES:-5}"
 # and to exercise the missing-interpreter path without mutating PATH.
 FERRITE_TEST_POLL_INTERVAL="${FERRITE_TEST_POLL_INTERVAL:-1}"
 FERRITE_TEST_PYTHON="${FERRITE_TEST_PYTHON:-python3}"
+
+# Compose expands the required image even for `down`. Teardown commands use
+# this internal placeholder solely to let Compose parse the model; no command
+# that can pull or start a service is allowed to use it.
+TEARDOWN_DUMMY_IMAGE="ferrite.invalid/teardown-only@sha256:0000000000000000000000000000000000000000000000000000000000000000"
 
 CLEANUP_KEYS=()
 DIAGNOSTICS_TMP=""
@@ -50,8 +61,8 @@ Commands:
 Environment:
   FERRITE_TEST_IMAGE           Exact repository-qualified sha256 digest reference
                                (repository/path@sha256:<64 lowercase hex
-                               characters>); required, no default, never a tag
-                               or latest
+                               characters>); required except for stop/reset,
+                               no default, never a tag or latest
   FERRITE_TEST_PORT            Host Redis-compatible port (default: 6379)
   FERRITE_TEST_METRICS_PORT    Host metrics port (default: 9090)
   FERRITE_TEST_READY_TIMEOUT   Health wait in seconds (default: 60)
@@ -133,6 +144,10 @@ validate_settings() {
   validate_uint_range "FERRITE_TEST_READY_TIMEOUT" "$FERRITE_TEST_READY_TIMEOUT" 1 86400
   validate_uint_range "FERRITE_TEST_PROBE_TIMEOUT" "$FERRITE_TEST_PROBE_TIMEOUT" 1 300
   validate_uint_range "FERRITE_TEST_PROBE_RETRIES" "$FERRITE_TEST_PROBE_RETRIES" 0 60
+  validate_project
+}
+
+validate_project() {
   [[ "$FERRITE_TEST_PROJECT" =~ ^[a-z0-9][a-z0-9_-]*$ ]] ||
     die "FERRITE_TEST_PROJECT must match [a-z0-9][a-z0-9_-]*"
 }
@@ -171,17 +186,29 @@ verify_host_reachability() {
 }
 
 # The exact ferrite-ops commit this tooling is running from. Diagnostics are
-# provenance records: a report that cannot name the tooling commit cannot be
-# attributed to a campaign, so this fails the whole command rather than
-# recording "unknown" and misattributing the result.
+# provenance records, so attribution is accepted only from a detached, clean
+# Git worktree. Untracked files are intentionally ignored because they cannot
+# alter the committed tooling being attributed.
 ops_tooling_commit() {
-  local commit
+  local commit worktree_status
   command -v git >/dev/null 2>&1 ||
     die "git is required so diagnostics can record the exact ferrite-ops tooling commit; install git and rerun"
 
-  commit="$(git -C "$REPO_ROOT" rev-parse HEAD 2>/dev/null || true)"
+  [[ "$(git -C "$REPO_ROOT" rev-parse --is-inside-work-tree 2>/dev/null || true)" == "true" ]] ||
+    die "ferrite-ops tooling provenance requires a Git worktree; run diagnostics from a detached checkout of the campaign commit"
+
+  if git -C "$REPO_ROOT" symbolic-ref -q HEAD >/dev/null 2>&1; then
+    die "ferrite-ops tooling provenance requires detached HEAD; run 'git -C ${REPO_ROOT} checkout --detach <CAMPAIGN_OPS_COMMIT>' before diagnostics"
+  fi
+
+  commit="$(git -C "$REPO_ROOT" rev-parse --verify 'HEAD^{commit}' 2>/dev/null || true)"
   [[ "$commit" =~ ^[0-9a-f]{40}$ ]] ||
-    die "could not determine the exact ferrite-ops tooling commit via 'git -C ${REPO_ROOT} rev-parse HEAD'; run this tooling from a Git checkout of the campaign commit (git checkout --detach <CAMPAIGN_OPS_COMMIT>) so diagnostics cannot misattribute results"
+    die "could not determine a full 40-character ferrite-ops tooling commit via 'git -C ${REPO_ROOT} rev-parse --verify HEAD^{commit}'; check out the campaign commit by its full SHA"
+
+  worktree_status="$(git -C "$REPO_ROOT" status --porcelain --untracked-files=no 2>/dev/null)" ||
+    die "could not verify that the ferrite-ops tooling checkout is clean"
+  [[ -z "$worktree_status" ]] ||
+    die "ferrite-ops tooling has tracked staged or unstaged modifications; restore the checkout before diagnostics (untracked files are ignored)"
 
   printf '%s\n' "$commit"
 }
@@ -190,7 +217,12 @@ compose() {
   docker compose \
     --project-name "$FERRITE_TEST_PROJECT" \
     --file "$COMPOSE_FILE" \
+    --profile "$TESTER_COMPOSE_PROFILE" \
     "$@"
+}
+
+compose_teardown() {
+  FERRITE_TEST_IMAGE="$TEARDOWN_DUMMY_IMAGE" compose "$@"
 }
 
 validate_compose() {
@@ -397,11 +429,11 @@ collect_diagnostics() {
   local timestamp bundle_name bundle archive id ops_commit
   local previous_umask
 
+  ops_commit="$(ops_tooling_commit)"
   validate_settings
   require_compose
   verify_running_image
   command -v tar >/dev/null 2>&1 || die "tar is required to create diagnostics"
-  ops_commit="$(ops_tooling_commit)"
 
   # Diagnostics can contain operationally sensitive data (client addresses,
   # keys, or values that leak into logs/INFO output; see report.md below).
@@ -484,15 +516,15 @@ REPORT
 }
 
 stop_environment() {
-  validate_settings
+  validate_project
   require_compose
-  compose down --remove-orphans
+  compose_teardown down --remove-orphans
   echo "Tester containers removed; the named data volume was preserved."
 }
 
 reset_environment() {
   local reply
-  validate_settings
+  validate_project
   require_compose
   echo "WARNING: reset permanently deletes the ${FERRITE_TEST_PROJECT} tester data volume." >&2
   if [[ "${FERRITE_TEST_RESET_CONFIRM:-}" != "1" ]]; then
@@ -500,7 +532,7 @@ reset_environment() {
     read -r reply || die "reset cancelled"
     [[ "$reply" == "RESET" ]] || die "reset cancelled"
   fi
-  compose down --volumes --remove-orphans
+  compose_teardown down --volumes --remove-orphans
   echo "Tester containers and data volume removed."
 }
 

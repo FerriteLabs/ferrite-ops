@@ -192,6 +192,28 @@ else
   harness_fail "hanging metrics probe is bounded by the timeout (took ${ELAPSED}s)"
 fi
 
+# Each body byte arrives within the socket timeout, but the complete response
+# exceeds one total attempt deadline. A per-read timeout would incorrectly
+# allow this response to run to completion.
+start_fake_services pong drip
+START_SECONDS=$SECONDS
+OUTPUT="$(
+  python3 "$PROBE" \
+    --port "$RESP_PORT" \
+    --metrics-port "$METRICS_PORT" \
+    --timeout 0.5 \
+    --retries 0 2>&1
+)"
+STATUS=$?
+ELAPSED=$((SECONDS - START_SECONDS))
+assert_nonzero "$STATUS" "probe rejects a slow-drip metrics body after the total deadline"
+assert_contains "$OUTPUT" "total deadline expired while reading" "slow-drip failure identifies the total body deadline"
+if ((ELAPSED <= 2)); then
+  harness_ok "slow-drip metrics probe obeys one total deadline (${ELAPSED}s)"
+else
+  harness_fail "slow-drip metrics probe obeys one total deadline (took ${ELAPSED}s)"
+fi
+
 start_fake_services pong none
 OUTPUT="$(run_probe)"
 STATUS=$?

@@ -63,13 +63,21 @@ export FERRITE_TEST_IMAGE='ghcr.io/ferritelabs/ferrite@sha256:<CAMPAIGN_DIGEST>'
 ./scripts/tester.sh stop
 ```
 
-`FERRITE_TEST_IMAGE` has no default: `tester.sh` and `docker-compose.tester.yml`
-both fail fast with an actionable error, before any Docker call, if it is
-unset, an implicit/floating `latest` reference, a tag, or not the complete
-repository-qualified sha256 digest form (`repository/path@sha256:<64
-lowercase hex characters>`). `tester.sh` also verifies, before every
-command that talks to the container, that the running container's image
-still matches `FERRITE_TEST_IMAGE` exactly.
+`FERRITE_TEST_IMAGE` has no default for commands that start or inspect the
+tester. `tester.sh` fails fast with an actionable error, before any Docker
+call, if it is unset, an implicit/floating `latest` reference, a tag, or not
+the complete repository-qualified sha256 digest form
+(`repository/path@sha256:<64 lowercase hex characters>`). It also verifies,
+before every command that talks to the container, that the running container's
+image still matches `FERRITE_TEST_IMAGE` exactly. `stop` and `reset` do not
+need campaign image or port settings; the wrapper supplies a private,
+parse-only dummy digest to Compose for teardown and never pulls or starts it.
+
+`docker-compose.tester.yml` is an internal implementation detail. Direct
+`docker compose -f docker-compose.tester.yml ...` invocation is unsupported:
+the service requires a wrapper guard and belongs to the dedicated `tester`
+profile. Always use `./scripts/tester.sh`, which sets both controls and keeps
+its authoritative digest validation in front of every start/inspection path.
 
 Docker reporting a container healthy only proves the in-container healthcheck
 passed, so `start` additionally verifies host reachability with
@@ -79,14 +87,16 @@ deployment is available on localhost. The probe sends a RESP `PING` to
 `127.0.0.1:${FERRITE_TEST_PORT}` and requires `+PONG`, then performs an HTTP
 `GET /metrics` against `127.0.0.1:${FERRITE_TEST_METRICS_PORT}` and requires a
 2xx status with a non-empty body. Tune it with `FERRITE_TEST_PROBE_TIMEOUT`
-(seconds, default 5) and `FERRITE_TEST_PROBE_RETRIES` (default 5); both
-tester ports stay bound to loopback only.
+(one total wall-clock deadline per endpoint attempt, in seconds; default 5)
+and `FERRITE_TEST_PROBE_RETRIES` (default 5); both tester ports stay bound to
+loopback only.
 
-`./scripts/tester.sh diagnostics` records the exact ops tooling commit from
-`git -C <repo root> rev-parse HEAD` in `versions.txt`, `image.txt`, and
-`report.md`. If that commit cannot be determined (for example the tooling was
-copied out of its Git checkout), diagnostics fails instead of producing an
-archive that misattributes its provenance.
+`./scripts/tester.sh diagnostics` first requires a Git worktree at detached
+HEAD, a full 40-character commit SHA, and no tracked staged or unstaged
+modifications (`--untracked-files=no`, so untracked files are ignored). It
+records that exact ops tooling commit in `versions.txt`, `image.txt`, and
+`report.md`. If provenance is not verifiable, diagnostics fails before Docker
+inspection or collection instead of producing a misattributed archive.
 
 Only run `./scripts/tester.sh durability` if the campaign owner has explicitly
 enabled it (`FERRITE_TEST_ENABLE_DURABILITY=1`); it is an optional,

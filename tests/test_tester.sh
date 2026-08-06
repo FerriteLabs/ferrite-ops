@@ -30,6 +30,35 @@ mkdir -p "$FAKE_STATE"
 # `docker image inspect` output; used as the default FERRITE_TEST_IMAGE for
 # every test that is not specifically exercising missing/malformed values.
 FAKE_IMAGE="ghcr.io/ferritelabs/ferrite@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+TEARDOWN_DUMMY_IMAGE="ferrite.invalid/teardown-only@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+
+PROVENANCE_ROOT="${WORK_DIR}/provenance-repo"
+mkdir -p "${PROVENANCE_ROOT}/scripts"
+cp "$TESTER" "${PROVENANCE_ROOT}/scripts/tester.sh"
+cp "${REPO_ROOT}/scripts/tester-host-probe.py" "${PROVENANCE_ROOT}/scripts/"
+cp "${REPO_ROOT}/docker-compose.tester.yml" "${PROVENANCE_ROOT}/"
+git -C "$PROVENANCE_ROOT" init -q
+git -C "$PROVENANCE_ROOT" config user.name "Ferrite Ops Tests"
+git -C "$PROVENANCE_ROOT" config user.email "ferrite-ops-tests@example.invalid"
+git -C "$PROVENANCE_ROOT" add scripts docker-compose.tester.yml
+git -C "$PROVENANCE_ROOT" commit -qm "test fixture"
+PROVENANCE_COMMIT="$(git -C "$PROVENANCE_ROOT" rev-parse HEAD)"
+git -C "$PROVENANCE_ROOT" checkout --detach -q "$PROVENANCE_COMMIT"
+PROVENANCE_TESTER="${PROVENANCE_ROOT}/scripts/tester.sh"
+
+SHORT_SHA_BIN="${WORK_DIR}/short-sha-bin"
+mkdir -p "$SHORT_SHA_BIN"
+REAL_GIT="$(command -v git)"
+cat >"${SHORT_SHA_BIN}/git" <<SHORT_GIT
+#!/usr/bin/env bash
+case "\$*" in
+  *"rev-parse --is-inside-work-tree"*) echo true ;;
+  *"symbolic-ref -q HEAD"*) exit 1 ;;
+  *"rev-parse --verify HEAD^{commit}"*) echo deadbeef ;;
+  *) exec "$REAL_GIT" "\$@" ;;
+esac
+SHORT_GIT
+chmod +x "${SHORT_SHA_BIN}/git"
 
 run_tester() {
   env \
@@ -197,6 +226,7 @@ STATUS=$?
 CALLS="$(cat "$FAKE_LOG")"
 assert_eq 0 "$STATUS" "start succeeds when the fake container is healthy"
 assert_contains "$CALLS" "config" "start renders and validates the tester Compose file"
+assert_contains "$CALLS" "--profile tester" "start always enables the dedicated tester profile"
 assert_contains "$CALLS" "pull ferrite" "start pulls the configured tester image"
 assert_contains "$CALLS" "up -d ferrite" "start starts only the tester service"
 assert_contains "$CALLS" "inspect --format" "start checks Docker health status"
@@ -335,11 +365,32 @@ STATUS=$?
 assert_nonzero "$STATUS" "durability fails when DEL reports the wrong key count"
 assert_contains "$OUTPUT" "expected DEL to remove 1 temporary key(s), got 0" "durability wrong-count cleanup failure names expected and actual counts"
 
-# diagnostics also verifies the running container's image before any CLI
-# exec: no running container, and a mismatched image, must both fail clearly
-# before any diagnostics are collected.
+# Provenance is verified before Docker availability, container inspection, or
+# any other diagnostic collection. The main source checkout is intentionally
+# attached to the development branch, so diagnostics must reject it.
 : >"$FAKE_LOG"
-OUTPUT="$(run_tester FAKE_NO_CONTAINER=1 bash "$TESTER" diagnostics "${WORK_DIR}/diagnostics-no-container" 2>&1)"
+OUTPUT="$(run_tester bash "$TESTER" diagnostics "${WORK_DIR}/diagnostics-attached" 2>&1)"
+STATUS=$?
+assert_nonzero "$STATUS" "diagnostics rejects an attached Git checkout"
+assert_contains "$OUTPUT" "requires detached HEAD" "attached-checkout failure explains the required state"
+assert_empty_file "$FAKE_LOG" "attached-checkout rejection occurs before Docker diagnostics"
+
+: >"$FAKE_LOG"
+OUTPUT="$(
+  run_tester \
+    PATH="${SHORT_SHA_BIN}:${WORK_DIR}/bin:${PATH}" \
+    bash "$TESTER" diagnostics "${WORK_DIR}/diagnostics-short-sha" 2>&1
+)"
+STATUS=$?
+assert_nonzero "$STATUS" "diagnostics rejects a non-canonical short tooling SHA"
+assert_contains "$OUTPUT" "full 40-character" "short-SHA failure states the canonical commit requirement"
+assert_empty_file "$FAKE_LOG" "short-SHA rejection occurs before Docker diagnostics"
+
+# Diagnostics also verifies the running container's image before any CLI
+# exec once provenance is valid: no running container, and a mismatched image,
+# must both fail clearly before any diagnostics are collected.
+: >"$FAKE_LOG"
+OUTPUT="$(run_tester FAKE_NO_CONTAINER=1 bash "$PROVENANCE_TESTER" diagnostics "${WORK_DIR}/diagnostics-no-container" 2>&1)"
 STATUS=$?
 CALLS="$(cat "$FAKE_LOG")"
 assert_nonzero "$STATUS" "diagnostics fails when no tester container is running"
@@ -348,7 +399,7 @@ assert_not_contains "$CALLS" "exec" "diagnostics no-container failure occurs bef
 
 : >"$FAKE_LOG"
 MISMATCHED_IMAGE="ghcr.io/ferritelabs/ferrite@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-OUTPUT="$(run_tester FAKE_RUNNING_IMAGE="$MISMATCHED_IMAGE" bash "$TESTER" diagnostics "${WORK_DIR}/diagnostics-mismatch" 2>&1)"
+OUTPUT="$(run_tester FAKE_RUNNING_IMAGE="$MISMATCHED_IMAGE" bash "$PROVENANCE_TESTER" diagnostics "${WORK_DIR}/diagnostics-mismatch" 2>&1)"
 STATUS=$?
 CALLS="$(cat "$FAKE_LOG")"
 assert_nonzero "$STATUS" "diagnostics fails when the running container image does not match FERRITE_TEST_IMAGE"
@@ -357,12 +408,13 @@ assert_not_contains "$CALLS" "exec" "diagnostics image-mismatch failure occurs b
 
 # Diagnostics collect only bounded, reviewable operational data, and are
 # written with restrictive, portable file permissions.
+touch "${PROVENANCE_ROOT}/untracked-tester-note"
 : >"$FAKE_LOG"
 DIAGNOSTICS_DIR="${WORK_DIR}/diagnostics"
-OUTPUT="$(run_tester bash "$TESTER" diagnostics "$DIAGNOSTICS_DIR" 2>&1)"
+OUTPUT="$(run_tester bash "$PROVENANCE_TESTER" diagnostics "$DIAGNOSTICS_DIR" 2>&1)"
 STATUS=$?
 ARCHIVE="$(find "$DIAGNOSTICS_DIR" -type f -name '*.tar.gz' -print -quit)"
-assert_eq 0 "$STATUS" "diagnostics succeeds"
+assert_eq 0 "$STATUS" "diagnostics succeeds from a detached clean checkout with untracked files"
 assert_existing_file "$ARCHIVE" "diagnostics creates a timestamped tar.gz"
 LISTING="$(tar -tzf "$ARCHIVE")"
 for file in versions.txt image.txt compose-ps.txt logs.txt info-server.txt info-memory.txt info-persistence.txt info-stats.txt report.md; do
@@ -385,15 +437,35 @@ REPORT_TEXT="$(cat "$REPORT")"
 # Diagnostics are a provenance record: the exact ops tooling commit must be
 # recorded, never inferred from a branch or tag, so a report can always be
 # attributed to the campaign commit it was produced from.
-OPS_COMMIT="$(git -C "$REPO_ROOT" rev-parse HEAD)"
 VERSIONS_TEXT="$(cat "$(find "$EXTRACT_DIR" -type f -name versions.txt -print -quit)")"
 IMAGE_TEXT="$(cat "$(find "$EXTRACT_DIR" -type f -name image.txt -print -quit)")"
-assert_contains "$VERSIONS_TEXT" "ferrite-ops tooling commit: ${OPS_COMMIT}" "versions.txt records the exact ops tooling commit"
-assert_contains "$IMAGE_TEXT" "ferrite-ops tooling commit: ${OPS_COMMIT}" "image.txt records the exact ops tooling commit"
-assert_contains "$REPORT_TEXT" "ferrite-ops tooling commit (CAMPAIGN_OPS_COMMIT): \`${OPS_COMMIT}\`" "report.md records the exact ops tooling commit"
+assert_contains "$VERSIONS_TEXT" "ferrite-ops tooling commit: ${PROVENANCE_COMMIT}" "versions.txt records the exact ops tooling commit"
+assert_contains "$IMAGE_TEXT" "ferrite-ops tooling commit: ${PROVENANCE_COMMIT}" "image.txt records the exact ops tooling commit"
+assert_contains "$REPORT_TEXT" "ferrite-ops tooling commit (CAMPAIGN_OPS_COMMIT): \`${PROVENANCE_COMMIT}\`" "report.md records the exact ops tooling commit"
 
 assert_contains "$REPORT_TEXT" "template=tester_report.yml" "report template links the exact tester report form"
 assert_contains "$REPORT_TEXT" "excludes environment variables, secrets, full" "report describes intentional exclusions"
+
+# Tracked unstaged and staged modifications both invalidate provenance, and
+# each rejection must happen before any Docker diagnostic operation.
+printf '\n# unstaged provenance test\n' >>"${PROVENANCE_ROOT}/scripts/tester.sh"
+: >"$FAKE_LOG"
+OUTPUT="$(run_tester bash "$PROVENANCE_TESTER" diagnostics "${WORK_DIR}/diagnostics-unstaged" 2>&1)"
+STATUS=$?
+assert_nonzero "$STATUS" "diagnostics rejects tracked unstaged tooling modifications"
+assert_contains "$OUTPUT" "tracked staged or unstaged modifications" "unstaged-dirty failure explains the clean-checkout requirement"
+assert_empty_file "$FAKE_LOG" "unstaged-dirty rejection occurs before Docker diagnostics"
+git -C "$PROVENANCE_ROOT" checkout -- scripts/tester.sh
+
+printf '\n# staged provenance test\n' >>"${PROVENANCE_ROOT}/docker-compose.tester.yml"
+git -C "$PROVENANCE_ROOT" add docker-compose.tester.yml
+: >"$FAKE_LOG"
+OUTPUT="$(run_tester bash "$PROVENANCE_TESTER" diagnostics "${WORK_DIR}/diagnostics-staged" 2>&1)"
+STATUS=$?
+assert_nonzero "$STATUS" "diagnostics rejects tracked staged tooling modifications"
+assert_contains "$OUTPUT" "tracked staged or unstaged modifications" "staged-dirty failure explains the clean-checkout requirement"
+assert_empty_file "$FAKE_LOG" "staged-dirty rejection occurs before Docker diagnostics"
+git -C "$PROVENANCE_ROOT" reset --hard -q "$PROVENANCE_COMMIT"
 
 # Running the tooling outside a Git checkout means the exact ops commit cannot
 # be determined. Diagnostics must fail rather than emit an archive that
@@ -408,27 +480,46 @@ NON_GIT_OUTPUT_DIR="${WORK_DIR}/diagnostics-non-git"
 OUTPUT="$(run_tester bash "${NON_GIT_ROOT}/scripts/tester.sh" diagnostics "$NON_GIT_OUTPUT_DIR" 2>&1)"
 STATUS=$?
 assert_nonzero "$STATUS" "diagnostics fails outside a Git checkout rather than misattributing provenance"
-assert_contains "$OUTPUT" "could not determine the exact ferrite-ops tooling commit" "missing-provenance failure is actionable"
-assert_contains "$OUTPUT" "rev-parse HEAD" "missing-provenance failure names the exact command it ran"
+assert_contains "$OUTPUT" "requires a Git worktree" "missing-provenance failure is actionable"
 NON_GIT_ARCHIVE="$(find "$NON_GIT_OUTPUT_DIR" -type f -name '*.tar.gz' -print -quit 2>/dev/null || true)"
 assert_eq "" "$NON_GIT_ARCHIVE" "no diagnostics archive is produced without verifiable provenance"
 
-# Stop preserves volumes; reset deletes them only after an explicit signal.
+# Stop/reset require only a valid project name and Compose availability. The
+# campaign image and port settings are irrelevant to cleanup, while an
+# internal parse-only image lets Compose process its required interpolation.
 : >"$FAKE_LOG"
-OUTPUT="$(run_tester bash "$TESTER" stop 2>&1)"
+OUTPUT="$(
+  run_tester_no_image \
+    FAKE_EXPECT_COMPOSE_IMAGE="$TEARDOWN_DUMMY_IMAGE" \
+    FERRITE_TEST_PORT=not-a-port \
+    FERRITE_TEST_METRICS_PORT=also-invalid \
+    bash "$TESTER" stop 2>&1
+)"
 STATUS=$?
 CALLS="$(cat "$FAKE_LOG")"
-assert_eq 0 "$STATUS" "stop succeeds"
+assert_eq 0 "$STATUS" "stop succeeds without a campaign image or valid runtime ports"
+assert_contains "$CALLS" "--profile tester" "stop always invokes Compose through the tester profile"
 assert_contains "$CALLS" "down --remove-orphans" "stop removes containers"
+assert_not_contains "$CALLS" " pull " "stop never pulls the teardown dummy image"
+assert_not_contains "$CALLS" " up " "stop never starts the teardown dummy image"
 assert_not_contains "$CALLS" "--volumes" "stop preserves the named volume"
 assert_contains "$OUTPUT" "volume was preserved" "stop clearly states volume behavior"
 
 : >"$FAKE_LOG"
-OUTPUT="$(run_tester FERRITE_TEST_RESET_CONFIRM=1 bash "$TESTER" reset 2>&1)"
+OUTPUT="$(
+  run_tester_no_image \
+    FAKE_EXPECT_COMPOSE_IMAGE="$TEARDOWN_DUMMY_IMAGE" \
+    FERRITE_TEST_PORT=not-a-port \
+    FERRITE_TEST_METRICS_PORT=also-invalid \
+    FERRITE_TEST_RESET_CONFIRM=1 \
+    bash "$TESTER" reset 2>&1
+)"
 STATUS=$?
 CALLS="$(cat "$FAKE_LOG")"
-assert_eq 0 "$STATUS" "reset supports the CI confirmation bypass"
+assert_eq 0 "$STATUS" "reset supports cleanup without a campaign image or valid runtime ports"
 assert_contains "$CALLS" "down --volumes --remove-orphans" "reset explicitly removes the volume"
+assert_not_contains "$CALLS" " pull " "reset never pulls the teardown dummy image"
+assert_not_contains "$CALLS" " up " "reset never starts the teardown dummy image"
 assert_contains "$OUTPUT" "permanently deletes" "reset prints a destructive warning"
 
 : >"$FAKE_LOG"
