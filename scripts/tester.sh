@@ -5,7 +5,10 @@ SCRIPT_NAME="$(basename "${BASH_SOURCE[0]}")"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 COMPOSE_FILE="${REPO_ROOT}/docker-compose.tester.yml"
 
-export FERRITE_TEST_IMAGE="${FERRITE_TEST_IMAGE:-ghcr.io/ferritelabs/ferrite:0.4.0}"
+# No default: the campaign owner must supply an exact image reference.
+# Left unset (rather than defaulted) so validate_image's missing-value check
+# below is reachable and every command fails fast, before any Docker call.
+export FERRITE_TEST_IMAGE="${FERRITE_TEST_IMAGE:-}"
 export FERRITE_TEST_PORT="${FERRITE_TEST_PORT:-6379}"
 export FERRITE_TEST_METRICS_PORT="${FERRITE_TEST_METRICS_PORT:-9090}"
 export FERRITE_TEST_READY_TIMEOUT="${FERRITE_TEST_READY_TIMEOUT:-60}"
@@ -30,17 +33,23 @@ Commands:
   start                    Validate and start the isolated tester environment
   smoke                    Run core Redis-compatible command checks
   durability               Verify a value survives a controlled restart
+                           (optional; requires FERRITE_TEST_ENABLE_DURABILITY=1)
   diagnostics [output-dir] Create a redaction-conscious diagnostic archive
   stop                     Remove containers and preserve the tester volume
   reset                    Destructively remove containers and tester volume
 
 Environment:
-  FERRITE_TEST_IMAGE          Exact campaign image tag or digest (never latest)
-  FERRITE_TEST_PORT           Host Redis-compatible port (default: 6379)
-  FERRITE_TEST_METRICS_PORT   Host metrics port (default: 9090)
-  FERRITE_TEST_READY_TIMEOUT  Health wait in seconds (default: 60)
-  FERRITE_TEST_PROJECT        Isolated Compose project (default: ferrite-tester)
-  FERRITE_TEST_RESET_CONFIRM  Set to 1 to bypass reset confirmation in CI
+  FERRITE_TEST_IMAGE           Exact campaign image tag or digest; required, no
+                               default, never latest
+  FERRITE_TEST_PORT            Host Redis-compatible port (default: 6379)
+  FERRITE_TEST_METRICS_PORT    Host metrics port (default: 9090)
+  FERRITE_TEST_READY_TIMEOUT   Health wait in seconds (default: 60)
+  FERRITE_TEST_PROJECT         Isolated Compose project (default: ferrite-tester)
+  FERRITE_TEST_RESET_CONFIRM   Set to 1 to bypass reset confirmation in CI
+  FERRITE_TEST_ENABLE_DURABILITY
+                               Must be set to 1 to run `durability`; it is an
+                               optional, campaign-specific diagnostic track,
+                               not part of the required core tester path
 USAGE
 }
 
@@ -53,10 +62,13 @@ validate_uint_range() {
 }
 
 validate_image() {
-  local image="$FERRITE_TEST_IMAGE"
+  local image="${FERRITE_TEST_IMAGE:-}"
   local lower leaf digest
 
-  [[ -n "$image" && "$image" != *[[:space:]]* ]] ||
+  [[ -n "$image" ]] ||
+    die "FERRITE_TEST_IMAGE is required; set it to the exact campaign image tag or digest (never latest). There is no default."
+
+  [[ "$image" != *[[:space:]]* ]] ||
     die "FERRITE_TEST_IMAGE must be one exact image reference"
 
   lower="$(printf '%s' "$image" | tr '[:upper:]' '[:lower:]')"
@@ -143,15 +155,36 @@ cli_raw() {
   compose exec -T ferrite ferrite-cli "$@"
 }
 
-cleanup_keys() {
+# Best-effort cleanup used only by the EXIT trap: it must never itself fail
+# or mask the script's real exit status (e.g. during an error unwind where
+# the container is already gone), so it swallows DEL errors.
+cleanup_keys_best_effort() {
   if ((${#CLEANUP_KEYS[@]} > 0)); then
     cli_raw DEL "${CLEANUP_KEYS[@]}" >/dev/null 2>&1 || true
     CLEANUP_KEYS=()
   fi
 }
 
+# Verified cleanup used on the success path of smoke/durability: a command
+# may only claim "temporary keys were removed" after DEL both succeeds and
+# reports removing exactly the number of keys requested. A silent partial
+# delete (e.g. a key already expired, or a server-side error swallowed by a
+# less strict check) must be surfaced as a failure, not a quiet pass.
+cleanup_keys_verified() {
+  local description="$1" expected output
+  expected=${#CLEANUP_KEYS[@]}
+  ((expected > 0)) || return 0
+
+  output="$(cli_json DEL "${CLEANUP_KEYS[@]}" | tr -d '\r')" ||
+    die "${description}: DEL failed while removing ${expected} temporary key(s); cleanup could not be confirmed"
+  [[ "$output" == "$expected" ]] ||
+    die "${description}: expected DEL to remove ${expected} temporary key(s), got ${output}; cleanup could not be confirmed"
+
+  CLEANUP_KEYS=()
+}
+
 cleanup_on_exit() {
-  cleanup_keys
+  cleanup_keys_best_effort
   if [[ -n "$DIAGNOSTICS_TMP" && -d "$DIAGNOSTICS_TMP" ]]; then
     rm -rf "$DIAGNOSTICS_TMP"
   fi
@@ -212,12 +245,19 @@ run_smoke() {
     die "TTL failed: expected 1..30, got ${ttl}"
   fi
 
-  cleanup_keys
+  cleanup_keys_verified "smoke"
   echo "Smoke checks passed and temporary keys were removed."
 }
 
 run_durability() {
   local key value actual
+
+  # Durability is an optional, campaign-specific diagnostic track, not part
+  # of the required core tester path; it must be explicitly opted into by
+  # the campaign owner before it runs.
+  [[ "${FERRITE_TEST_ENABLE_DURABILITY:-}" == "1" ]] ||
+    die "durability is an optional, campaign-specific diagnostic; set FERRITE_TEST_ENABLE_DURABILITY=1 only if the campaign owner has explicitly enabled this track. It is not part of the required core tester path."
+
   validate_settings
   require_compose
   key="ferrite:tester:durability:$(date -u +%Y%m%dT%H%M%SZ):$$:${RANDOM}"
@@ -231,7 +271,7 @@ run_durability() {
   [[ "$actual" == "\"${value}\"" ]] ||
     die "durability check failed: value did not survive restart"
 
-  cleanup_keys
+  cleanup_keys_verified "durability"
   echo "Durability check passed; the tester volume was preserved."
 }
 
@@ -248,10 +288,19 @@ collect_command() {
 collect_diagnostics() {
   local output_dir="${1:-${PWD}/tester-diagnostics}"
   local timestamp bundle_name bundle archive id
+  local previous_umask
 
   validate_settings
   require_compose
   command -v tar >/dev/null 2>&1 || die "tar is required to create diagnostics"
+
+  # Diagnostics can contain operationally sensitive data (client addresses,
+  # keys, or values that leak into logs/INFO output; see report.md below).
+  # Restrict every file and directory created in this function to the
+  # current user via umask, and belt-and-suspenders chmod the final archive
+  # explicitly so its permissions don't depend on umask alone.
+  previous_umask="$(umask)"
+  umask 077
 
   mkdir -p "$output_dir"
   timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
@@ -313,8 +362,10 @@ details can still appear there.
 REPORT
 
   tar -czf "$archive" -C "$DIAGNOSTICS_TMP" "$bundle_name"
+  chmod 600 "$archive"
   rm -rf "$DIAGNOSTICS_TMP"
   DIAGNOSTICS_TMP=""
+  umask "$previous_umask"
 
   echo "Diagnostics archive: ${archive}"
   echo "Review and redact logs and INFO output before sharing."

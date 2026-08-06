@@ -1,6 +1,6 @@
 services:
   ferrite:
-    image: ${FERRITE_TEST_IMAGE:-ghcr.io/ferritelabs/ferrite:0.4.0}
+    image: "${FERRITE_TEST_IMAGE:?FERRITE_TEST_IMAGE is required: set it to the exact campaign image tag or digest, never latest}"
     ports:
       - "${FERRITE_TEST_PORT:-6379}:6379"
       - "${FERRITE_TEST_METRICS_PORT:-9090}:9090"

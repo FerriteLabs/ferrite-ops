@@ -16,8 +16,26 @@ FAKE_STATE="${WORK_DIR}/state"
 touch "$FAKE_LOG"
 mkdir -p "$FAKE_STATE"
 
+# A valid, exact digest reference matching the fake docker fixture's own
+# `docker image inspect` output; used as the default FERRITE_TEST_IMAGE for
+# every test that is not specifically exercising missing/malformed values.
+FAKE_IMAGE="ghcr.io/ferritelabs/ferrite@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
 run_tester() {
   env \
+    PATH="${WORK_DIR}/bin:${PATH}" \
+    FAKE_DOCKER_LOG="$FAKE_LOG" \
+    FAKE_DOCKER_STATE="$FAKE_STATE" \
+    FERRITE_TEST_POLL_INTERVAL="0.05" \
+    FERRITE_TEST_IMAGE="$FAKE_IMAGE" \
+    "$@"
+}
+
+# Like run_tester, but does not supply any default FERRITE_TEST_IMAGE at all
+# (and strips one from the parent environment) so missing-variable behavior
+# can be exercised without a test author having to remember to override it.
+run_tester_no_image() {
+  env -u FERRITE_TEST_IMAGE \
     PATH="${WORK_DIR}/bin:${PATH}" \
     FAKE_DOCKER_LOG="$FAKE_LOG" \
     FAKE_DOCKER_STATE="$FAKE_STATE" \
@@ -52,9 +70,26 @@ assert_empty_file() {
   fi
 }
 
+# Portable file-mode reader: GNU stat (Linux) uses -c '%a', BSD/macOS stat
+# uses -f '%OLp'. Falls back to empty string (assertion will simply fail)
+# rather than erroring out on an unsupported platform.
+portable_mode() {
+  local path="$1"
+  stat -c '%a' "$path" 2>/dev/null || stat -f '%OLp' "$path" 2>/dev/null || echo ""
+}
+
 assert_true "$(bash -n "$TESTER"; echo $?)" "tester.sh has valid Bash syntax"
 
-# Exact image validation happens before Docker is called.
+# --- FERRITE_TEST_IMAGE validation happens before Docker is called, for
+# every failure mode: missing, implicit/floating latest, and malformed. ---
+
+: >"$FAKE_LOG"
+OUTPUT="$(run_tester_no_image bash "$TESTER" start 2>&1)"
+STATUS=$?
+assert_nonzero "$STATUS" "start rejects a missing FERRITE_TEST_IMAGE"
+assert_contains "$OUTPUT" "FERRITE_TEST_IMAGE is required" "missing-image rejection is actionable"
+assert_empty_file "$FAKE_LOG" "missing-image rejection occurs before Docker calls"
+
 : >"$FAKE_LOG"
 OUTPUT="$(run_tester FERRITE_TEST_IMAGE="ghcr.io/ferritelabs/ferrite:latest" bash "$TESTER" start 2>&1)"
 STATUS=$?
@@ -62,10 +97,33 @@ assert_nonzero "$STATUS" "start rejects the latest tag"
 assert_contains "$OUTPUT" "must never use latest" "latest rejection explains the campaign rule"
 assert_empty_file "$FAKE_LOG" "latest rejection occurs before Docker calls"
 
+: >"$FAKE_LOG"
+OUTPUT="$(run_tester FERRITE_TEST_IMAGE="latest" bash "$TESTER" start 2>&1)"
+STATUS=$?
+assert_nonzero "$STATUS" "start rejects a bare latest value"
+assert_contains "$OUTPUT" "must never use latest" "bare latest rejection explains the campaign rule"
+assert_empty_file "$FAKE_LOG" "bare latest rejection occurs before Docker calls"
+
+: >"$FAKE_LOG"
 OUTPUT="$(run_tester FERRITE_TEST_IMAGE="ghcr.io/ferritelabs/ferrite" bash "$TESTER" start 2>&1)"
 STATUS=$?
 assert_nonzero "$STATUS" "start rejects an implicit latest image"
 assert_contains "$OUTPUT" "explicit tag or sha256 digest" "implicit latest rejection requests an exact reference"
+assert_empty_file "$FAKE_LOG" "implicit latest rejection occurs before Docker calls"
+
+: >"$FAKE_LOG"
+OUTPUT="$(run_tester FERRITE_TEST_IMAGE="ghcr.io/ferritelabs/ferrite@sha256:not-a-real-digest" bash "$TESTER" start 2>&1)"
+STATUS=$?
+assert_nonzero "$STATUS" "start rejects a malformed digest"
+assert_contains "$OUTPUT" "sha256:<64 hex characters>" "malformed digest rejection explains the required form"
+assert_empty_file "$FAKE_LOG" "malformed digest rejection occurs before Docker calls"
+
+: >"$FAKE_LOG"
+OUTPUT="$(run_tester FERRITE_TEST_IMAGE="ghcr.io/ferritelabs/ferrite:" bash "$TESTER" start 2>&1)"
+STATUS=$?
+assert_nonzero "$STATUS" "start rejects a malformed empty tag"
+assert_contains "$OUTPUT" "explicit tag or sha256 digest" "malformed empty tag rejection requests an exact reference"
+assert_empty_file "$FAKE_LOG" "malformed empty tag rejection occurs before Docker calls"
 
 # Start validates Compose, pulls the exact image, starts only Ferrite, and waits.
 : >"$FAKE_LOG"
@@ -102,20 +160,65 @@ OUTPUT="$(run_tester FAKE_FAIL_COMMAND=HGET bash "$TESTER" smoke 2>&1)"
 STATUS=$?
 CALLS="$(cat "$FAKE_LOG")"
 assert_nonzero "$STATUS" "smoke propagates a command failure"
-assert_contains "$CALLS" " DEL " "smoke cleans keys after a failure"
+assert_contains "$CALLS" " DEL " "smoke best-effort cleans keys after a failure via the exit trap"
+assert_not_contains "$OUTPUT" "temporary keys were removed" "smoke does not claim cleanup after a command failure"
 
-# Durability restarts the service, waits again, verifies, and removes its key.
+# Cleanup must be verified, not assumed: a failing DEL on an otherwise
+# successful smoke run must fail the whole command and must not claim
+# cleanup succeeded.
+: >"$FAKE_LOG"
+OUTPUT="$(run_tester FAKE_FAIL_COMMAND=DEL bash "$TESTER" smoke 2>&1)"
+STATUS=$?
+assert_nonzero "$STATUS" "smoke fails when DEL itself fails during verified cleanup"
+assert_contains "$OUTPUT" "DEL failed while removing" "DEL failure during cleanup is actionable"
+assert_not_contains "$OUTPUT" "temporary keys were removed" "smoke does not claim cleanup when DEL fails"
+
+# A DEL that succeeds but reports the wrong count must also fail: a partial
+# delete is not a completed cleanup.
+: >"$FAKE_LOG"
+OUTPUT="$(run_tester FAKE_DEL_COUNT=3 bash "$TESTER" smoke 2>&1)"
+STATUS=$?
+assert_nonzero "$STATUS" "smoke fails when DEL reports the wrong key count"
+assert_contains "$OUTPUT" "expected DEL to remove 5 temporary key(s), got 3" "wrong-count cleanup failure names the expected and actual counts"
+assert_not_contains "$OUTPUT" "temporary keys were removed" "smoke does not claim cleanup when the DEL count is wrong"
+
+# --- Durability is opt-in and campaign-specific. ---
+
 : >"$FAKE_LOG"
 OUTPUT="$(run_tester bash "$TESTER" durability 2>&1)"
 STATUS=$?
+assert_nonzero "$STATUS" "durability refuses to run without FERRITE_TEST_ENABLE_DURABILITY=1"
+assert_contains "$OUTPUT" "FERRITE_TEST_ENABLE_DURABILITY=1" "durability gate names the required opt-in variable"
+assert_contains "$OUTPUT" "campaign-specific" "durability gate explains it is an optional, campaign-specific diagnostic"
+assert_empty_file "$FAKE_LOG" "durability gate rejection occurs before Docker calls"
+
+# Durability restarts the service, waits again, verifies, and removes its key,
+# once explicitly enabled.
+: >"$FAKE_LOG"
+OUTPUT="$(run_tester FERRITE_TEST_ENABLE_DURABILITY=1 bash "$TESTER" durability 2>&1)"
+STATUS=$?
 CALLS="$(cat "$FAKE_LOG")"
-assert_eq 0 "$STATUS" "durability succeeds when the value survives restart"
+assert_eq 0 "$STATUS" "durability succeeds when explicitly enabled and the value survives restart"
 assert_contains "$CALLS" "restart ferrite" "durability restarts Ferrite through Compose"
 assert_contains "$CALLS" " GET " "durability reads the value after restart"
 assert_contains "$CALLS" " DEL " "durability removes its temporary key"
 assert_contains "$OUTPUT" "tester volume was preserved" "durability documents volume preservation"
 
-# Diagnostics collect only bounded, reviewable operational data.
+: >"$FAKE_LOG"
+OUTPUT="$(run_tester FERRITE_TEST_ENABLE_DURABILITY=1 FAKE_FAIL_COMMAND=DEL bash "$TESTER" durability 2>&1)"
+STATUS=$?
+assert_nonzero "$STATUS" "durability fails when DEL itself fails during verified cleanup"
+assert_contains "$OUTPUT" "DEL failed while removing" "durability DEL failure is actionable"
+assert_not_contains "$OUTPUT" "tester volume was preserved" "durability does not claim success when cleanup DEL fails"
+
+: >"$FAKE_LOG"
+OUTPUT="$(run_tester FERRITE_TEST_ENABLE_DURABILITY=1 FAKE_DEL_COUNT=0 bash "$TESTER" durability 2>&1)"
+STATUS=$?
+assert_nonzero "$STATUS" "durability fails when DEL reports the wrong key count"
+assert_contains "$OUTPUT" "expected DEL to remove 1 temporary key(s), got 0" "durability wrong-count cleanup failure names expected and actual counts"
+
+# Diagnostics collect only bounded, reviewable operational data, and are
+# written with restrictive, portable file permissions.
 : >"$FAKE_LOG"
 DIAGNOSTICS_DIR="${WORK_DIR}/diagnostics"
 OUTPUT="$(run_tester bash "$TESTER" diagnostics "$DIAGNOSTICS_DIR" 2>&1)"
@@ -131,6 +234,9 @@ assert_not_contains "$LISTING" "environment" "diagnostics archive excludes envir
 assert_not_contains "$LISTING" "config" "diagnostics archive excludes full configuration"
 assert_contains "$(cat "$FAKE_LOG")" "logs --no-color --tail 500 ferrite" "diagnostic logs are bounded"
 assert_contains "$OUTPUT" "Review and redact logs and INFO output" "diagnostics warns the tester before sharing"
+
+ARCHIVE_MODE="$(portable_mode "$ARCHIVE")"
+assert_eq "600" "$ARCHIVE_MODE" "diagnostics archive is created with 0600 permissions"
 
 EXTRACT_DIR="${WORK_DIR}/extracted"
 mkdir -p "$EXTRACT_DIR"

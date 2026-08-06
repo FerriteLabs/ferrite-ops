@@ -37,18 +37,29 @@ helm install ferrite charts/ferrite
 
 ### External Tester Quick Start
 
-For the v0.4 non-production cohort, follow the
-[canonical Tester Program](https://github.com/ferritelabs/ferrite/blob/main/TESTER_PROGRAM.md)
-and use the isolated, volume-preserving tester environment:
+For a non-production candidate/hardening campaign cohort, follow the
+[canonical Tester Program](https://github.com/ferritelabs/ferrite/blob/main/TESTER_PROGRAM.md).
+Check out the exact campaign reference before running the isolated,
+volume-preserving tester environment — there is no default branch or image;
+both must be supplied by the campaign owner:
 
 ```bash
-export FERRITE_TEST_IMAGE='ghcr.io/ferritelabs/ferrite:0.4.0' # or exact campaign digest
+git checkout <CAMPAIGN_OPS_REF>   # exact tag or commit the campaign owner supplied; never main
+export FERRITE_TEST_IMAGE='<CAMPAIGN_IMAGE_DIGEST>' # exact tag/digest the campaign owner supplied; never latest
 ./scripts/tester.sh start
 ./scripts/tester.sh smoke
-./scripts/tester.sh durability
 ./scripts/tester.sh diagnostics
 ./scripts/tester.sh stop
 ```
+
+`FERRITE_TEST_IMAGE` has no default: `tester.sh` and `docker-compose.tester.yml`
+both fail fast with an actionable error, before any Docker call, if it is
+unset, an implicit/floating `latest` reference, or a malformed tag/digest.
+
+Only run `./scripts/tester.sh durability` if the campaign owner has explicitly
+enabled it (`FERRITE_TEST_ENABLE_DURABILITY=1`); it is an optional,
+campaign-specific diagnostic track, not part of the core tester path, and the
+script refuses to run it otherwise.
 
 Use `./scripts/tester.sh reset` only when you are ready to delete the tester
 volume. General deployment and operations guidance below remains authoritative

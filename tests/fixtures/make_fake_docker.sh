@@ -137,7 +137,10 @@ case "$command" in
         echo "29"
         ;;
       DEL)
-        echo "1"
+        # Echo the number of keys actually passed, unless a test forces a
+        # specific (possibly wrong) count via FAKE_DEL_COUNT, so tests can
+        # exercise both correct and mismatched cleanup-verification counts.
+        echo "${FAKE_DEL_COUNT:-$#}"
         ;;
       INFO)
         echo "# ${1:-server}"
