@@ -4,6 +4,7 @@ set -euo pipefail
 SCRIPT_NAME="$(basename "${BASH_SOURCE[0]}")"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 COMPOSE_FILE="${REPO_ROOT}/docker-compose.tester.yml"
+HOST_PROBE="${REPO_ROOT}/scripts/tester-host-probe.py"
 
 # No default: the campaign owner must supply an exact image reference.
 # Left unset (rather than defaulted) so validate_image's missing-value check
@@ -14,8 +15,16 @@ export FERRITE_TEST_METRICS_PORT="${FERRITE_TEST_METRICS_PORT:-9090}"
 export FERRITE_TEST_READY_TIMEOUT="${FERRITE_TEST_READY_TIMEOUT:-60}"
 export FERRITE_TEST_PROJECT="${FERRITE_TEST_PROJECT:-ferrite-tester}"
 
-# Internal override used by dependency-free tests to avoid one-second sleeps.
+# Host reachability probe settings. Docker health only proves the in-container
+# check passed; these govern the host-side verification that the published
+# loopback ports actually answer before `start` claims availability.
+FERRITE_TEST_PROBE_TIMEOUT="${FERRITE_TEST_PROBE_TIMEOUT:-5}"
+FERRITE_TEST_PROBE_RETRIES="${FERRITE_TEST_PROBE_RETRIES:-5}"
+
+# Internal overrides used by dependency-free tests to avoid one-second sleeps
+# and to exercise the missing-interpreter path without mutating PATH.
 FERRITE_TEST_POLL_INTERVAL="${FERRITE_TEST_POLL_INTERVAL:-1}"
+FERRITE_TEST_PYTHON="${FERRITE_TEST_PYTHON:-python3}"
 
 CLEANUP_KEYS=()
 DIAGNOSTICS_TMP=""
@@ -46,6 +55,10 @@ Environment:
   FERRITE_TEST_PORT            Host Redis-compatible port (default: 6379)
   FERRITE_TEST_METRICS_PORT    Host metrics port (default: 9090)
   FERRITE_TEST_READY_TIMEOUT   Health wait in seconds (default: 60)
+  FERRITE_TEST_PROBE_TIMEOUT   Host reachability probe timeout in seconds
+                               (default: 5)
+  FERRITE_TEST_PROBE_RETRIES   Extra host reachability probe attempts after a
+                               failure (default: 5)
   FERRITE_TEST_PROJECT         Isolated Compose project (default: ferrite-tester)
   FERRITE_TEST_RESET_CONFIRM   Set to 1 to bypass reset confirmation in CI
   FERRITE_TEST_ENABLE_DURABILITY
@@ -118,6 +131,8 @@ validate_settings() {
   validate_uint_range "FERRITE_TEST_PORT" "$FERRITE_TEST_PORT" 1 65535
   validate_uint_range "FERRITE_TEST_METRICS_PORT" "$FERRITE_TEST_METRICS_PORT" 1 65535
   validate_uint_range "FERRITE_TEST_READY_TIMEOUT" "$FERRITE_TEST_READY_TIMEOUT" 1 86400
+  validate_uint_range "FERRITE_TEST_PROBE_TIMEOUT" "$FERRITE_TEST_PROBE_TIMEOUT" 1 300
+  validate_uint_range "FERRITE_TEST_PROBE_RETRIES" "$FERRITE_TEST_PROBE_RETRIES" 0 60
   [[ "$FERRITE_TEST_PROJECT" =~ ^[a-z0-9][a-z0-9_-]*$ ]] ||
     die "FERRITE_TEST_PROJECT must match [a-z0-9][a-z0-9_-]*"
 }
@@ -127,6 +142,48 @@ require_compose() {
     die "Docker is required; install Docker Engine or Docker Desktop"
   docker compose version >/dev/null 2>&1 ||
     die "Docker Compose v2 is required ('docker compose')"
+}
+
+require_python() {
+  command -v "$FERRITE_TEST_PYTHON" >/dev/null 2>&1 ||
+    die "Python 3 is required to verify host reachability ('${FERRITE_TEST_PYTHON}' was not found); install Python 3 and rerun"
+  "$FERRITE_TEST_PYTHON" -c 'import sys; raise SystemExit(0 if sys.version_info[0] >= 3 else 1)' >/dev/null 2>&1 ||
+    die "'${FERRITE_TEST_PYTHON}' is not a working Python 3 interpreter; install Python 3 and rerun"
+}
+
+# Docker reporting the container healthy only proves the in-container
+# healthcheck passed. Before telling a tester the deployment is available on
+# localhost, verify from the host that the published loopback ports actually
+# answer: RESP PING must return +PONG and GET /metrics must return 2xx with a
+# non-empty body. The probe is standard-library Python 3 only and every
+# timeout it uses is bounded.
+verify_host_reachability() {
+  [[ -f "$HOST_PROBE" ]] ||
+    die "host reachability probe is missing at ${HOST_PROBE}; the checkout is incomplete, re-clone ferrite-ops at the campaign commit"
+
+  "$FERRITE_TEST_PYTHON" "$HOST_PROBE" \
+    --host 127.0.0.1 \
+    --port "$FERRITE_TEST_PORT" \
+    --metrics-port "$FERRITE_TEST_METRICS_PORT" \
+    --timeout "$FERRITE_TEST_PROBE_TIMEOUT" \
+    --retries "$FERRITE_TEST_PROBE_RETRIES" ||
+    die "Ferrite is NOT reachable from this host (see the probe error above); do not begin a tester session until it is"
+}
+
+# The exact ferrite-ops commit this tooling is running from. Diagnostics are
+# provenance records: a report that cannot name the tooling commit cannot be
+# attributed to a campaign, so this fails the whole command rather than
+# recording "unknown" and misattributing the result.
+ops_tooling_commit() {
+  local commit
+  command -v git >/dev/null 2>&1 ||
+    die "git is required so diagnostics can record the exact ferrite-ops tooling commit; install git and rerun"
+
+  commit="$(git -C "$REPO_ROOT" rev-parse HEAD 2>/dev/null || true)"
+  [[ "$commit" =~ ^[0-9a-f]{40}$ ]] ||
+    die "could not determine the exact ferrite-ops tooling commit via 'git -C ${REPO_ROOT} rev-parse HEAD'; run this tooling from a Git checkout of the campaign commit (git checkout --detach <CAMPAIGN_OPS_COMMIT>) so diagnostics cannot misattribute results"
+
+  printf '%s\n' "$commit"
 }
 
 compose() {
@@ -248,6 +305,7 @@ expect_json() {
 
 start_environment() {
   validate_settings
+  require_python
   require_compose
   validate_compose
   echo "Starting ${FERRITE_TEST_PROJECT} with ${FERRITE_TEST_IMAGE}"
@@ -255,6 +313,7 @@ start_environment() {
   compose up -d ferrite
   wait_for_health
   verify_running_image
+  verify_host_reachability
   echo "Ferrite is available on localhost:${FERRITE_TEST_PORT}; metrics: localhost:${FERRITE_TEST_METRICS_PORT}"
 }
 
@@ -335,13 +394,14 @@ collect_command() {
 
 collect_diagnostics() {
   local output_dir="${1:-${PWD}/tester-diagnostics}"
-  local timestamp bundle_name bundle archive id
+  local timestamp bundle_name bundle archive id ops_commit
   local previous_umask
 
   validate_settings
   require_compose
   verify_running_image
   command -v tar >/dev/null 2>&1 || die "tar is required to create diagnostics"
+  ops_commit="$(ops_tooling_commit)"
 
   # Diagnostics can contain operationally sensitive data (client addresses,
   # keys, or values that leak into logs/INFO output; see report.md below).
@@ -362,12 +422,14 @@ collect_diagnostics() {
 
   {
     echo "tester.sh diagnostics format: 1"
+    echo "ferrite-ops tooling commit: ${ops_commit}"
     docker --version 2>&1 || true
     docker compose version 2>&1 || true
     compose exec -T ferrite ferrite-cli --version 2>&1 || true
   } >"${bundle}/versions.txt"
 
   {
+    echo "ferrite-ops tooling commit: ${ops_commit}"
     echo "Requested image: ${FERRITE_TEST_IMAGE}"
     if [[ -n "$id" ]]; then
       echo "Container image ID:"
@@ -393,6 +455,7 @@ Submit at: https://github.com/ferritelabs/ferrite/issues/new?template=tester_rep
 - Track completed:
 - Highest severity observed:
 - Version and exact image digest: \`${FERRITE_TEST_IMAGE}\`
+- ferrite-ops tooling commit (CAMPAIGN_OPS_COMMIT): \`${ops_commit}\`
 - Install method: ferrite-ops tester Docker Compose
 - Environment:
 - Redis client or application:

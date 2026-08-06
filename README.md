@@ -39,16 +39,21 @@ helm install ferrite charts/ferrite
 
 For a non-production candidate/hardening campaign cohort, follow the
 [canonical Tester Program](https://github.com/ferritelabs/ferrite/blob/main/TESTER_PROGRAM.md).
-Check out the exact campaign reference before running the isolated,
+Check out the exact campaign commit before running the isolated,
 volume-preserving tester environment — there is no default branch or image;
-both must be supplied by the campaign owner:
+both must be supplied by the campaign owner. Docker, Docker Compose v2, and
+Python 3 (standard library only) are required:
 
 ```bash
 git clone https://github.com/ferritelabs/ferrite-ops.git
 cd ferrite-ops
-git checkout <CAMPAIGN_OPS_REF>   # exact tag or commit the campaign owner supplied; never main
+git checkout --detach <CAMPAIGN_OPS_COMMIT>   # full 40-character lowercase commit SHA; never a tag, a branch, or main
+test "$(git rev-parse HEAD)" = "<CAMPAIGN_OPS_COMMIT>" || {
+  echo "HEAD is not <CAMPAIGN_OPS_COMMIT>; stop and re-request the campaign commit" >&2
+  exit 1
+}
 test -x scripts/tester.sh && ./scripts/tester.sh --help >/dev/null || {
-  echo "scripts/tester.sh is missing or not runnable at <CAMPAIGN_OPS_REF>" >&2
+  echo "scripts/tester.sh is missing or not runnable at <CAMPAIGN_OPS_COMMIT>" >&2
   exit 1
 }
 export FERRITE_TEST_IMAGE='ghcr.io/ferritelabs/ferrite@sha256:<CAMPAIGN_DIGEST>' # complete repository-qualified digest the campaign owner supplied; never latest or a tag
@@ -65,6 +70,23 @@ repository-qualified sha256 digest form (`repository/path@sha256:<64
 lowercase hex characters>`). `tester.sh` also verifies, before every
 command that talks to the container, that the running container's image
 still matches `FERRITE_TEST_IMAGE` exactly.
+
+Docker reporting a container healthy only proves the in-container healthcheck
+passed, so `start` additionally verifies host reachability with
+`scripts/tester-host-probe.py` (Python 3 standard library only, bounded
+timeouts) after health and image verification, and before claiming the
+deployment is available on localhost. The probe sends a RESP `PING` to
+`127.0.0.1:${FERRITE_TEST_PORT}` and requires `+PONG`, then performs an HTTP
+`GET /metrics` against `127.0.0.1:${FERRITE_TEST_METRICS_PORT}` and requires a
+2xx status with a non-empty body. Tune it with `FERRITE_TEST_PROBE_TIMEOUT`
+(seconds, default 5) and `FERRITE_TEST_PROBE_RETRIES` (default 5); both
+tester ports stay bound to loopback only.
+
+`./scripts/tester.sh diagnostics` records the exact ops tooling commit from
+`git -C <repo root> rev-parse HEAD` in `versions.txt`, `image.txt`, and
+`report.md`. If that commit cannot be determined (for example the tooling was
+copied out of its Git checkout), diagnostics fails instead of producing an
+archive that misattributes its provenance.
 
 Only run `./scripts/tester.sh durability` if the campaign owner has explicitly
 enabled it (`FERRITE_TEST_ENABLE_DURABILITY=1`); it is an optional,

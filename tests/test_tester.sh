@@ -5,10 +5,20 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${HERE}/.." && pwd)"
 # shellcheck disable=SC1091
 source "${HERE}/lib/harness.sh"
+# shellcheck source=tests/lib/host_services.sh
+source "${HERE}/lib/host_services.sh"
 
 TESTER="${REPO_ROOT}/scripts/tester.sh"
 WORK_DIR="$(mktemp -d)"
-trap 'rm -rf "$WORK_DIR"' EXIT
+trap 'host_services_stop; rm -rf "$WORK_DIR"' EXIT
+
+# `start` verifies host reachability with real loopback servers, so commands
+# that are expected to reach that stage need something actually listening.
+# Every other command is unaffected by these ports.
+host_services_start pong ok || {
+  echo "  FAIL: could not start the loopback host services fixture" >&2
+  exit 1
+}
 
 "${HERE}/fixtures/make_fake_docker.sh" "${WORK_DIR}/bin"
 FAKE_LOG="${WORK_DIR}/docker.log"
@@ -28,6 +38,10 @@ run_tester() {
     FAKE_DOCKER_STATE="$FAKE_STATE" \
     FERRITE_TEST_POLL_INTERVAL="0.05" \
     FERRITE_TEST_IMAGE="$FAKE_IMAGE" \
+    FERRITE_TEST_PORT="$RESP_PORT" \
+    FERRITE_TEST_METRICS_PORT="$METRICS_PORT" \
+    FERRITE_TEST_PROBE_TIMEOUT=1 \
+    FERRITE_TEST_PROBE_RETRIES=0 \
     "$@"
 }
 
@@ -40,6 +54,10 @@ run_tester_no_image() {
     FAKE_DOCKER_LOG="$FAKE_LOG" \
     FAKE_DOCKER_STATE="$FAKE_STATE" \
     FERRITE_TEST_POLL_INTERVAL="0.05" \
+    FERRITE_TEST_PORT="$RESP_PORT" \
+    FERRITE_TEST_METRICS_PORT="$METRICS_PORT" \
+    FERRITE_TEST_PROBE_TIMEOUT=1 \
+    FERRITE_TEST_PROBE_RETRIES=0 \
     "$@"
 }
 
@@ -184,6 +202,8 @@ assert_contains "$CALLS" "up -d ferrite" "start starts only the tester service"
 assert_contains "$CALLS" "inspect --format" "start checks Docker health status"
 assert_contains "$CALLS" ".Config.Image" "start verifies the running container's image after health"
 assert_contains "$OUTPUT" "Ferrite is healthy" "start reports readiness"
+assert_contains "$OUTPUT" "Host reachability verified" "start verifies host reachability before claiming availability"
+assert_contains "$OUTPUT" "Ferrite is available on localhost" "start reports availability once reachable"
 
 # Health waiting is bounded.
 : >"$FAKE_LOG"
@@ -361,8 +381,37 @@ mkdir -p "$EXTRACT_DIR"
 tar -xzf "$ARCHIVE" -C "$EXTRACT_DIR"
 REPORT="$(find "$EXTRACT_DIR" -type f -name report.md -print -quit)"
 REPORT_TEXT="$(cat "$REPORT")"
+
+# Diagnostics are a provenance record: the exact ops tooling commit must be
+# recorded, never inferred from a branch or tag, so a report can always be
+# attributed to the campaign commit it was produced from.
+OPS_COMMIT="$(git -C "$REPO_ROOT" rev-parse HEAD)"
+VERSIONS_TEXT="$(cat "$(find "$EXTRACT_DIR" -type f -name versions.txt -print -quit)")"
+IMAGE_TEXT="$(cat "$(find "$EXTRACT_DIR" -type f -name image.txt -print -quit)")"
+assert_contains "$VERSIONS_TEXT" "ferrite-ops tooling commit: ${OPS_COMMIT}" "versions.txt records the exact ops tooling commit"
+assert_contains "$IMAGE_TEXT" "ferrite-ops tooling commit: ${OPS_COMMIT}" "image.txt records the exact ops tooling commit"
+assert_contains "$REPORT_TEXT" "ferrite-ops tooling commit (CAMPAIGN_OPS_COMMIT): \`${OPS_COMMIT}\`" "report.md records the exact ops tooling commit"
+
 assert_contains "$REPORT_TEXT" "template=tester_report.yml" "report template links the exact tester report form"
 assert_contains "$REPORT_TEXT" "excludes environment variables, secrets, full" "report describes intentional exclusions"
+
+# Running the tooling outside a Git checkout means the exact ops commit cannot
+# be determined. Diagnostics must fail rather than emit an archive that
+# misattributes (or silently omits) its provenance.
+NON_GIT_ROOT="${WORK_DIR}/non-git"
+mkdir -p "${NON_GIT_ROOT}/scripts"
+cp "$TESTER" "${NON_GIT_ROOT}/scripts/tester.sh"
+cp "${REPO_ROOT}/docker-compose.tester.yml" "${NON_GIT_ROOT}/"
+cp -R "${REPO_ROOT}/scripts/tester-host-probe.py" "${NON_GIT_ROOT}/scripts/"
+: >"$FAKE_LOG"
+NON_GIT_OUTPUT_DIR="${WORK_DIR}/diagnostics-non-git"
+OUTPUT="$(run_tester bash "${NON_GIT_ROOT}/scripts/tester.sh" diagnostics "$NON_GIT_OUTPUT_DIR" 2>&1)"
+STATUS=$?
+assert_nonzero "$STATUS" "diagnostics fails outside a Git checkout rather than misattributing provenance"
+assert_contains "$OUTPUT" "could not determine the exact ferrite-ops tooling commit" "missing-provenance failure is actionable"
+assert_contains "$OUTPUT" "rev-parse HEAD" "missing-provenance failure names the exact command it ran"
+NON_GIT_ARCHIVE="$(find "$NON_GIT_OUTPUT_DIR" -type f -name '*.tar.gz' -print -quit 2>/dev/null || true)"
+assert_eq "" "$NON_GIT_ARCHIVE" "no diagnostics archive is produced without verifiable provenance"
 
 # Stop preserves volumes; reset deletes them only after an explicit signal.
 : >"$FAKE_LOG"
