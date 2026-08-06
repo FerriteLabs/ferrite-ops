@@ -44,6 +44,10 @@ volume-preserving tester environment — there is no default branch or image;
 both must be supplied by the campaign owner. Docker, Docker Compose v2, and
 Python 3 (standard library only) are required:
 
+> Linux testers must use Docker Engine 28 or newer. Older engines can expose
+> ports published to `127.0.0.1` to peers on the same local network, so
+> `tester.sh start` fails closed on those versions.
+
 ```bash
 git clone https://github.com/ferritelabs/ferrite-ops.git
 cd ferrite-ops

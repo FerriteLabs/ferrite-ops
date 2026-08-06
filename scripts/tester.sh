@@ -33,6 +33,7 @@ FERRITE_TEST_PROBE_RETRIES="${FERRITE_TEST_PROBE_RETRIES:-5}"
 # and to exercise the missing-interpreter path without mutating PATH.
 FERRITE_TEST_POLL_INTERVAL="${FERRITE_TEST_POLL_INTERVAL:-1}"
 FERRITE_TEST_PYTHON="${FERRITE_TEST_PYTHON:-python3}"
+FERRITE_TEST_OS="${FERRITE_TEST_OS:-$(uname -s)}"
 
 # Compose expands the required image even for `down`. Teardown commands use
 # this internal placeholder solely to let Compose parse the model; no command
@@ -415,6 +416,19 @@ require_compose() {
     die "Docker Compose v2 is required ('docker compose')"
 }
 
+require_safe_port_publishing() {
+  local server_version major
+  [[ "$FERRITE_TEST_OS" == "Linux" ]] || return 0
+
+  server_version="$(docker version --format '{{.Server.Version}}' 2>/dev/null)" ||
+    die "could not determine the Docker Engine server version"
+  [[ "$server_version" =~ ^([0-9]+)\. ]] ||
+    die "could not parse Docker Engine server version '${server_version}'"
+  major="${BASH_REMATCH[1]}"
+  ((10#$major >= 28)) ||
+    die "Docker Engine 28 or newer is required on Linux because older engines can expose 127.0.0.1-published ports to the local network; upgrade Docker before starting the tester environment"
+}
+
 require_python() {
   command -v "$FERRITE_TEST_PYTHON" >/dev/null 2>&1 ||
     die "Python 3 is required to verify host reachability ('${FERRITE_TEST_PYTHON}' was not found); install Python 3 and rerun"
@@ -681,6 +695,7 @@ start_environment() {
   validate_settings
   require_python
   require_compose
+  require_safe_port_publishing
   verify_project_ownership
   validate_compose
   echo "Starting ${FERRITE_TEST_PROJECT} with ${FERRITE_TEST_IMAGE}"
@@ -697,6 +712,7 @@ run_smoke() {
   local prefix value ttl zscore
   validate_settings
   require_compose
+  require_safe_port_publishing
   verify_project_ownership
   verify_running_image
   prefix="ferrite:tester:smoke:$(date -u +%Y%m%dT%H%M%SZ):$$:${RANDOM}"
@@ -743,6 +759,7 @@ run_durability() {
 
   validate_settings
   require_compose
+  require_safe_port_publishing
   verify_project_ownership
   verify_running_image
   key="ferrite:tester:durability:$(date -u +%Y%m%dT%H%M%SZ):$$:${RANDOM}"
@@ -779,6 +796,7 @@ collect_diagnostics() {
   ops_commit="$(ops_tooling_commit)"
   validate_settings
   require_compose
+  require_safe_port_publishing
   verify_project_ownership
   verify_running_image
   command -v tar >/dev/null 2>&1 || die "tar is required to create diagnostics"

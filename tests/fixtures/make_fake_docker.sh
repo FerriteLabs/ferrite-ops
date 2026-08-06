@@ -34,6 +34,11 @@ if [[ "${1:-}" == "--version" ]]; then
   exit 0
 fi
 
+if [[ "${1:-}" == "version" ]]; then
+  echo "${FAKE_DOCKER_SERVER_VERSION:-28.0.0}"
+  exit 0
+fi
+
 if [[ "${1:-}" == "container" && "${2:-}" == "ls" ]]; then
   if [[ -n "${FAKE_OWNERSHIP_CHECK_FILE:-}" ]]; then
     ownership_check=0

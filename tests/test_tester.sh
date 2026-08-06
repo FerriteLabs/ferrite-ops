@@ -277,6 +277,18 @@ assert_nonzero "$STATUS" "start rejects a single-segment (non-repository-qualifi
 assert_contains "$OUTPUT" "not a bare image name" "single-segment rejection asks for a repository-qualified name"
 assert_empty_file "$FAKE_LOG" "single-segment rejection occurs before Docker calls"
 
+: >"$FAKE_LOG"
+OUTPUT="$(run_tester FERRITE_TEST_OS=Linux FAKE_DOCKER_SERVER_VERSION=27.5.1 bash "$TESTER" start 2>&1)"
+STATUS=$?
+assert_nonzero "$STATUS" "start rejects Linux Docker Engine versions older than 28"
+assert_contains "$OUTPUT" "Docker Engine 28 or newer is required on Linux" "old Linux engine rejection explains the loopback exposure risk"
+assert_not_contains "$(cat "$FAKE_LOG")" "up -d ferrite" "old Linux engine rejection occurs before container startup"
+
+: >"$FAKE_LOG"
+OUTPUT="$(run_tester FERRITE_TEST_OS=Linux FAKE_DOCKER_SERVER_VERSION=28.0.0 bash "$TESTER" start 2>&1)"
+STATUS=$?
+assert_eq 0 "$STATUS" "start accepts Docker Engine 28 on Linux"
+
 # Project validation occurs before the canonical lock path is constructed.
 : >"$FAKE_LOG"
 OUTPUT="$(run_tester FERRITE_TEST_PROJECT="../escaped-project" bash "$TESTER" stop 2>&1)"
