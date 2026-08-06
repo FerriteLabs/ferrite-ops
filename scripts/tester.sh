@@ -41,8 +41,12 @@ TEARDOWN_DUMMY_IMAGE="ferrite.invalid/teardown-only@sha256:000000000000000000000
 
 CLEANUP_KEYS=()
 DIAGNOSTICS_TMP=""
+PROJECT_LOCK_ROOT=""
 PROJECT_LOCK_DIR=""
 PROJECT_LOCK_OWNER_PID=""
+PROJECT_LOCK_OWNER_START_TIME=""
+LOCK_RECORD_PID=""
+LOCK_RECORD_START_TIME=""
 PROJECT_OWNERSHIP_REVALIDATION_PENDING=0
 
 die() {
@@ -174,60 +178,190 @@ process_is_alive() {
   [[ "$observed_pid" == "$pid" ]]
 }
 
+process_start_time() {
+  local pid="$1" start_time
+
+  start_time="$(LC_ALL=C ps -p "$pid" -o lstart= 2>/dev/null)" || return 1
+  start_time="$(
+    printf '%s\n' "$start_time" |
+      sed -e 's/^[[:space:]]*//' \
+        -e 's/[[:space:]][[:space:]]*/ /g' \
+        -e 's/[[:space:]]*$//'
+  )"
+  [[ -n "$start_time" ]] || return 1
+  printf '%s\n' "$start_time"
+}
+
+process_identity_matches() {
+  local pid="$1" recorded_start_time="$2" current_start_time
+
+  process_is_alive "$pid" || return 1
+  current_start_time="$(process_start_time "$pid")" || return 1
+  [[ "$current_start_time" == "$recorded_start_time" ]]
+}
+
+path_owner_uid() {
+  local path="$1" owner_uid
+
+  if owner_uid="$(stat -c '%u' -- "$path" 2>/dev/null)"; then
+    :
+  elif owner_uid="$(stat -f '%u' "$path" 2>/dev/null)"; then
+    :
+  else
+    return 1
+  fi
+  [[ "$owner_uid" =~ ^[0-9]+$ ]] || return 1
+  printf '%s\n' "$owner_uid"
+}
+
+path_mode() {
+  local path="$1" mode
+
+  if mode="$(stat -c '%a' -- "$path" 2>/dev/null)"; then
+    :
+  elif mode="$(stat -f '%OLp' "$path" 2>/dev/null)"; then
+    :
+  else
+    return 1
+  fi
+  [[ "$mode" =~ ^0*[0-7]{3}$ ]] || return 1
+  while [[ "$mode" == 0* && ${#mode} -gt 3 ]]; do
+    mode="${mode#0}"
+  done
+  printf '%s\n' "$mode"
+}
+
+validate_private_directory() {
+  local path="$1" description="$2" expected_uid="$3" actual_uid mode
+
+  [[ ! -L "$path" ]] ||
+    die "${description} '${path}' must not be a symbolic link"
+  [[ -d "$path" ]] ||
+    die "${description} '${path}' must be a directory"
+  actual_uid="$(path_owner_uid "$path")" ||
+    die "could not determine ownership of ${description} '${path}'"
+  [[ "$actual_uid" == "$expected_uid" ]] ||
+    die "${description} '${path}' is owned by UID ${actual_uid}, expected UID ${expected_uid}"
+  mode="$(path_mode "$path")" ||
+    die "could not determine permissions of ${description} '${path}'"
+  [[ "$mode" == "700" ]] ||
+    die "${description} '${path}' permissions must be 700, found ${mode}"
+}
+
+ensure_project_lock_root() {
+  local uid lock_root created=0
+
+  uid="$(id -u)" || die "could not determine the numeric user ID for project locking"
+  [[ "$uid" =~ ^[0-9]+$ ]] ||
+    die "project locking requires a numeric user ID; got '${uid}'"
+
+  lock_root="/tmp/ferrite-tester-locks-${uid}"
+  if [[ ! -e "$lock_root" && ! -L "$lock_root" ]]; then
+    if (umask 077 && mkdir "$lock_root") 2>/dev/null; then
+      created=1
+    elif [[ ! -e "$lock_root" && ! -L "$lock_root" ]]; then
+      die "could not create project lock root '${lock_root}'"
+    fi
+  fi
+
+  if ((created == 1)) && ! chmod 700 "$lock_root"; then
+    rmdir "$lock_root" 2>/dev/null || true
+    die "could not apply restrictive permissions to project lock root '${lock_root}'"
+  fi
+  validate_private_directory "$lock_root" "project lock root" "$uid"
+  PROJECT_LOCK_ROOT="$lock_root"
+}
+
+read_project_lock_owner() {
+  local owner_file="$1" owner_uid owner_mode
+
+  LOCK_RECORD_PID=""
+  LOCK_RECORD_START_TIME=""
+  [[ ! -L "$owner_file" && -f "$owner_file" ]] || return 1
+  owner_uid="$(path_owner_uid "$owner_file")" || return 1
+  [[ "$owner_uid" == "$(id -u)" ]] || return 1
+  owner_mode="$(path_mode "$owner_file")" || return 1
+  [[ "$owner_mode" == "600" ]] || return 1
+
+  {
+    IFS= read -r LOCK_RECORD_PID || return 1
+    IFS= read -r LOCK_RECORD_START_TIME || return 1
+    if IFS= read -r; then
+      return 1
+    fi
+  } <"$owner_file"
+
+  [[ "$LOCK_RECORD_PID" =~ ^[1-9][0-9]*$ ]] || return 1
+  [[ "$LOCK_RECORD_START_TIME" =~ [^[:space:]] ]] || return 1
+}
+
+write_project_lock_owner() {
+  local owner_file="$1" pid="$2" start_time="$3"
+
+  (umask 077 && printf '%s\n%s\n' "$pid" "$start_time" >"$owner_file") ||
+    return 1
+  chmod 600 "$owner_file"
+}
+
 acquire_project_lock() {
-  local lock_root lock_dir pid_file owner_pid process_id
+  local lock_dir owner_file owner_pid owner_start_time process_id
+  local process_start uid
 
   validate_project
-  lock_root="${TMPDIR:-/tmp}"
-  [[ -d "$lock_root" && -w "$lock_root" ]] ||
-    die "TMPDIR '${lock_root}' must be an existing writable directory"
-
-  lock_dir="${lock_root%/}/ferrite-tester-${FERRITE_TEST_PROJECT}.lock"
-  [[ -n "${lock_root%/}" ]] ||
-    lock_dir="/ferrite-tester-${FERRITE_TEST_PROJECT}.lock"
-  pid_file="${lock_dir}/pid"
+  ensure_project_lock_root
+  uid="$(id -u)"
+  lock_dir="${PROJECT_LOCK_ROOT}/ferrite-tester-${FERRITE_TEST_PROJECT}.lock"
+  owner_file="${lock_dir}/owner"
   process_id="${BASHPID:-$$}"
+  process_start="$(process_start_time "$process_id")" ||
+    die "could not determine start time for lock owner PID ${process_id}"
 
   while true; do
     if (umask 077 && mkdir "$lock_dir") 2>/dev/null; then
-      if ! (umask 077 && printf '%s\n' "$process_id" >"$pid_file"); then
+      if ! write_project_lock_owner "$owner_file" "$process_id" "$process_start"; then
+        rm -f "$owner_file"
         rmdir "$lock_dir" 2>/dev/null || true
-        die "could not record PID ownership for project lock '${lock_dir}'"
+        die "could not record process ownership for project lock '${lock_dir}'"
       fi
-      if ! chmod 700 "$lock_dir" || ! chmod 600 "$pid_file"; then
-        rm -f "$pid_file"
+      if ! chmod 700 "$lock_dir"; then
+        rm -f "$owner_file"
         rmdir "$lock_dir" 2>/dev/null || true
         die "could not apply restrictive permissions to project lock '${lock_dir}'"
       fi
 
       PROJECT_LOCK_DIR="$lock_dir"
       PROJECT_LOCK_OWNER_PID="$process_id"
+      PROJECT_LOCK_OWNER_START_TIME="$process_start"
       return 0
     fi
 
-    [[ -d "$lock_dir" ]] ||
-      die "could not create project lock '${lock_dir}'"
+    validate_private_directory "$lock_dir" "project lock" "$uid"
 
     owner_pid=""
-    if [[ -f "$pid_file" ]]; then
-      IFS= read -r owner_pid <"$pid_file" || owner_pid=""
-    fi
-    [[ "$owner_pid" =~ ^[1-9][0-9]*$ ]] ||
-      die "project lock '${lock_dir}' has no valid recorded owner PID; refusing stale-lock recovery"
-
-    if process_is_alive "$owner_pid"; then
-      die "Compose project '${FERRITE_TEST_PROJECT}' is locked by active process PID ${owner_pid}; wait for it to finish"
+    owner_start_time=""
+    if read_project_lock_owner "$owner_file"; then
+      owner_pid="$LOCK_RECORD_PID"
+      owner_start_time="$LOCK_RECORD_START_TIME"
+    else
+      die "project lock '${lock_dir}' has no valid recorded owner identity; refusing stale-lock recovery"
     fi
 
-    # Removing the PID file is the recovery claim. Only the process that
-    # successfully removes that exact dead-owner record may remove the now
+    if process_identity_matches "$owner_pid" "$owner_start_time"; then
+      die "Compose project '${FERRITE_TEST_PROJECT}' is locked by active process PID ${owner_pid} (started ${owner_start_time}); wait for it to finish"
+    fi
+
+    # Removing the owner file is the recovery claim. Only the process that
+    # successfully removes that exact stale-owner record may remove the now
     # empty lock directory; concurrent recoverers fail closed.
-    if rm "$pid_file" 2>/dev/null; then
+    if rm "$owner_file" 2>/dev/null; then
       if ! rmdir "$lock_dir" 2>/dev/null; then
-        (umask 077 && printf '%s\n' "$owner_pid" >"$pid_file") || true
+        (
+          set -o noclobber
+          write_project_lock_owner "$owner_file" "$owner_pid" "$owner_start_time"
+        ) 2>/dev/null || true
         die "stale project lock '${lock_dir}' contains unexpected entries; refusing recovery"
       fi
-      echo "Recovered stale project lock for '${FERRITE_TEST_PROJECT}' from PID ${owner_pid}." >&2
+      echo "Recovered stale project lock for '${FERRITE_TEST_PROJECT}' from PID ${owner_pid} (recorded start ${owner_start_time})." >&2
       continue
     fi
 
@@ -237,26 +371,41 @@ acquire_project_lock() {
 }
 
 release_project_lock() {
-  local process_id recorded_pid
+  local owner_file process_id process_start recorded_pid recorded_start_time
 
-  [[ -n "$PROJECT_LOCK_DIR" && -n "$PROJECT_LOCK_OWNER_PID" ]] || return 0
+  [[ -n "$PROJECT_LOCK_DIR" &&
+    -n "$PROJECT_LOCK_OWNER_PID" &&
+    -n "$PROJECT_LOCK_OWNER_START_TIME" ]] || return 0
   process_id="${BASHPID:-$$}"
   [[ "$process_id" == "$PROJECT_LOCK_OWNER_PID" ]] || return 0
+  process_start="$(process_start_time "$process_id")" || return 0
+  [[ "$process_start" == "$PROJECT_LOCK_OWNER_START_TIME" ]] || return 0
+  [[ ! -L "$PROJECT_LOCK_DIR" && -d "$PROJECT_LOCK_DIR" ]] || return 0
 
+  owner_file="${PROJECT_LOCK_DIR}/owner"
   recorded_pid=""
-  if [[ -f "${PROJECT_LOCK_DIR}/pid" ]]; then
-    IFS= read -r recorded_pid <"${PROJECT_LOCK_DIR}/pid" || recorded_pid=""
+  recorded_start_time=""
+  if read_project_lock_owner "$owner_file"; then
+    recorded_pid="$LOCK_RECORD_PID"
+    recorded_start_time="$LOCK_RECORD_START_TIME"
   fi
   [[ "$recorded_pid" == "$PROJECT_LOCK_OWNER_PID" ]] || return 0
+  [[ "$recorded_start_time" == "$PROJECT_LOCK_OWNER_START_TIME" ]] || return 0
 
-  if rm "${PROJECT_LOCK_DIR}/pid" 2>/dev/null; then
+  if rm "$owner_file" 2>/dev/null; then
     if ! rmdir "$PROJECT_LOCK_DIR" 2>/dev/null; then
-      (umask 077 && printf '%s\n' "$PROJECT_LOCK_OWNER_PID" >"${PROJECT_LOCK_DIR}/pid") ||
-        true
+      (
+        set -o noclobber
+        write_project_lock_owner \
+          "$owner_file" \
+          "$PROJECT_LOCK_OWNER_PID" \
+          "$PROJECT_LOCK_OWNER_START_TIME"
+      ) 2>/dev/null || true
     fi
   fi
   PROJECT_LOCK_DIR=""
   PROJECT_LOCK_OWNER_PID=""
+  PROJECT_LOCK_OWNER_START_TIME=""
 }
 
 require_compose() {

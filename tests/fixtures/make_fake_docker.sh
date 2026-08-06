@@ -13,6 +13,18 @@ STATE="${FAKE_DOCKER_STATE:?FAKE_DOCKER_STATE is required}"
 mkdir -p "$STATE"
 printf '%s\n' "$*" >>"$LOG"
 
+if [[ -n "${FAKE_LOCK_OWNER_FILE:-}" &&
+      -n "${FAKE_REPLACEMENT_LOCK_PID:-}" &&
+      -n "${FAKE_REPLACEMENT_LOCK_START_TIME:-}" &&
+      -n "${FAKE_LOCK_REPLACEMENT_MARKER:-}" &&
+      ! -e "$FAKE_LOCK_REPLACEMENT_MARKER" ]]; then
+  printf '%s\n%s\n' \
+    "$FAKE_REPLACEMENT_LOCK_PID" \
+    "$FAKE_REPLACEMENT_LOCK_START_TIME" >"$FAKE_LOCK_OWNER_FILE"
+  chmod 600 "$FAKE_LOCK_OWNER_FILE"
+  : >"$FAKE_LOCK_REPLACEMENT_MARKER"
+fi
+
 json_string() {
   printf '"%s"\n' "$1"
 }
