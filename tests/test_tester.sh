@@ -81,7 +81,9 @@ portable_mode() {
 assert_true "$(bash -n "$TESTER"; echo $?)" "tester.sh has valid Bash syntax"
 
 # --- FERRITE_TEST_IMAGE validation happens before Docker is called, for
-# every failure mode: missing, implicit/floating latest, and malformed. ---
+# every failure mode: missing, tags (including latest), bare digests,
+# missing repositories, and malformed/uppercase digests. Only a complete
+# repository-qualified lowercase sha256 digest is ever accepted. ---
 
 : >"$FAKE_LOG"
 OUTPUT="$(run_tester_no_image bash "$TESTER" start 2>&1)"
@@ -107,9 +109,23 @@ assert_empty_file "$FAKE_LOG" "bare latest rejection occurs before Docker calls"
 : >"$FAKE_LOG"
 OUTPUT="$(run_tester FERRITE_TEST_IMAGE="ghcr.io/ferritelabs/ferrite" bash "$TESTER" start 2>&1)"
 STATUS=$?
-assert_nonzero "$STATUS" "start rejects an implicit latest image"
-assert_contains "$OUTPUT" "explicit tag or sha256 digest" "implicit latest rejection requests an exact reference"
+assert_nonzero "$STATUS" "start rejects an implicit latest image with no digest"
+assert_contains "$OUTPUT" "tags are never accepted" "implicit latest rejection requires a digest"
 assert_empty_file "$FAKE_LOG" "implicit latest rejection occurs before Docker calls"
+
+: >"$FAKE_LOG"
+OUTPUT="$(run_tester FERRITE_TEST_IMAGE="ghcr.io/ferritelabs/ferrite:v1.2.3" bash "$TESTER" start 2>&1)"
+STATUS=$?
+assert_nonzero "$STATUS" "start rejects a pinned tag"
+assert_contains "$OUTPUT" "tags are never accepted" "pinned tag rejection requires a digest"
+assert_empty_file "$FAKE_LOG" "pinned tag rejection occurs before Docker calls"
+
+: >"$FAKE_LOG"
+OUTPUT="$(run_tester FERRITE_TEST_IMAGE="ghcr.io/ferritelabs/ferrite:v1.2.3@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" bash "$TESTER" start 2>&1)"
+STATUS=$?
+assert_nonzero "$STATUS" "start rejects a tag combined with a digest"
+assert_contains "$OUTPUT" "must not combine a tag with a digest" "tag+digest rejection is actionable"
+assert_empty_file "$FAKE_LOG" "tag+digest rejection occurs before Docker calls"
 
 : >"$FAKE_LOG"
 OUTPUT="$(run_tester FERRITE_TEST_IMAGE="ghcr.io/ferritelabs/ferrite@sha256:not-a-real-digest" bash "$TESTER" start 2>&1)"
@@ -135,21 +151,7 @@ assert_contains "$OUTPUT" "lowercase sha256" "mixed-case digest rejection explai
 assert_empty_file "$FAKE_LOG" "mixed-case digest rejection occurs before Docker calls"
 
 : >"$FAKE_LOG"
-OUTPUT="$(run_tester FERRITE_TEST_IMAGE="ghcr.io/ferritelabs/ferrite:" bash "$TESTER" start 2>&1)"
-STATUS=$?
-assert_nonzero "$STATUS" "start rejects a malformed empty tag"
-assert_contains "$OUTPUT" "malformed image tag" "malformed empty tag rejection identifies the tag"
-assert_empty_file "$FAKE_LOG" "malformed empty tag rejection occurs before Docker calls"
-
-: >"$FAKE_LOG"
-OUTPUT="$(run_tester FERRITE_TEST_IMAGE="ghcr.io/ferritelabs/ferrite:-candidate" bash "$TESTER" start 2>&1)"
-STATUS=$?
-assert_nonzero "$STATUS" "start rejects a malformed tag prefix"
-assert_contains "$OUTPUT" "malformed image tag" "malformed tag rejection is actionable"
-assert_empty_file "$FAKE_LOG" "malformed tag rejection occurs before Docker calls"
-
-: >"$FAKE_LOG"
-OUTPUT="$(run_tester FERRITE_TEST_IMAGE="ghcr.io/ferritelabs//ferrite:candidate" bash "$TESTER" start 2>&1)"
+OUTPUT="$(run_tester FERRITE_TEST_IMAGE="ghcr.io/ferritelabs//ferrite@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" bash "$TESTER" start 2>&1)"
 STATUS=$?
 assert_nonzero "$STATUS" "start rejects a malformed repository path"
 assert_contains "$OUTPUT" "malformed repository path" "malformed repository rejection is actionable"
@@ -162,7 +164,15 @@ assert_nonzero "$STATUS" "start rejects a digest without a repository"
 assert_contains "$OUTPUT" "repository name before the digest" "missing repository rejection is actionable"
 assert_empty_file "$FAKE_LOG" "missing repository rejection occurs before Docker calls"
 
-# Start validates Compose, pulls the exact image, starts only Ferrite, and waits.
+: >"$FAKE_LOG"
+OUTPUT="$(run_tester FERRITE_TEST_IMAGE="ferrite@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" bash "$TESTER" start 2>&1)"
+STATUS=$?
+assert_nonzero "$STATUS" "start rejects a single-segment (non-repository-qualified) image name"
+assert_contains "$OUTPUT" "not a bare image name" "single-segment rejection asks for a repository-qualified name"
+assert_empty_file "$FAKE_LOG" "single-segment rejection occurs before Docker calls"
+
+# Start validates Compose, pulls the exact image, starts only Ferrite, waits,
+# and verifies the running container's image matches FERRITE_TEST_IMAGE.
 : >"$FAKE_LOG"
 OUTPUT="$(run_tester bash "$TESTER" start 2>&1)"
 STATUS=$?
@@ -172,6 +182,7 @@ assert_contains "$CALLS" "config" "start renders and validates the tester Compos
 assert_contains "$CALLS" "pull ferrite" "start pulls the configured tester image"
 assert_contains "$CALLS" "up -d ferrite" "start starts only the tester service"
 assert_contains "$CALLS" "inspect --format" "start checks Docker health status"
+assert_contains "$CALLS" ".Config.Image" "start verifies the running container's image after health"
 assert_contains "$OUTPUT" "Ferrite is healthy" "start reports readiness"
 
 # Health waiting is bounded.
@@ -180,6 +191,35 @@ OUTPUT="$(run_tester FAKE_HEALTH_STATUS=unhealthy FERRITE_TEST_READY_TIMEOUT=1 b
 STATUS=$?
 assert_nonzero "$STATUS" "start fails after the readiness timeout"
 assert_contains "$OUTPUT" "did not become healthy within 1s" "health timeout is actionable"
+
+# start fails, with a clear message, when the container that became healthy
+# is not actually running the requested image (e.g. a stale container).
+: >"$FAKE_LOG"
+MISMATCHED_IMAGE="ghcr.io/ferritelabs/ferrite@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+OUTPUT="$(run_tester FAKE_RUNNING_IMAGE="$MISMATCHED_IMAGE" bash "$TESTER" start 2>&1)"
+STATUS=$?
+assert_nonzero "$STATUS" "start fails when the running container image does not match FERRITE_TEST_IMAGE"
+assert_contains "$OUTPUT" "does not match FERRITE_TEST_IMAGE" "start image-mismatch failure is actionable"
+
+# smoke verifies the running container's image before any CLI exec: no
+# running container, and a running-but-mismatched image, must both fail
+# clearly before any ferrite-cli command is invoked.
+: >"$FAKE_LOG"
+OUTPUT="$(run_tester FAKE_NO_CONTAINER=1 bash "$TESTER" smoke 2>&1)"
+STATUS=$?
+CALLS="$(cat "$FAKE_LOG")"
+assert_nonzero "$STATUS" "smoke fails when no tester container is running"
+assert_contains "$OUTPUT" "No running tester container was found" "no-container failure is actionable"
+assert_not_contains "$CALLS" "exec" "no-container failure occurs before any CLI exec"
+
+: >"$FAKE_LOG"
+MISMATCHED_IMAGE="ghcr.io/ferritelabs/ferrite@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+OUTPUT="$(run_tester FAKE_RUNNING_IMAGE="$MISMATCHED_IMAGE" bash "$TESTER" smoke 2>&1)"
+STATUS=$?
+CALLS="$(cat "$FAKE_LOG")"
+assert_nonzero "$STATUS" "smoke fails when the running container image does not match FERRITE_TEST_IMAGE"
+assert_contains "$OUTPUT" "does not match FERRITE_TEST_IMAGE" "smoke image-mismatch failure is actionable"
+assert_not_contains "$CALLS" "exec" "image-mismatch failure occurs before any CLI exec"
 
 # Smoke covers the requested command families and always cleans temporary keys.
 : >"$FAKE_LOG"
@@ -230,6 +270,26 @@ assert_contains "$OUTPUT" "campaign-specific" "durability gate explains it is an
 assert_contains "$OUTPUT" "may not persist data across restart" "durability gate explains the current persistence limitation"
 assert_empty_file "$FAKE_LOG" "durability gate rejection occurs before Docker calls"
 
+# Once enabled, durability also verifies the running container's image
+# before any CLI exec: no running container, and a mismatched image, must
+# both fail clearly before the durability SET is ever issued.
+: >"$FAKE_LOG"
+OUTPUT="$(run_tester FERRITE_TEST_ENABLE_DURABILITY=1 FAKE_NO_CONTAINER=1 bash "$TESTER" durability 2>&1)"
+STATUS=$?
+CALLS="$(cat "$FAKE_LOG")"
+assert_nonzero "$STATUS" "durability fails when no tester container is running"
+assert_contains "$OUTPUT" "No running tester container was found" "durability no-container failure is actionable"
+assert_not_contains "$CALLS" "exec" "durability no-container failure occurs before any CLI exec"
+
+: >"$FAKE_LOG"
+MISMATCHED_IMAGE="ghcr.io/ferritelabs/ferrite@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+OUTPUT="$(run_tester FERRITE_TEST_ENABLE_DURABILITY=1 FAKE_RUNNING_IMAGE="$MISMATCHED_IMAGE" bash "$TESTER" durability 2>&1)"
+STATUS=$?
+CALLS="$(cat "$FAKE_LOG")"
+assert_nonzero "$STATUS" "durability fails when the running container image does not match FERRITE_TEST_IMAGE"
+assert_contains "$OUTPUT" "does not match FERRITE_TEST_IMAGE" "durability image-mismatch failure is actionable"
+assert_not_contains "$CALLS" "exec" "durability image-mismatch failure occurs before any CLI exec"
+
 # Durability restarts the service, waits again, verifies, and removes its key,
 # once explicitly enabled.
 : >"$FAKE_LOG"
@@ -254,6 +314,26 @@ OUTPUT="$(run_tester FERRITE_TEST_ENABLE_DURABILITY=1 FAKE_DEL_COUNT=0 bash "$TE
 STATUS=$?
 assert_nonzero "$STATUS" "durability fails when DEL reports the wrong key count"
 assert_contains "$OUTPUT" "expected DEL to remove 1 temporary key(s), got 0" "durability wrong-count cleanup failure names expected and actual counts"
+
+# diagnostics also verifies the running container's image before any CLI
+# exec: no running container, and a mismatched image, must both fail clearly
+# before any diagnostics are collected.
+: >"$FAKE_LOG"
+OUTPUT="$(run_tester FAKE_NO_CONTAINER=1 bash "$TESTER" diagnostics "${WORK_DIR}/diagnostics-no-container" 2>&1)"
+STATUS=$?
+CALLS="$(cat "$FAKE_LOG")"
+assert_nonzero "$STATUS" "diagnostics fails when no tester container is running"
+assert_contains "$OUTPUT" "No running tester container was found" "diagnostics no-container failure is actionable"
+assert_not_contains "$CALLS" "exec" "diagnostics no-container failure occurs before any CLI exec"
+
+: >"$FAKE_LOG"
+MISMATCHED_IMAGE="ghcr.io/ferritelabs/ferrite@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+OUTPUT="$(run_tester FAKE_RUNNING_IMAGE="$MISMATCHED_IMAGE" bash "$TESTER" diagnostics "${WORK_DIR}/diagnostics-mismatch" 2>&1)"
+STATUS=$?
+CALLS="$(cat "$FAKE_LOG")"
+assert_nonzero "$STATUS" "diagnostics fails when the running container image does not match FERRITE_TEST_IMAGE"
+assert_contains "$OUTPUT" "does not match FERRITE_TEST_IMAGE" "diagnostics image-mismatch failure is actionable"
+assert_not_contains "$CALLS" "exec" "diagnostics image-mismatch failure occurs before any CLI exec"
 
 # Diagnostics collect only bounded, reviewable operational data, and are
 # written with restrictive, portable file permissions.

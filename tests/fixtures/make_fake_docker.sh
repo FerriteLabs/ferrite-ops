@@ -25,6 +25,17 @@ fi
 if [[ "${1:-}" == "inspect" ]]; then
   if [[ "$*" == *".State.Health"* ]]; then
     echo "${FAKE_HEALTH_STATUS:-healthy}"
+  elif [[ "$*" == *".Config.Image"* ]]; then
+    # Defaults to the same digest reference tests use as FERRITE_TEST_IMAGE
+    # (see tests/test_tester.sh FAKE_IMAGE) so verify_running_image succeeds
+    # unless a test explicitly overrides FAKE_RUNNING_IMAGE to simulate a
+    # mismatch, or FAKE_NO_RUNNING_IMAGE to simulate an unreadable/missing
+    # value.
+    if [[ "${FAKE_NO_RUNNING_IMAGE:-}" == "1" ]]; then
+      :
+    else
+      echo "${FAKE_RUNNING_IMAGE:-ghcr.io/ferritelabs/ferrite@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}"
+    fi
   elif [[ "$*" == *".Image"* ]]; then
     echo "sha256:fake-container-image"
   fi
@@ -57,10 +68,14 @@ case "$command" in
     ;;
   ps)
     if [[ " $* " == *" -q "* ]]; then
-      echo "fake-ferrite-container"
+      if [[ "${FAKE_NO_CONTAINER:-}" != "1" ]]; then
+        echo "fake-ferrite-container"
+      fi
     else
       echo "NAME STATUS"
-      echo "fake-ferrite-container Up (healthy)"
+      if [[ "${FAKE_NO_CONTAINER:-}" != "1" ]]; then
+        echo "fake-ferrite-container Up (healthy)"
+      fi
     fi
     exit 0
     ;;

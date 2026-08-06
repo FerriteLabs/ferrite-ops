@@ -1,9 +1,9 @@
 services:
   ferrite:
-    image: "${FERRITE_TEST_IMAGE:?FERRITE_TEST_IMAGE is required: set it to the exact campaign image tag or digest, never latest}"
+    image: "${FERRITE_TEST_IMAGE:?FERRITE_TEST_IMAGE is required: set it to the exact repository-qualified sha256 digest reference (repository/path@sha256:<64 lowercase hex characters>), never a tag or latest}"
     ports:
-      - "${FERRITE_TEST_PORT:-6379}:6379"
-      - "${FERRITE_TEST_METRICS_PORT:-9090}:9090"
+      - "127.0.0.1:${FERRITE_TEST_PORT:-6379}:6379"
+      - "127.0.0.1:${FERRITE_TEST_METRICS_PORT:-9090}:9090"
     volumes:
       - ferrite-tester-data:/var/lib/ferrite/data
     environment:

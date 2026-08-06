@@ -51,7 +51,7 @@ test -x scripts/tester.sh && ./scripts/tester.sh --help >/dev/null || {
   echo "scripts/tester.sh is missing or not runnable at <CAMPAIGN_OPS_REF>" >&2
   exit 1
 }
-export FERRITE_TEST_IMAGE='<CAMPAIGN_IMAGE_DIGEST>' # exact tag/digest the campaign owner supplied; never latest
+export FERRITE_TEST_IMAGE='ghcr.io/ferritelabs/ferrite@sha256:<CAMPAIGN_DIGEST>' # complete repository-qualified digest the campaign owner supplied; never latest or a tag
 ./scripts/tester.sh start
 ./scripts/tester.sh smoke
 ./scripts/tester.sh diagnostics
@@ -60,7 +60,11 @@ export FERRITE_TEST_IMAGE='<CAMPAIGN_IMAGE_DIGEST>' # exact tag/digest the campa
 
 `FERRITE_TEST_IMAGE` has no default: `tester.sh` and `docker-compose.tester.yml`
 both fail fast with an actionable error, before any Docker call, if it is
-unset, an implicit/floating `latest` reference, or a malformed tag/digest.
+unset, an implicit/floating `latest` reference, a tag, or not the complete
+repository-qualified sha256 digest form (`repository/path@sha256:<64
+lowercase hex characters>`). `tester.sh` also verifies, before every
+command that talks to the container, that the running container's image
+still matches `FERRITE_TEST_IMAGE` exactly.
 
 Only run `./scripts/tester.sh durability` if the campaign owner has explicitly
 enabled it (`FERRITE_TEST_ENABLE_DURABILITY=1`); it is an optional,

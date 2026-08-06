@@ -39,8 +39,10 @@ Commands:
   reset                    Destructively remove containers and tester volume
 
 Environment:
-  FERRITE_TEST_IMAGE           Exact campaign image tag or digest; required, no
-                               default, never latest
+  FERRITE_TEST_IMAGE           Exact repository-qualified sha256 digest reference
+                               (repository/path@sha256:<64 lowercase hex
+                               characters>); required, no default, never a tag
+                               or latest
   FERRITE_TEST_PORT            Host Redis-compatible port (default: 6379)
   FERRITE_TEST_METRICS_PORT    Host metrics port (default: 9090)
   FERRITE_TEST_READY_TIMEOUT   Health wait in seconds (default: 60)
@@ -63,10 +65,10 @@ validate_uint_range() {
 
 validate_image() {
   local image="${FERRITE_TEST_IMAGE:-}"
-  local lower leaf digest reference name tag segment
+  local lower reference digest segment
 
   [[ -n "$image" ]] ||
-    die "FERRITE_TEST_IMAGE is required; set it to the exact campaign image tag or digest (never latest). There is no default."
+    die "FERRITE_TEST_IMAGE is required; set it to the exact repository-qualified sha256 digest (repository/path@sha256:<64 lowercase hex characters>); never a tag or latest. There is no default."
 
   [[ "$image" != *[[:space:]]* ]] ||
     die "FERRITE_TEST_IMAGE must be one exact image reference"
@@ -75,48 +77,40 @@ validate_image() {
 
   lower="$(printf '%s' "$image" | tr '[:upper:]' '[:lower:]')"
   if [[ "$lower" == "latest" || "$lower" == *":latest" ]]; then
-    die "FERRITE_TEST_IMAGE must never use latest; use the campaign tag or digest"
+    die "FERRITE_TEST_IMAGE must never use latest; use the exact repository-qualified sha256 digest"
   fi
 
-  reference="$image"
-  if [[ "$image" == *"@"* ]]; then
-    [[ "$image" != *@*@* ]] ||
-      die "FERRITE_TEST_IMAGE contains more than one digest separator"
-    reference="${image%@*}"
-    digest="${image##*@}"
-    [[ -n "$reference" ]] ||
-      die "FERRITE_TEST_IMAGE must include a repository name before the digest"
-    [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] ||
-      die "image digests must use the full lowercase sha256:<64 lowercase hex characters> form"
-  fi
+  # Only a digest reference is accepted: a bare tag, an implicit-latest
+  # reference, or a tag alongside a digest are all rejected before any
+  # Docker call.
+  [[ "$image" == *"@"* ]] ||
+    die "FERRITE_TEST_IMAGE must be a repository-qualified sha256 digest reference (repository/path@sha256:<64 lowercase hex characters>); tags are never accepted"
+
+  [[ "$image" != *@*@* ]] ||
+    die "FERRITE_TEST_IMAGE contains more than one digest separator"
+
+  reference="${image%@*}"
+  digest="${image##*@}"
+
+  [[ -n "$reference" ]] ||
+    die "FERRITE_TEST_IMAGE must include a repository name before the digest"
+
+  [[ "$reference" != *:* ]] ||
+    die "FERRITE_TEST_IMAGE must not combine a tag with a digest; use repository/path@sha256:<digest> only"
+
+  [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] ||
+    die "image digests must use the full lowercase sha256:<64 lowercase hex characters> form"
 
   [[ "$reference" != /* && "$reference" != */ && "$reference" != *"//"* ]] ||
     die "FERRITE_TEST_IMAGE contains a malformed repository path"
 
-  leaf="${reference##*/}"
-  name="$reference"
-  if [[ "$leaf" == *":"* ]]; then
-    tag="${leaf##*:}"
-    name="${reference%:*}"
-    [[ "$tag" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$ ]] ||
-      die "FERRITE_TEST_IMAGE contains a malformed image tag"
-  elif [[ "$image" != *"@"* ]]; then
-    die "FERRITE_TEST_IMAGE must include an explicit tag or sha256 digest"
-  fi
-
-  IFS='/' read -r -a image_segments <<<"$name"
-  ((${#image_segments[@]} > 0)) ||
-    die "FERRITE_TEST_IMAGE must include a repository name"
+  IFS='/' read -r -a image_segments <<<"$reference"
+  ((${#image_segments[@]} > 1)) ||
+    die "FERRITE_TEST_IMAGE must include a repository name (e.g. ghcr.io/ferritelabs/ferrite), not a bare image name"
   for segment in "${image_segments[@]}"; do
     [[ "$segment" =~ ^[a-z0-9]+([._-][a-z0-9]+)*(:[0-9]+)?$ ]] ||
       die "FERRITE_TEST_IMAGE contains a malformed repository path"
   done
-
-  if [[ "$image" != *"@"* ]]; then
-    leaf="${image##*/}"
-    [[ "$leaf" == *":"* && -n "${leaf##*:}" ]] ||
-      die "FERRITE_TEST_IMAGE must include an explicit tag or sha256 digest"
-  fi
 }
 
 validate_settings() {
@@ -177,6 +171,25 @@ wait_for_health() {
     fi
     sleep "$FERRITE_TEST_POLL_INTERVAL"
   done
+}
+
+# Confirms the currently running tester container is actually running the
+# requested FERRITE_TEST_IMAGE, not a stale container left over from a prior
+# session with a different image. Called after `start` becomes healthy and
+# again before every command that talks to the container (smoke, durability,
+# diagnostics), before any `compose exec`/CLI call.
+verify_running_image() {
+  local id running_image
+  id="$(container_id)"
+  [[ -n "$id" ]] ||
+    die "No running tester container was found; run './scripts/tester.sh start' first"
+
+  running_image="$(docker inspect --format '{{.Config.Image}}' "$id" 2>/dev/null || true)"
+  [[ -n "$running_image" ]] ||
+    die "Could not determine the running container's image; run './scripts/tester.sh start' first"
+
+  [[ "$running_image" == "$FERRITE_TEST_IMAGE" ]] ||
+    die "Running container image '${running_image}' does not match FERRITE_TEST_IMAGE '${FERRITE_TEST_IMAGE}'; run './scripts/tester.sh stop' then 'start' with the intended image"
 }
 
 cli_json() {
@@ -241,6 +254,7 @@ start_environment() {
   compose pull ferrite
   compose up -d ferrite
   wait_for_health
+  verify_running_image
   echo "Ferrite is available on localhost:${FERRITE_TEST_PORT}; metrics: localhost:${FERRITE_TEST_METRICS_PORT}"
 }
 
@@ -248,6 +262,7 @@ run_smoke() {
   local prefix value ttl zscore
   validate_settings
   require_compose
+  verify_running_image
   prefix="ferrite:tester:smoke:$(date -u +%Y%m%dT%H%M%SZ):$$:${RANDOM}"
   value="value-${RANDOM}-$$"
   CLEANUP_KEYS=(
@@ -292,6 +307,7 @@ run_durability() {
 
   validate_settings
   require_compose
+  verify_running_image
   key="ferrite:tester:durability:$(date -u +%Y%m%dT%H%M%SZ):$$:${RANDOM}"
   value="durable-${RANDOM}-$$"
   CLEANUP_KEYS=("$key")
@@ -324,6 +340,7 @@ collect_diagnostics() {
 
   validate_settings
   require_compose
+  verify_running_image
   command -v tar >/dev/null 2>&1 || die "tar is required to create diagnostics"
 
   # Diagnostics can contain operationally sensitive data (client addresses,
@@ -375,7 +392,7 @@ Submit at: https://github.com/ferritelabs/ferrite/issues/new?template=tester_rep
 
 - Track completed:
 - Highest severity observed:
-- Version and exact image tag or digest: \`${FERRITE_TEST_IMAGE}\`
+- Version and exact image digest: \`${FERRITE_TEST_IMAGE}\`
 - Install method: ferrite-ops tester Docker Compose
 - Environment:
 - Redis client or application:

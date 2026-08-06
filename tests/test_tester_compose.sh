@@ -13,6 +13,8 @@ assert_contains "$CONTENT" "\${FERRITE_TEST_IMAGE:?" "tester image is a required
 assert_not_contains "$CONTENT" "\${FERRITE_TEST_IMAGE:-" "tester image must not silently default to any baseline"
 assert_contains "$CONTENT" "\${FERRITE_TEST_PORT:-6379}" "Redis-compatible host port is configurable"
 assert_contains "$CONTENT" "\${FERRITE_TEST_METRICS_PORT:-9090}" "metrics host port is configurable"
+assert_contains "$CONTENT" "127.0.0.1:\${FERRITE_TEST_PORT:-6379}" "Redis-compatible port is bound to loopback only"
+assert_contains "$CONTENT" "127.0.0.1:\${FERRITE_TEST_METRICS_PORT:-9090}" "metrics port is bound to loopback only"
 assert_contains "$CONTENT" 'ferrite-tester-data:/var/lib/ferrite/data' "tester Compose uses a named data volume"
 assert_contains "$CONTENT" 'test: ["CMD", "ferrite-cli", "PING"]' "healthcheck uses ferrite-cli"
 assert_contains "$CONTENT" "resources:" "tester Compose declares conservative resource defaults"
@@ -48,6 +50,8 @@ if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; 
   assert_contains "$RENDERED" "ghcr.io/ferritelabs/ferrite@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" "render honors the exact image override"
   assert_contains "$RENDERED" "published: \"16379\"" "render honors the Redis-compatible port override"
   assert_contains "$RENDERED" "published: \"19090\"" "render honors the metrics port override"
+  HOST_IP_COUNT="$(printf '%s\n' "$RENDERED" | grep -c 'host_ip: 127.0.0.1')"
+  assert_eq 2 "$HOST_IP_COUNT" "both rendered ports are bound to host_ip 127.0.0.1"
 else
   echo "  skip: Docker Compose unavailable; static Compose validation completed"
 fi
