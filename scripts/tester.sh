@@ -86,8 +86,8 @@ validate_image() {
     digest="${image##*@}"
     [[ -n "$reference" ]] ||
       die "FERRITE_TEST_IMAGE must include a repository name before the digest"
-    [[ "$digest" =~ ^sha256:[0-9a-fA-F]{64}$ ]] ||
-      die "image digests must use the full sha256:<64 hex characters> form"
+    [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] ||
+      die "image digests must use the full lowercase sha256:<64 lowercase hex characters> form"
   fi
 
   [[ "$reference" != /* && "$reference" != */ && "$reference" != *"//"* ]] ||

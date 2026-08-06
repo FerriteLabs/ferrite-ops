@@ -115,8 +115,24 @@ assert_empty_file "$FAKE_LOG" "implicit latest rejection occurs before Docker ca
 OUTPUT="$(run_tester FERRITE_TEST_IMAGE="ghcr.io/ferritelabs/ferrite@sha256:not-a-real-digest" bash "$TESTER" start 2>&1)"
 STATUS=$?
 assert_nonzero "$STATUS" "start rejects a malformed digest"
-assert_contains "$OUTPUT" "sha256:<64 hex characters>" "malformed digest rejection explains the required form"
+assert_contains "$OUTPUT" "lowercase sha256:<64 lowercase hex characters>" "malformed digest rejection explains the required form"
 assert_empty_file "$FAKE_LOG" "malformed digest rejection occurs before Docker calls"
+
+: >"$FAKE_LOG"
+UPPERCASE_DIGEST="ghcr.io/ferritelabs/ferrite@sha256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+OUTPUT="$(run_tester FERRITE_TEST_IMAGE="$UPPERCASE_DIGEST" bash "$TESTER" start 2>&1)"
+STATUS=$?
+assert_nonzero "$STATUS" "start rejects an uppercase-hex digest"
+assert_contains "$OUTPUT" "lowercase sha256" "uppercase digest rejection explains the lowercase-only form"
+assert_empty_file "$FAKE_LOG" "uppercase digest rejection occurs before Docker calls"
+
+: >"$FAKE_LOG"
+MIXED_CASE_DIGEST="ghcr.io/ferritelabs/ferrite@sha256:aAaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+OUTPUT="$(run_tester FERRITE_TEST_IMAGE="$MIXED_CASE_DIGEST" bash "$TESTER" start 2>&1)"
+STATUS=$?
+assert_nonzero "$STATUS" "start rejects a mixed-case digest"
+assert_contains "$OUTPUT" "lowercase sha256" "mixed-case digest rejection explains the lowercase-only form"
+assert_empty_file "$FAKE_LOG" "mixed-case digest rejection occurs before Docker calls"
 
 : >"$FAKE_LOG"
 OUTPUT="$(run_tester FERRITE_TEST_IMAGE="ghcr.io/ferritelabs/ferrite:" bash "$TESTER" start 2>&1)"
