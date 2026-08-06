@@ -265,24 +265,20 @@ assert_not_contains "$ORCHESTRATION_CONTENT" \
 
 # No GitHub expression is allowed inside a run script in these privileged
 # release workflows. Untrusted values enter scripts only through step env.
-if command -v python3 >/dev/null 2>&1 &&
-  python3 -c "import yaml" >/dev/null 2>&1 &&
-  python3 - "$RELEASE_YML" "$RECONCILE_YML" "$VERSION_SYNC_YML" "$ORCHESTRATION_YML" <<'PYEOF'
-import sys
-import yaml
+if ruby -ryaml - "$RELEASE_YML" "$RECONCILE_YML" "$VERSION_SYNC_YML" "$ORCHESTRATION_YML" <<'RUBY'
+ARGV.each do |path|
+  workflow = YAML.safe_load(File.read(path), aliases: true) || {}
+  workflow.fetch("jobs", {}).each do |job_name, job|
+    job.fetch("steps", []).each_with_index do |step, index|
+      script = step["run"]
+      next unless script&.include?("${{")
 
-for path in sys.argv[1:]:
-    with open(path) as workflow_file:
-        workflow = yaml.safe_load(workflow_file)
-    for job_name, job in workflow.get("jobs", {}).items():
-        for index, step in enumerate(job.get("steps", [])):
-            script = step.get("run")
-            if script and "${{" in script:
-                name = step.get("name", f"step {index}")
-                raise SystemExit(
-                    f"{path}: {job_name}/{name} interpolates a GitHub expression in run"
-                )
-PYEOF
+      name = step.fetch("name", "step #{index}")
+      abort "#{path}: #{job_name}/#{name} interpolates a GitHub expression in run"
+    end
+  end
+end
+RUBY
 then
   harness_ok "release workflow run scripts contain no direct GitHub expression interpolation"
 else
@@ -293,45 +289,22 @@ fi
 # `ferrite-release` dispatch core emits (kept alongside `version-sync` only
 # for backward compatibility), and no other release workflow may run a
 # competing job that partially updates chart files.
-if command -v python3 >/dev/null 2>&1 &&
-  python3 -c "import yaml" >/dev/null 2>&1 &&
-  python3 - "$VERSION_SYNC_YML" "$RELEASE_YML" "$ORCHESTRATION_YML" <<'TRIGGERCHECK'
-import sys
-import yaml
+if ruby -ryaml - "$VERSION_SYNC_YML" "$RELEASE_YML" "$ORCHESTRATION_YML" <<'RUBY'
+version_sync_path, release_path, orchestration_path = ARGV
 
-version_sync_path, release_path, orchestration_path = sys.argv[1:]
+version_sync_doc = YAML.safe_load(File.read(version_sync_path), aliases: true) || {}
+triggers = version_sync_doc["on"] || version_sync_doc[true] || {}
+sync_types = triggers.dig("repository_dispatch", "types") || []
+abort "version-sync.yml must trigger on ferrite-release" unless sync_types.include?("ferrite-release")
+abort "version-sync.yml must retain version-sync compatibility" unless sync_types.include?("version-sync")
 
-with open(version_sync_path) as f:
-    version_sync_doc = yaml.safe_load(f)
-sync_types = version_sync_doc.get(True, {}).get("repository_dispatch", {}).get("types", [])
-if "ferrite-release" not in sync_types:
-    raise SystemExit(
-        "version-sync.yml must trigger on the real ferrite-release dispatch event core emits"
-    )
-if "version-sync" not in sync_types:
-    raise SystemExit(
-        "version-sync.yml should keep version-sync as a backward-compatible trigger"
-    )
+release_doc = YAML.safe_load(File.read(release_path), aliases: true) || {}
+abort "release.yml must not define bump-chart" if release_doc.fetch("jobs", {}).key?("bump-chart")
 
-with open(release_path) as f:
-    release_doc = yaml.safe_load(f)
-if "bump-chart" in release_doc.get("jobs", {}):
-    raise SystemExit(
-        "release.yml must not define its own competing chart-only bump job"
-    )
-
-with open(orchestration_path) as f:
-    orchestration_doc = yaml.safe_load(f)
-if "update-ops" in orchestration_doc.get("jobs", {}):
-    raise SystemExit(
-        "release-orchestration.yml must not define a competing ferrite-ops update job"
-    )
-orchestration_text = open(orchestration_path).read()
-if "charts/ferrite" in orchestration_text:
-    raise SystemExit(
-        "release-orchestration.yml must leave chart updates to version-sync.yml"
-    )
-TRIGGERCHECK
+orchestration_doc = YAML.safe_load(File.read(orchestration_path), aliases: true) || {}
+abort "release-orchestration.yml must not define update-ops" if orchestration_doc.fetch("jobs", {}).key?("update-ops")
+abort "release-orchestration.yml must not update charts/ferrite" if File.read(orchestration_path).include?("charts/ferrite")
+RUBY
 then
   harness_ok "version-sync.yml is the sole ferrite-release chart/Dockerfile/pin sync workflow"
 else
