@@ -41,6 +41,9 @@ TEARDOWN_DUMMY_IMAGE="ferrite.invalid/teardown-only@sha256:000000000000000000000
 
 CLEANUP_KEYS=()
 DIAGNOSTICS_TMP=""
+PROJECT_LOCK_DIR=""
+PROJECT_LOCK_OWNER_PID=""
+PROJECT_OWNERSHIP_REVALIDATION_PENDING=0
 
 die() {
   echo "${SCRIPT_NAME}: error: $*" >&2
@@ -155,6 +158,105 @@ validate_settings() {
 validate_project() {
   [[ "$FERRITE_TEST_PROJECT" =~ ^[a-z0-9][a-z0-9_-]*$ ]] ||
     die "FERRITE_TEST_PROJECT must match [a-z0-9][a-z0-9_-]*"
+}
+
+process_is_alive() {
+  local pid="$1" observed_pid
+
+  if kill -0 "$pid" 2>/dev/null; then
+    return 0
+  fi
+
+  # kill -0 can fail for an existing process owned by another user. ps
+  # distinguishes that case from a PID that is no longer present.
+  observed_pid="$(ps -p "$pid" -o pid= 2>/dev/null || true)"
+  observed_pid="${observed_pid//[[:space:]]/}"
+  [[ "$observed_pid" == "$pid" ]]
+}
+
+acquire_project_lock() {
+  local lock_root lock_dir pid_file owner_pid process_id
+
+  validate_project
+  lock_root="${TMPDIR:-/tmp}"
+  [[ -d "$lock_root" && -w "$lock_root" ]] ||
+    die "TMPDIR '${lock_root}' must be an existing writable directory"
+
+  lock_dir="${lock_root%/}/ferrite-tester-${FERRITE_TEST_PROJECT}.lock"
+  [[ -n "${lock_root%/}" ]] ||
+    lock_dir="/ferrite-tester-${FERRITE_TEST_PROJECT}.lock"
+  pid_file="${lock_dir}/pid"
+  process_id="${BASHPID:-$$}"
+
+  while true; do
+    if (umask 077 && mkdir "$lock_dir") 2>/dev/null; then
+      if ! (umask 077 && printf '%s\n' "$process_id" >"$pid_file"); then
+        rmdir "$lock_dir" 2>/dev/null || true
+        die "could not record PID ownership for project lock '${lock_dir}'"
+      fi
+      if ! chmod 700 "$lock_dir" || ! chmod 600 "$pid_file"; then
+        rm -f "$pid_file"
+        rmdir "$lock_dir" 2>/dev/null || true
+        die "could not apply restrictive permissions to project lock '${lock_dir}'"
+      fi
+
+      PROJECT_LOCK_DIR="$lock_dir"
+      PROJECT_LOCK_OWNER_PID="$process_id"
+      return 0
+    fi
+
+    [[ -d "$lock_dir" ]] ||
+      die "could not create project lock '${lock_dir}'"
+
+    owner_pid=""
+    if [[ -f "$pid_file" ]]; then
+      IFS= read -r owner_pid <"$pid_file" || owner_pid=""
+    fi
+    [[ "$owner_pid" =~ ^[1-9][0-9]*$ ]] ||
+      die "project lock '${lock_dir}' has no valid recorded owner PID; refusing stale-lock recovery"
+
+    if process_is_alive "$owner_pid"; then
+      die "Compose project '${FERRITE_TEST_PROJECT}' is locked by active process PID ${owner_pid}; wait for it to finish"
+    fi
+
+    # Removing the PID file is the recovery claim. Only the process that
+    # successfully removes that exact dead-owner record may remove the now
+    # empty lock directory; concurrent recoverers fail closed.
+    if rm "$pid_file" 2>/dev/null; then
+      if ! rmdir "$lock_dir" 2>/dev/null; then
+        (umask 077 && printf '%s\n' "$owner_pid" >"$pid_file") || true
+        die "stale project lock '${lock_dir}' contains unexpected entries; refusing recovery"
+      fi
+      echo "Recovered stale project lock for '${FERRITE_TEST_PROJECT}' from PID ${owner_pid}." >&2
+      continue
+    fi
+
+    [[ ! -e "$lock_dir" ]] ||
+      die "project lock '${lock_dir}' changed during stale-lock recovery; retry the command"
+  done
+}
+
+release_project_lock() {
+  local process_id recorded_pid
+
+  [[ -n "$PROJECT_LOCK_DIR" && -n "$PROJECT_LOCK_OWNER_PID" ]] || return 0
+  process_id="${BASHPID:-$$}"
+  [[ "$process_id" == "$PROJECT_LOCK_OWNER_PID" ]] || return 0
+
+  recorded_pid=""
+  if [[ -f "${PROJECT_LOCK_DIR}/pid" ]]; then
+    IFS= read -r recorded_pid <"${PROJECT_LOCK_DIR}/pid" || recorded_pid=""
+  fi
+  [[ "$recorded_pid" == "$PROJECT_LOCK_OWNER_PID" ]] || return 0
+
+  if rm "${PROJECT_LOCK_DIR}/pid" 2>/dev/null; then
+    if ! rmdir "$PROJECT_LOCK_DIR" 2>/dev/null; then
+      (umask 077 && printf '%s\n' "$PROJECT_LOCK_OWNER_PID" >"${PROJECT_LOCK_DIR}/pid") ||
+        true
+    fi
+  fi
+  PROJECT_LOCK_DIR=""
+  PROJECT_LOCK_OWNER_PID=""
 }
 
 require_compose() {
@@ -298,6 +400,14 @@ verify_project_ownership() {
   verify_named_resource_ownership network "$network_name"
 }
 
+revalidate_project_ownership() {
+  # Leave this set if verification exits through die(). The EXIT cleanup must
+  # not issue a best-effort mutating CLI call after ownership became unsafe.
+  PROJECT_OWNERSHIP_REVALIDATION_PENDING=1
+  verify_project_ownership
+  PROJECT_OWNERSHIP_REVALIDATION_PENDING=0
+}
+
 validate_compose() {
   compose config >/dev/null
 }
@@ -366,6 +476,10 @@ cli_raw() {
 # or mask the script's real exit status (e.g. during an error unwind where
 # the container is already gone), so it swallows DEL errors.
 cleanup_keys_best_effort() {
+  if ((PROJECT_OWNERSHIP_REVALIDATION_PENDING == 1)); then
+    CLEANUP_KEYS=()
+    return 0
+  fi
   if ((${#CLEANUP_KEYS[@]} > 0)); then
     cli_raw DEL "${CLEANUP_KEYS[@]}" >/dev/null 2>&1 || true
     CLEANUP_KEYS=()
@@ -395,6 +509,7 @@ cleanup_on_exit() {
   if [[ -n "$DIAGNOSTICS_TMP" && -d "$DIAGNOSTICS_TMP" ]]; then
     rm -rf "$DIAGNOSTICS_TMP"
   fi
+  release_project_lock
 }
 trap cleanup_on_exit EXIT
 
@@ -416,6 +531,7 @@ start_environment() {
   validate_compose
   echo "Starting ${FERRITE_TEST_PROJECT} with ${FERRITE_TEST_IMAGE}"
   compose pull ferrite
+  revalidate_project_ownership
   compose up -d ferrite
   wait_for_health
   verify_running_image
@@ -427,6 +543,7 @@ run_smoke() {
   local prefix value ttl zscore
   validate_settings
   require_compose
+  verify_project_ownership
   verify_running_image
   prefix="ferrite:tester:smoke:$(date -u +%Y%m%dT%H%M%SZ):$$:${RANDOM}"
   value="value-${RANDOM}-$$"
@@ -472,12 +589,14 @@ run_durability() {
 
   validate_settings
   require_compose
+  verify_project_ownership
   verify_running_image
   key="ferrite:tester:durability:$(date -u +%Y%m%dT%H%M%SZ):$$:${RANDOM}"
   value="durable-${RANDOM}-$$"
   CLEANUP_KEYS=("$key")
 
   expect_json '"OK"' "durability SET" SET "$key" "$value"
+  revalidate_project_ownership
   compose restart ferrite
   wait_for_health
   actual="$(cli_json GET "$key" | tr -d '\r')"
@@ -506,6 +625,7 @@ collect_diagnostics() {
   ops_commit="$(ops_tooling_commit)"
   validate_settings
   require_compose
+  verify_project_ownership
   verify_running_image
   command -v tar >/dev/null 2>&1 || die "tar is required to create diagnostics"
 
@@ -592,7 +712,7 @@ REPORT
 stop_environment() {
   validate_project
   require_compose
-  verify_project_ownership
+  revalidate_project_ownership
   compose_teardown down
   echo "Tester containers removed; the named data volume was preserved."
 }
@@ -608,6 +728,7 @@ reset_environment() {
     read -r reply || die "reset cancelled"
     [[ "$reply" == "RESET" ]] || die "reset cancelled"
   fi
+  revalidate_project_ownership
   compose_teardown down --volumes
   echo "Tester containers and data volume removed."
 }
@@ -617,26 +738,32 @@ main() {
   case "$command" in
     start)
       [[ $# -eq 1 ]] || die "start takes no arguments"
+      acquire_project_lock
       start_environment
       ;;
     smoke)
       [[ $# -eq 1 ]] || die "smoke takes no arguments"
+      acquire_project_lock
       run_smoke
       ;;
     durability)
       [[ $# -eq 1 ]] || die "durability takes no arguments"
+      acquire_project_lock
       run_durability
       ;;
     diagnostics)
       [[ $# -le 2 ]] || die "diagnostics accepts at most one output directory"
+      acquire_project_lock
       collect_diagnostics "${2:-}"
       ;;
     stop)
       [[ $# -eq 1 ]] || die "stop takes no arguments"
+      acquire_project_lock
       stop_environment
       ;;
     reset)
       [[ $# -eq 1 ]] || die "reset takes no arguments"
+      acquire_project_lock
       reset_environment
       ;;
     -h | --help | help)

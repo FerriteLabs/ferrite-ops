@@ -11,6 +11,8 @@ source "${HERE}/lib/host_services.sh"
 TESTER="${REPO_ROOT}/scripts/tester.sh"
 WORK_DIR="$(mktemp -d)"
 trap 'host_services_stop; rm -rf "$WORK_DIR"' EXIT
+TEST_TMPDIR="${WORK_DIR}/tmp"
+mkdir -p "$TEST_TMPDIR"
 
 # `start` verifies host reachability with real loopback servers, so commands
 # that are expected to reach that stage need something actually listening.
@@ -65,6 +67,7 @@ run_tester() {
     PATH="${WORK_DIR}/bin:${PATH}" \
     FAKE_DOCKER_LOG="$FAKE_LOG" \
     FAKE_DOCKER_STATE="$FAKE_STATE" \
+    TMPDIR="$TEST_TMPDIR" \
     FERRITE_TEST_POLL_INTERVAL="0.05" \
     FERRITE_TEST_IMAGE="$FAKE_IMAGE" \
     FERRITE_TEST_PORT="$RESP_PORT" \
@@ -82,6 +85,7 @@ run_tester_no_image() {
     PATH="${WORK_DIR}/bin:${PATH}" \
     FAKE_DOCKER_LOG="$FAKE_LOG" \
     FAKE_DOCKER_STATE="$FAKE_STATE" \
+    TMPDIR="$TEST_TMPDIR" \
     FERRITE_TEST_POLL_INTERVAL="0.05" \
     FERRITE_TEST_PORT="$RESP_PORT" \
     FERRITE_TEST_METRICS_PORT="$METRICS_PORT" \
@@ -117,12 +121,41 @@ assert_empty_file() {
   fi
 }
 
+assert_existing_directory() {
+  local path="$1" description="$2"
+  if [[ -d "$path" ]]; then
+    harness_ok "$description"
+  else
+    harness_fail "$description"
+  fi
+}
+
+assert_missing_path() {
+  local path="$1" description="$2"
+  if [[ ! -e "$path" ]]; then
+    harness_ok "$description"
+  else
+    harness_fail "$description"
+  fi
+}
+
 # Portable file-mode reader: GNU stat (Linux) uses -c '%a', BSD/macOS stat
 # uses -f '%OLp'. Falls back to empty string (assertion will simply fail)
 # rather than erroring out on an unsupported platform.
 portable_mode() {
   local path="$1"
   stat -c '%a' "$path" 2>/dev/null || stat -f '%OLp' "$path" 2>/dev/null || echo ""
+}
+
+PROJECT_LOCK_DIR="${TEST_TMPDIR}/ferrite-tester-ferrite-tester.lock"
+
+make_project_lock() {
+  local owner_pid="$1"
+  rm -rf "$PROJECT_LOCK_DIR"
+  (umask 077 && mkdir "$PROJECT_LOCK_DIR")
+  (umask 077 && printf '%s\n' "$owner_pid" >"${PROJECT_LOCK_DIR}/pid")
+  chmod 700 "$PROJECT_LOCK_DIR"
+  chmod 600 "${PROJECT_LOCK_DIR}/pid"
 }
 
 assert_true "$(bash -n "$TESTER"; echo $?)" "tester.sh has valid Bash syntax"
@@ -226,6 +259,72 @@ assert_nonzero "$STATUS" "start rejects a single-segment (non-repository-qualifi
 assert_contains "$OUTPUT" "not a bare image name" "single-segment rejection asks for a repository-qualified name"
 assert_empty_file "$FAKE_LOG" "single-segment rejection occurs before Docker calls"
 
+# Every operational command rejects an active project lock before validation
+# or Docker access. Help remains available and must not disturb another
+# process's lock.
+ACTIVE_LOCK_PID="${BASHPID:-$$}"
+make_project_lock "$ACTIVE_LOCK_PID"
+for locked_command in start smoke durability diagnostics stop reset; do
+  : >"$FAKE_LOG"
+  if [[ "$locked_command" == "diagnostics" ]]; then
+    OUTPUT="$(run_tester bash "$TESTER" "$locked_command" "${WORK_DIR}/locked-diagnostics" 2>&1)"
+  else
+    OUTPUT="$(run_tester bash "$TESTER" "$locked_command" 2>&1)"
+  fi
+  STATUS=$?
+  assert_nonzero "$STATUS" "${locked_command} rejects an active project lock"
+  assert_contains "$OUTPUT" "locked by active process PID ${ACTIVE_LOCK_PID}" "${locked_command} identifies the active lock owner"
+  assert_empty_file "$FAKE_LOG" "${locked_command} active-lock rejection occurs before Docker calls"
+  assert_eq "$ACTIVE_LOCK_PID" "$(cat "${PROJECT_LOCK_DIR}/pid")" "${locked_command} does not release another process's lock"
+done
+
+: >"$FAKE_LOG"
+OUTPUT="$(run_tester bash "$TESTER" --help 2>&1)"
+STATUS=$?
+assert_eq 0 "$STATUS" "help remains available while the project is locked"
+assert_contains "$OUTPUT" "Usage:" "help prints usage while the project is locked"
+assert_empty_file "$FAKE_LOG" "help does not access Docker"
+assert_eq "$ACTIVE_LOCK_PID" "$(cat "${PROJECT_LOCK_DIR}/pid")" "help does not disturb the active project lock"
+rm -rf "$PROJECT_LOCK_DIR"
+
+# Missing ownership metadata is not evidence that a process is dead, so the
+# lock must fail closed rather than being reclaimed.
+(umask 077 && mkdir "$PROJECT_LOCK_DIR")
+: >"$FAKE_LOG"
+OUTPUT="$(run_tester bash "$TESTER" stop 2>&1)"
+STATUS=$?
+assert_nonzero "$STATUS" "a lock without a recorded PID is not reclaimed"
+assert_contains "$OUTPUT" "refusing stale-lock recovery" "missing lock ownership fails closed"
+assert_empty_file "$FAKE_LOG" "invalid stale-lock metadata is rejected before Docker calls"
+assert_existing_directory "$PROJECT_LOCK_DIR" "an invalid lock is left untouched"
+rm -rf "$PROJECT_LOCK_DIR"
+
+# A lock is stale only when it contains a valid PID that is no longer alive.
+# Recovery is followed by normal command execution, and the recovered lock is
+# released when the command completes.
+make_project_lock 99999999
+: >"$FAKE_LOG"
+OUTPUT="$(run_tester bash "$TESTER" stop 2>&1)"
+STATUS=$?
+assert_eq 0 "$STATUS" "stop recovers a stale project lock"
+assert_contains "$OUTPUT" "Recovered stale project lock" "stale-lock recovery is reported"
+assert_contains "$(cat "$FAKE_LOG")" "--profile tester down" "the command proceeds after stale-lock recovery"
+assert_missing_path "$PROJECT_LOCK_DIR" "the recovered lock is cleaned after success"
+
+# Locks acquired by this process are released on both successful completion
+# and failure paths.
+: >"$FAKE_LOG"
+OUTPUT="$(run_tester bash "$TESTER" start 2>&1)"
+STATUS=$?
+assert_eq 0 "$STATUS" "start succeeds for lock cleanup verification"
+assert_missing_path "$PROJECT_LOCK_DIR" "the project lock is removed after success"
+
+: >"$FAKE_LOG"
+OUTPUT="$(run_tester FERRITE_TEST_IMAGE=invalid bash "$TESTER" start 2>&1)"
+STATUS=$?
+assert_nonzero "$STATUS" "start fails for lock cleanup verification"
+assert_missing_path "$PROJECT_LOCK_DIR" "the project lock is removed after failure"
+
 # Start validates Compose, pulls the exact image, starts only Ferrite, waits,
 # and verifies the running container's image matches FERRITE_TEST_IMAGE.
 : >"$FAKE_LOG"
@@ -278,6 +377,18 @@ CALLS="$(cat "$FAKE_LOG")"
 assert_nonzero "$STATUS" "smoke fails when the running container image does not match FERRITE_TEST_IMAGE"
 assert_contains "$OUTPUT" "does not match FERRITE_TEST_IMAGE" "smoke image-mismatch failure is actionable"
 assert_not_contains "$CALLS" "exec" "image-mismatch failure occurs before any CLI exec"
+
+: >"$FAKE_LOG"
+OUTPUT="$(
+  run_tester \
+    FAKE_PROJECT_CONTAINER_ID=foreign-ferrite-container \
+    FAKE_CONTAINER_OWNERSHIP_LABEL=another-wrapper \
+    bash "$TESTER" smoke 2>&1
+)"
+STATUS=$?
+CALLS="$(cat "$FAKE_LOG")"
+assert_nonzero "$STATUS" "smoke rejects a foreign-owned same-project container"
+assert_not_contains "$CALLS" "exec" "smoke ownership rejection occurs before any CLI exec"
 
 # Smoke covers the requested command families and always cleans temporary keys.
 : >"$FAKE_LOG"
@@ -348,6 +459,19 @@ assert_nonzero "$STATUS" "durability fails when the running container image does
 assert_contains "$OUTPUT" "does not match FERRITE_TEST_IMAGE" "durability image-mismatch failure is actionable"
 assert_not_contains "$CALLS" "exec" "durability image-mismatch failure occurs before any CLI exec"
 
+: >"$FAKE_LOG"
+OUTPUT="$(
+  run_tester \
+    FERRITE_TEST_ENABLE_DURABILITY=1 \
+    FAKE_PROJECT_CONTAINER_ID=foreign-ferrite-container \
+    FAKE_CONTAINER_OWNERSHIP_LABEL=another-wrapper \
+    bash "$TESTER" durability 2>&1
+)"
+STATUS=$?
+CALLS="$(cat "$FAKE_LOG")"
+assert_nonzero "$STATUS" "durability rejects a foreign-owned same-project container"
+assert_not_contains "$CALLS" " SET " "durability ownership rejection occurs before SET"
+
 # Durability restarts the service, waits again, verifies, and removes its key,
 # once explicitly enabled.
 : >"$FAKE_LOG"
@@ -359,6 +483,28 @@ assert_contains "$CALLS" "restart ferrite" "durability restarts Ferrite through 
 assert_contains "$CALLS" " GET " "durability reads the value after restart"
 assert_contains "$CALLS" " DEL " "durability removes its temporary key"
 assert_contains "$OUTPUT" "tester volume was preserved" "durability documents volume preservation"
+
+# Ownership is revalidated after SET and immediately before restart. If that
+# revalidation fails, neither restart nor EXIT-trap DEL may touch the now
+# untrusted project.
+DURABILITY_OWNERSHIP_CHECK="${WORK_DIR}/durability-ownership-check"
+rm -f "$DURABILITY_OWNERSHIP_CHECK"
+: >"$FAKE_LOG"
+OUTPUT="$(
+  run_tester \
+    FERRITE_TEST_ENABLE_DURABILITY=1 \
+    FAKE_PROJECT_CONTAINER_ID=owned-ferrite-container \
+    FAKE_OWNERSHIP_CHECK_FILE="$DURABILITY_OWNERSHIP_CHECK" \
+    FAKE_OWNERSHIP_FAIL_ON_CHECK=2 \
+    bash "$TESTER" durability 2>&1
+)"
+STATUS=$?
+CALLS="$(cat "$FAKE_LOG")"
+assert_nonzero "$STATUS" "durability rejects ownership that changed before restart"
+assert_contains "$CALLS" " SET " "durability reaches the pre-restart revalidation boundary"
+assert_eq 2 "$(cat "$DURABILITY_OWNERSHIP_CHECK")" "durability checks ownership before access and again before restart"
+assert_not_contains "$CALLS" "restart ferrite" "failed restart revalidation prevents Compose restart"
+assert_not_contains "$CALLS" " DEL " "failed restart revalidation prevents mutating EXIT cleanup"
 
 : >"$FAKE_LOG"
 OUTPUT="$(run_tester FERRITE_TEST_ENABLE_DURABILITY=1 FAKE_FAIL_COMMAND=DEL bash "$TESTER" durability 2>&1)"
@@ -413,6 +559,19 @@ CALLS="$(cat "$FAKE_LOG")"
 assert_nonzero "$STATUS" "diagnostics fails when the running container image does not match FERRITE_TEST_IMAGE"
 assert_contains "$OUTPUT" "does not match FERRITE_TEST_IMAGE" "diagnostics image-mismatch failure is actionable"
 assert_not_contains "$CALLS" "exec" "diagnostics image-mismatch failure occurs before any CLI exec"
+
+: >"$FAKE_LOG"
+OUTPUT="$(
+  run_tester \
+    FAKE_PROJECT_CONTAINER_ID=foreign-ferrite-container \
+    FAKE_CONTAINER_OWNERSHIP_LABEL=another-wrapper \
+    bash "$PROVENANCE_TESTER" diagnostics "${WORK_DIR}/diagnostics-foreign-owner" 2>&1
+)"
+STATUS=$?
+CALLS="$(cat "$FAKE_LOG")"
+assert_nonzero "$STATUS" "diagnostics rejects a foreign-owned same-project container"
+assert_not_contains "$CALLS" "logs " "diagnostics ownership rejection occurs before log collection"
+assert_not_contains "$CALLS" "exec" "diagnostics ownership rejection occurs before CLI collection"
 
 # Diagnostics collect only bounded, reviewable operational data, and are
 # written with restrictive, portable file permissions.
@@ -588,6 +747,46 @@ CALLS="$(cat "$FAKE_LOG")"
 assert_nonzero "$STATUS" "start rejects a foreign Compose-project service container"
 assert_not_contains "$CALLS" " pull " "start ownership rejection occurs before pull"
 assert_not_contains "$CALLS" " up " "start ownership rejection occurs before up"
+
+# Start must check again after pull, with no intervening mutating Compose call
+# before up. The fake changes ownership only on the second check.
+START_OWNERSHIP_CHECK="${WORK_DIR}/start-ownership-check"
+rm -f "$START_OWNERSHIP_CHECK"
+: >"$FAKE_LOG"
+OUTPUT="$(
+  run_tester \
+    FAKE_PROJECT_CONTAINER_ID=owned-ferrite-container \
+    FAKE_OWNERSHIP_CHECK_FILE="$START_OWNERSHIP_CHECK" \
+    FAKE_OWNERSHIP_FAIL_ON_CHECK=2 \
+    bash "$TESTER" start 2>&1
+)"
+STATUS=$?
+CALLS="$(cat "$FAKE_LOG")"
+assert_nonzero "$STATUS" "start rejects ownership that changed during image pull"
+assert_contains "$CALLS" " pull ferrite" "start pulls before its final ownership revalidation"
+assert_eq 2 "$(cat "$START_OWNERSHIP_CHECK")" "start performs ownership verification both before and after pull"
+assert_not_contains "$CALLS" " up -d ferrite" "failed post-pull revalidation prevents Compose up"
+
+# Reset checks before prompting and again after the confirmation. The fake
+# changes the ownership label between those checks, simulating another
+# process taking over while the operator is reading the warning.
+RESET_OWNERSHIP_CHECK="${WORK_DIR}/reset-ownership-check"
+rm -f "$RESET_OWNERSHIP_CHECK"
+: >"$FAKE_LOG"
+OUTPUT="$(
+  printf 'RESET\n' |
+    run_tester_no_image \
+      FAKE_PROJECT_CONTAINER_ID=owned-ferrite-container \
+      FAKE_OWNERSHIP_CHECK_FILE="$RESET_OWNERSHIP_CHECK" \
+      FAKE_OWNERSHIP_FAIL_ON_CHECK=2 \
+      bash "$TESTER" reset 2>&1
+)"
+STATUS=$?
+CALLS="$(cat "$FAKE_LOG")"
+assert_nonzero "$STATUS" "reset rejects ownership that changes during confirmation"
+assert_contains "$OUTPUT" "Type RESET to continue" "reset performs its first ownership check before prompting"
+assert_eq 2 "$(cat "$RESET_OWNERSHIP_CHECK")" "reset revalidates ownership after confirmation"
+assert_not_contains "$CALLS" "down --volumes" "failed post-confirmation revalidation prevents destructive down"
 
 : >"$FAKE_LOG"
 OUTPUT="$(

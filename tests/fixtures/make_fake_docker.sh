@@ -23,6 +23,14 @@ if [[ "${1:-}" == "--version" ]]; then
 fi
 
 if [[ "${1:-}" == "container" && "${2:-}" == "ls" ]]; then
+  if [[ -n "${FAKE_OWNERSHIP_CHECK_FILE:-}" ]]; then
+    ownership_check=0
+    if [[ -f "$FAKE_OWNERSHIP_CHECK_FILE" ]]; then
+      ownership_check="$(cat "$FAKE_OWNERSHIP_CHECK_FILE")"
+    fi
+    ownership_check=$((ownership_check + 1))
+    printf '%s\n' "$ownership_check" >"$FAKE_OWNERSHIP_CHECK_FILE"
+  fi
   if [[ -n "${FAKE_PROJECT_CONTAINER_ID:-}" ]]; then
     echo "$FAKE_PROJECT_CONTAINER_ID"
   fi
@@ -30,7 +38,14 @@ if [[ "${1:-}" == "container" && "${2:-}" == "ls" ]]; then
 fi
 
 if [[ "${1:-}" == "container" && "${2:-}" == "inspect" ]]; then
-  echo "${FAKE_CONTAINER_OWNERSHIP_LABEL:-tester.sh}"
+  ownership_label="${FAKE_CONTAINER_OWNERSHIP_LABEL:-tester.sh}"
+  if [[ -n "${FAKE_OWNERSHIP_FAIL_ON_CHECK:-}" &&
+        -n "${FAKE_OWNERSHIP_CHECK_FILE:-}" &&
+        -f "$FAKE_OWNERSHIP_CHECK_FILE" &&
+        "$(cat "$FAKE_OWNERSHIP_CHECK_FILE")" == "$FAKE_OWNERSHIP_FAIL_ON_CHECK" ]]; then
+    ownership_label="${FAKE_CHANGED_OWNERSHIP_LABEL:-another-wrapper}"
+  fi
+  echo "$ownership_label"
   exit 0
 fi
 
