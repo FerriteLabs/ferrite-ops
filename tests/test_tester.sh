@@ -126,6 +126,7 @@ portable_mode() {
 }
 
 assert_true "$(bash -n "$TESTER"; echo $?)" "tester.sh has valid Bash syntax"
+assert_contains "$(cat "$TESTER")" '"$FERRITE_TEST_PYTHON" -I "$HOST_PROBE"' "host probe uses Python isolated mode"
 
 # --- FERRITE_TEST_IMAGE validation happens before Docker is called, for
 # every failure mode: missing, tags (including latest), bare digests,
@@ -173,6 +174,13 @@ STATUS=$?
 assert_nonzero "$STATUS" "start rejects a tag combined with a digest"
 assert_contains "$OUTPUT" "must not combine a tag with a digest" "tag+digest rejection is actionable"
 assert_empty_file "$FAKE_LOG" "tag+digest rejection occurs before Docker calls"
+
+: >"$FAKE_LOG"
+REGISTRY_PORT_IMAGE="localhost:5000/team/ferrite@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+OUTPUT="$(run_tester FERRITE_TEST_IMAGE="$REGISTRY_PORT_IMAGE" FAKE_RUNNING_IMAGE="$REGISTRY_PORT_IMAGE" bash "$TESTER" start 2>&1)"
+STATUS=$?
+assert_eq 0 "$STATUS" "start accepts a digest reference whose registry includes a port"
+assert_contains "$(cat "$FAKE_LOG")" "up -d ferrite" "registry-port digest reaches Compose"
 
 : >"$FAKE_LOG"
 OUTPUT="$(run_tester FERRITE_TEST_IMAGE="ghcr.io/ferritelabs/ferrite@sha256:not-a-real-digest" bash "$TESTER" start 2>&1)"
@@ -445,6 +453,17 @@ assert_contains "$REPORT_TEXT" "ferrite-ops tooling commit (CAMPAIGN_OPS_COMMIT)
 
 assert_contains "$REPORT_TEXT" "template=tester_report.yml" "report template links the exact tester report form"
 assert_contains "$REPORT_TEXT" "excludes environment variables, secrets, full" "report describes intentional exclusions"
+
+cat >"${PROVENANCE_ROOT}/scripts/argparse.py" <<'PY'
+raise SystemExit(0)
+PY
+: >"$FAKE_LOG"
+OUTPUT="$(run_tester bash "$PROVENANCE_TESTER" diagnostics "${WORK_DIR}/diagnostics-shadowed" 2>&1)"
+STATUS=$?
+assert_nonzero "$STATUS" "diagnostics rejects untracked files under tester tooling paths"
+assert_contains "$OUTPUT" "untracked or modified files" "untracked-tooling failure explains the provenance risk"
+assert_empty_file "$FAKE_LOG" "untracked-tooling rejection occurs before Docker diagnostics"
+rm -f "${PROVENANCE_ROOT}/scripts/argparse.py"
 
 # Tracked unstaged and staged modifications both invalidate provenance, and
 # each rejection must happen before any Docker diagnostic operation.

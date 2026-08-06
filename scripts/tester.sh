@@ -119,9 +119,6 @@ validate_image() {
   [[ -n "$reference" ]] ||
     die "FERRITE_TEST_IMAGE must include a repository name before the digest"
 
-  [[ "$reference" != *:* ]] ||
-    die "FERRITE_TEST_IMAGE must not combine a tag with a digest; use repository/path@sha256:<digest> only"
-
   [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] ||
     die "image digests must use the full lowercase sha256:<64 lowercase hex characters> form"
 
@@ -131,9 +128,15 @@ validate_image() {
   IFS='/' read -r -a image_segments <<<"$reference"
   ((${#image_segments[@]} > 1)) ||
     die "FERRITE_TEST_IMAGE must include a repository name (e.g. ghcr.io/ferritelabs/ferrite), not a bare image name"
-  for segment in "${image_segments[@]}"; do
-    [[ "$segment" =~ ^[a-z0-9]+([._-][a-z0-9]+)*(:[0-9]+)?$ ]] ||
-      die "FERRITE_TEST_IMAGE contains a malformed repository path"
+  for index in "${!image_segments[@]}"; do
+    segment="${image_segments[$index]}"
+    if ((index == 0)); then
+      [[ "$segment" =~ ^[a-z0-9]+([._-][a-z0-9]+)*(:[0-9]+)?$ ]] ||
+        die "FERRITE_TEST_IMAGE contains a malformed registry host"
+    else
+      [[ "$segment" =~ ^[a-z0-9]+([._-][a-z0-9]+)*$ ]] ||
+        die "FERRITE_TEST_IMAGE must not combine a tag with a digest; use repository/path@sha256:<digest> only"
+    fi
   done
 }
 
@@ -176,7 +179,7 @@ verify_host_reachability() {
   [[ -f "$HOST_PROBE" ]] ||
     die "host reachability probe is missing at ${HOST_PROBE}; the checkout is incomplete, re-clone ferrite-ops at the campaign commit"
 
-  "$FERRITE_TEST_PYTHON" "$HOST_PROBE" \
+  "$FERRITE_TEST_PYTHON" -I "$HOST_PROBE" \
     --host 127.0.0.1 \
     --port "$FERRITE_TEST_PORT" \
     --metrics-port "$FERRITE_TEST_METRICS_PORT" \
@@ -187,10 +190,10 @@ verify_host_reachability() {
 
 # The exact ferrite-ops commit this tooling is running from. Diagnostics are
 # provenance records, so attribution is accepted only from a detached, clean
-# Git worktree. Untracked files are intentionally ignored because they cannot
-# alter the committed tooling being attributed.
+# Git worktree. Untracked files under the tester tooling paths are included:
+# Python imports and Compose/script behavior can be changed by such files.
 ops_tooling_commit() {
-  local commit worktree_status
+  local commit worktree_status tooling_status
   command -v git >/dev/null 2>&1 ||
     die "git is required so diagnostics can record the exact ferrite-ops tooling commit; install git and rerun"
 
@@ -208,7 +211,12 @@ ops_tooling_commit() {
   worktree_status="$(git -C "$REPO_ROOT" status --porcelain --untracked-files=no 2>/dev/null)" ||
     die "could not verify that the ferrite-ops tooling checkout is clean"
   [[ -z "$worktree_status" ]] ||
-    die "ferrite-ops tooling has tracked staged or unstaged modifications; restore the checkout before diagnostics (untracked files are ignored)"
+    die "ferrite-ops tooling has tracked staged or unstaged modifications; restore the checkout before diagnostics"
+
+  tooling_status="$(git -C "$REPO_ROOT" status --porcelain --untracked-files=all -- scripts docker-compose.tester.yml 2>/dev/null)" ||
+    die "could not verify the ferrite-ops tester tooling paths"
+  [[ -z "$tooling_status" ]] ||
+    die "ferrite-ops tester tooling paths contain untracked or modified files; restore the campaign checkout before diagnostics"
 
   printf '%s\n' "$commit"
 }
