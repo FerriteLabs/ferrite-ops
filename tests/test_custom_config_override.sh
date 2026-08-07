@@ -95,6 +95,7 @@ fi
 # docker/docker-compose.custom-config.yml (never the public
 # ferrite.example.toml — see AUDIT.md F-17/F-45). ------------------------
 mkdir -p "${WORKDIR}/ferrite-config"
+chmod 0777 "${WORKDIR}/ferrite-config"
 if docker run --rm --entrypoint ferrite \
   -v "${WORKDIR}/ferrite-config:/etc/ferrite" \
   "$IMAGE_TAG" \

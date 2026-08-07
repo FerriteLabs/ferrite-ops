@@ -137,12 +137,14 @@ assert_contains "$AUDIT_CONTENT" "never uses \`--force-with-lease\`" \
   "AUDIT.md records removal of the misleading unchanged-main lease"
 assert_contains "$AUDIT_CONTENT" "refs/tags/<tag>:refs/tags/<tag>" \
   "AUDIT.md records the non-force tag-only ops push"
-assert_contains "$GITLEAKS_CONTENT" 'Authorization:\s+Bearer\s+YOUR_API_KEY' \
-  "gitleaks narrowly allowlists the historical documentation placeholder"
-assert_contains "$GRAFANA_README_CONTENT" 'Authorization: Bearer ${GRAFANA_API_TOKEN}' \
-  "Grafana import documentation reads its API token from the environment"
-assert_not_contains "$GRAFANA_README_CONTENT" "Authorization: Bearer YOUR_API_KEY" \
-  "Grafana import documentation no longer contains the secret-like placeholder"
+assert_contains "$GITLEAKS_CONTENT" 'c1ddd4359dea2849716cbfc113802643edcb0a0f' \
+  "gitleaks narrowly allowlists the historical documentation placeholder commit"
+assert_contains "$GRAFANA_README_CONTENT" 'GRAFANA_SERVICE_ACCOUNT_TOKEN="<grafana-service-account-token>"' \
+  "Grafana import documentation names the service-account token environment variable"
+assert_contains "$GRAFANA_README_CONTENT" '--oauth2-bearer "$GRAFANA_SERVICE_ACCOUNT_TOKEN"' \
+  "Grafana import documentation passes its API token without an inline authorization header"
+assert_not_contains "$GRAFANA_README_CONTENT" 'Authorization:' \
+  "Grafana import documentation no longer contains a secret-like authorization header"
 assert_contains "$AUDIT_CONTENT" "D-02 is the only deferred item." \
   "AUDIT.md still leaves only D-02 deferred after this change"
 

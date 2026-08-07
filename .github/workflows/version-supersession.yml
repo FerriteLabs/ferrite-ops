@@ -73,6 +73,11 @@ jobs:
 
           BASE_REF="${BASE_REF#refs/heads/}"
 
+          if [ ! -f trusted/active-release.env ]; then
+            echo "::notice::${BASE_REF} does not yet define active-release.env; allowing its initial introduction."
+            exit 0
+          fi
+
           if [ ! -x "$ORDER_SCRIPT" ] && [ ! -f "$ORDER_SCRIPT" ]; then
             echo "::error::Trusted ordering script not found at ${ORDER_SCRIPT}"
             exit 1

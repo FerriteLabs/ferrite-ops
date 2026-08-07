@@ -51,6 +51,8 @@ assert_contains "$CONTENT" "candidate/active-release.env" \
   "the candidate's active-release.env is read as data, from its own directory"
 assert_contains "$CONTENT" "Checkout candidate (untrusted, data only)" \
   "the candidate checkout step is explicitly documented as data-only"
+assert_contains "$CONTENT" "does not yet define active-release.env" \
+  "the initial active-release bootstrap is allowed without executing candidate code"
 
 # Scope-check: the supersession job's own YAML text must never reference the
 # ordering script from the untrusted checkout root (only trusted/scripts/...).
@@ -143,6 +145,22 @@ run_supersession() {
   rm -rf "$work"
   return $rc
 }
+
+# The first PR that introduces active-release.env has no canonical base value
+# or trusted ordering script yet. It must pass without executing candidate code.
+BOOTSTRAP_WORK="${TMP}/bootstrap-case"
+mkdir -p "${BOOTSTRAP_WORK}/candidate" "${BOOTSTRAP_WORK}/trusted"
+write_env "0.4.0" "$ONES" "${BOOTSTRAP_WORK}/candidate"
+if (
+  cd "$BOOTSTRAP_WORK" &&
+    BASE_REF="main" ORDER_SCRIPT="trusted/scripts/release-ordering.sh" \
+    bash "$CHECK_SCRIPT" >"${TMP}/bootstrap.out" 2>&1
+); then
+  assert_contains "$(cat "${TMP}/bootstrap.out")" "allowing its initial introduction" \
+    "the first active-release.env introduction passes without a trusted base script"
+else
+  harness_fail "initial active-release.env introduction unexpectedly failed: $(cat "${TMP}/bootstrap.out")"
+fi
 
 # A genuinely newer PR (0.4.3) over current main (0.4.2): passes.
 if run_supersession "0.4.3" "$ONES" "0.4.2" "$ONES" "${TMP}/newer.out"; then

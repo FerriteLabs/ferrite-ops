@@ -48,7 +48,6 @@ git -C "$PROVENANCE_ROOT" config user.email "ferrite-ops-tests@example.invalid"
 git -C "$PROVENANCE_ROOT" add scripts docker-compose.tester.yml
 git -C "$PROVENANCE_ROOT" commit -qm "test fixture"
 PROVENANCE_COMMIT="$(git -C "$PROVENANCE_ROOT" rev-parse HEAD)"
-git -C "$PROVENANCE_ROOT" checkout --detach -q "$PROVENANCE_COMMIT"
 PROVENANCE_TESTER="${PROVENANCE_ROOT}/scripts/tester.sh"
 
 SHORT_SHA_BIN="${WORK_DIR}/short-sha-bin"
@@ -648,14 +647,15 @@ assert_nonzero "$STATUS" "durability fails when DEL reports the wrong key count"
 assert_contains "$OUTPUT" "expected DEL to remove 1 temporary key(s), got 0" "durability wrong-count cleanup failure names expected and actual counts"
 
 # Provenance is verified before Docker availability, container inspection, or
-# any other diagnostic collection. The main source checkout is intentionally
-# attached to the development branch, so diagnostics must reject it.
+# any other diagnostic collection. Use the fixture's attached branch so this
+# assertion is independent of how the outer checkout was created.
 : >"$FAKE_LOG"
-OUTPUT="$(run_tester bash "$TESTER" diagnostics "${WORK_DIR}/diagnostics-attached" 2>&1)"
+OUTPUT="$(run_tester bash "$PROVENANCE_TESTER" diagnostics "${WORK_DIR}/diagnostics-attached" 2>&1)"
 STATUS=$?
 assert_nonzero "$STATUS" "diagnostics rejects an attached Git checkout"
 assert_contains "$OUTPUT" "requires detached HEAD" "attached-checkout failure explains the required state"
 assert_empty_file "$FAKE_LOG" "attached-checkout rejection occurs before Docker diagnostics"
+git -C "$PROVENANCE_ROOT" checkout --detach -q "$PROVENANCE_COMMIT"
 
 : >"$FAKE_LOG"
 OUTPUT="$(
