@@ -24,7 +24,7 @@
 #     --build-arg FERRITE_SOURCE_SHA256=<sha256 of that version's tarball> .
 
 ARG FERRITE_VERSION=0.4.0
-FROM rust:1.94-slim-bookworm AS chef
+FROM rust:1.97-slim-bookworm AS chef
 
 # Install cargo-chef for caching dependencies, plus curl/ca-certificates to
 # fetch the Ferrite source tarball (tar ships with the base image already).
