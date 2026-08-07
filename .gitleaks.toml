@@ -1,11 +1,8 @@
 [extend]
 useDefault = true
 
-[[allowlists]]
-description = "Grafana authorization-header documentation placeholder"
+[allowlist]
+description = "Grafana documentation placeholders"
+commits = ["c1ddd4359dea2849716cbfc113802643edcb0a0f"]
 regexTarget = "match"
 regexes = ['''Authorization:\s+Bearer\s+YOUR_API_KEY''']
-
-[[allowlists]]
-description = "Historical Grafana documentation placeholder"
-commits = ["c1ddd4359dea2849716cbfc113802643edcb0a0f"]
