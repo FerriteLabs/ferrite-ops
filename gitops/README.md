@@ -60,8 +60,10 @@ kubectl apply -f flux/overlays/production.yaml
 Key differences in production:
 - Git source pinned to an immutable `ferrite-ops-v*` release tag
 - Longer reconciliation interval (30m vs 10m)
-- Rollback remediation strategy on upgrade failure
+- Flux controller rollback remediation for a failed Helm upgrade
 - Pod Disruption Budget enabled
+
+The Flux remediation above is limited to restoring the last healthy Helm release after an upgrade failure. It does not move `active-release.env` backwards or replace immutable image/ops tags. General Ferrite release downgrade is not supported by this repository; publish a strictly newer corrective release and let the canonical version-sync flow roll forward.
 
 ## Kustomize
 

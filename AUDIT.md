@@ -518,10 +518,7 @@ entirely:
   (`workflow_dispatch`) sync runs now handle an `OLDER` classification identically: skip, with no
   override of any kind. A stray `ALLOW_DOWNGRADE=true` left in a step's environment has no effect, since
   the variable is no longer read anywhere.
-- A real rollback is an intentional, human-operated decision with implications far beyond a version
-  bump (registry tags, GitOps revisions, RPM `Release` bumps, downstream SDK/IDE updates, ...), so it is
-  deliberately out of scope for this workflow. Rollbacks are deferred to a future, separate,
-  explicitly human-driven process rather than a workflow input.
+- General release rollback/downgrade is not implemented by this repository. Exact image tags and `ferrite-ops-v*` tags are immutable, while canonical release pins move monotonically. Recovery from a defective release is a strictly newer corrective release followed by the existing version-sync roll-forward. Flux's controller-local failed-upgrade rollback may restore the previous healthy Helm release state, but it does not rewrite canonical Ferrite metadata or immutable tags. `scripts/rollback-atomic.sh` is only a historical developer-workspace reset helper, not a release/deployment rollback mechanism.
 - `tests/test_version_sync_ordering.sh` (22 checks) asserts `allow_downgrade`/`ALLOW_DOWNGRADE` are
   absent from both the workflow source and the extracted guard step, and functionally replays that an
   older candidate is always skipped — including when a stray `ALLOW_DOWNGRADE=true` is present in the

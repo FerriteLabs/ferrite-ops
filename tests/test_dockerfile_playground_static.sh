@@ -91,6 +91,8 @@ assert_contains "$CONTENT" 'let mut fields = vec!' "v0.4.0 Linux eBPF fields rem
 #    matches at runtime.
 BUILDER_STAGE_FROM="$(grep -E '^FROM .* AS base$' "$DOCKERFILE" | head -1)"
 RUNTIME_STAGE_FROM="$(grep -E '^FROM .* AS runtime$' "$DOCKERFILE" | head -1)"
+assert_eq "FROM rust:1.98-slim-bookworm AS base" "$BUILDER_STAGE_FROM" \
+  "playground builder uses the merged Rust 1.98 Debian Bookworm image"
 assert_contains "$BUILDER_STAGE_FROM" "bookworm" "builder base stage is Debian bookworm (glibc)"
 assert_contains "$RUNTIME_STAGE_FROM" "bookworm" "runtime stage is Debian bookworm (glibc), matching the builder's ABI"
 assert_not_contains "$CONTENT" "FROM alpine" "no build stage uses an Alpine (musl) base image"

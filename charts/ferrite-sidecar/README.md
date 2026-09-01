@@ -384,4 +384,4 @@ kubectl label namespace my-app ferrite.dev/inject=enabled
 
 ## Documentation
 
-See the full documentation at [ferrite.dev/docs/deployment/kubernetes-sidecar](https://ferrite.dev/docs/deployment/kubernetes-sidecar).
+See this chart's maintained documentation in the [Ferrite sidecar chart README](https://github.com/ferritelabs/ferrite-ops/blob/main/charts/ferrite-sidecar/README.md).

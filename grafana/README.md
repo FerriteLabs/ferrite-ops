@@ -160,6 +160,6 @@ To update the dashboard:
 
 ## More Information
 
-- [Ferrite Documentation](https://ferrite.dev/docs)
-- [Monitoring Guide](https://ferrite.dev/docs/operations/monitoring)
-- [Observability Guide](https://ferrite.dev/docs/operations/observability)
+- [Ferrite Documentation](https://github.com/ferritelabs/ferrite-docs)
+- [Grafana Monitoring Guide](https://github.com/ferritelabs/ferrite-ops/blob/main/grafana/README.md)
+- [Ferrite Source Repository](https://github.com/ferritelabs/ferrite)

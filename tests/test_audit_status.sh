@@ -65,8 +65,14 @@ assert_contains "$AUDIT_CONTENT" "## Downgrade Override Removal Resolution" \
   "AUDIT.md records the allow_downgrade removal resolution"
 assert_contains "$AUDIT_CONTENT" "it was fully removed in a later" \
   "AUDIT.md's historical ordering section notes the override was later fully removed"
-assert_contains "$AUDIT_CONTENT" "explicitly human-driven process" \
-  "AUDIT.md records that rollbacks are deferred to a future human-driven process"
+assert_contains "$AUDIT_CONTENT" "General release rollback/downgrade is not implemented" \
+  "AUDIT.md records that general release rollback is unsupported"
+assert_contains "$AUDIT_CONTENT" "roll-forward" \
+  "AUDIT.md records the supported roll-forward recovery path"
+assert_contains "$AUDIT_CONTENT" "controller-local failed-upgrade rollback" \
+  "AUDIT.md distinguishes Flux remediation from release rollback"
+assert_contains "$AUDIT_CONTENT" "historical developer-workspace reset helper" \
+  "AUDIT.md does not present rollback-atomic.sh as a release rollback command"
 assert_contains "$AUDIT_CONTENT" "scripts/release-ordering.sh" \
   "AUDIT.md records the shared SemVer ordering guard"
 assert_contains "$AUDIT_CONTENT" "suppresses \`pull_request\` events" \

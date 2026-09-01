@@ -32,8 +32,12 @@ assert_contains "$CONTENT" "id: guard" \
   "version-sync.yml defines the ordering guard step"
 assert_eq "3" "$(grep -c "if: steps.guard.outputs.proceed == 'true'" "$VERSION_SYNC_YML")" \
   "the sync, RPM, and PR steps are all gated on the guard proceeding"
-assert_contains "$CONTENT" "rollbacks are a separate, explicitly human-driven process" \
-  "version-sync.yml documents that rollbacks are deferred to a future human process"
+assert_contains "$CONTENT" "release rollback/downgrade is not implemented" \
+  "version-sync.yml documents that general release rollback is unsupported"
+assert_contains "$CONTENT" "strictly newer" \
+  "version-sync.yml documents the supported roll-forward recovery path"
+assert_contains "$CONTENT" "controller-local Helm rollback" \
+  "version-sync.yml distinguishes Flux failed-upgrade remediation from release rollback"
 assert_contains "$CONTENT" "There is no override, manual or" \
   "version-sync.yml documents that the OLDER skip has no override of any kind"
 
@@ -121,8 +125,10 @@ if run_guard "0.3.9" "$ONES" "${TMP}/older.out"; then
     "an older candidate always skips the downgrade, with no override available"
   assert_contains "$(cat "${TMP}/older.out.log")" "skipping downgrade" \
     "an older candidate reports the skipped downgrade"
-  assert_contains "$(cat "${TMP}/older.out.log")" "never applied automatically or via manual override" \
-    "the skip message makes clear there is no override of any kind"
+  assert_contains "$(cat "${TMP}/older.out.log")" "Release downgrade is unsupported" \
+    "the skip message makes clear that release downgrade is unsupported"
+  assert_contains "$(cat "${TMP}/older.out.log")" "roll forward" \
+    "the skip message directs operators to the supported recovery model"
 else
   harness_fail "older candidate unexpectedly errored: $(cat "${TMP}/older.out.log")"
 fi

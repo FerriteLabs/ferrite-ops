@@ -90,10 +90,14 @@ assert_contains "$CONTENT" "EXPOSE 9090" "Dockerfile still exposes the metrics p
 assert_contains "$CONTENT" 'ENTRYPOINT ["/usr/local/bin/ferrite"]' "Dockerfile entrypoint is unchanged"
 
 # 8. Runtime stage must use a glibc-based (Debian) image, not Alpine
-#    (musl), to match the glibc ABI of the `rust:1.95-slim-bookworm`
+#    (musl), to match the glibc ABI of the `rust:1.98-slim-bookworm`
 #    builder stage. Building with a Debian/glibc toolchain and then running
 #    under an Alpine/musl runtime is an ABI mismatch that risks a missing
 #    dynamic linker/library failure at container startup.
+assert_contains "$CONTENT" "FROM rust:1.98-slim-bookworm AS chef" \
+  "builder uses the audited Rust 1.98 Debian Bookworm image"
+assert_contains "$CONTENT" 'ABI matches the `rust:1.98-slim-bookworm` builder stage above' \
+  "ABI pairing comment names the actual Rust 1.98 builder"
 RUNTIME_STAGE_FROM="$(grep -E '^FROM .* AS runtime$' "$DOCKERFILE" | head -1)"
 assert_contains "$RUNTIME_STAGE_FROM" "debian" "runtime stage is based on a Debian (glibc) image"
 assert_not_contains "$CONTENT" "FROM alpine" "no build stage uses an Alpine (musl) base image"

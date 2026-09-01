@@ -10,17 +10,11 @@ A Helm chart for deploying Ferrite - a high-performance, tiered-storage key-valu
 
 ## Installation
 
-### Add the Helm repository
+### Install from a GitHub checkout
 
 ```bash
-helm repo add ferrite https://charts.ferrite.dev
-helm repo update
-```
-
-### Install the chart
-
-```bash
-helm install my-ferrite ferrite/ferrite
+git clone https://github.com/ferritelabs/ferrite-ops.git
+helm install my-ferrite ./ferrite-ops/charts/ferrite
 ```
 
 ### Install from local chart

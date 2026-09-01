@@ -310,6 +310,16 @@ This workflow intentionally has no `workflow_dispatch` trigger. GitHub resolves
 `repository_dispatch` workflows from the default branch, and the job validates
 the event, ref, and workflow definition before any registry login or write.
 
+### Release recovery
+
+Ferrite release recovery is **roll-forward only** in this repository. Exact container tags and `ferrite-ops-v*` source tags are immutable, and `active-release.env` cannot be synchronized to an equal or older version. If a published release is defective, publish a strictly newer corrective Ferrite release and allow `version-sync.yml` to advance every active deployment and packaging pin.
+
+Flux's configured `rollback` remediation applies only when a Helm upgrade fails; it can restore the last healthy Helm release state, but it does not downgrade canonical Ferrite metadata or rewrite immutable tags. `scripts/rollback-atomic.sh` is a historical developer-workspace reset helper, not a supported release or deployment rollback command.
+
+### Public promotion blocker
+
+Public promotion remains blocked until the hosted documentation endpoint and the required Debian Maintainer mailbox currently declared in package metadata are configured and verified. Chart maintainer email fields are omitted until a verified mailbox exists. GitHub repository links are the supported public fallback until then; do not advertise commercial support, email-based security intake, or hosted chart/package endpoints on unverified domains.
+
 ```bash
 # Verify after release:
 docker pull ferritelabs/ferrite:latest

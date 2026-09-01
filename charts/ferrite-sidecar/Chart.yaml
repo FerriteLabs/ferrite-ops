@@ -10,14 +10,13 @@ appVersion: "0.4.0"
 
 kubeVersion: ">=1.23.0-0"
 
-home: https://ferrite.dev
+home: https://github.com/ferritelabs/ferrite
 
 sources:
   - https://github.com/ferritelabs/ferrite
 
 maintainers:
   - name: Jose David Baena
-    email: maintainers@ferrite.dev
 
 keywords:
   - redis
@@ -45,6 +44,6 @@ annotations:
   artifacthub.io/containsSecurityUpdates: "false"
   artifacthub.io/links: |
     - name: Documentation
-      url: https://ferrite.dev/docs/deployment/kubernetes-sidecar
+      url: https://github.com/ferritelabs/ferrite-ops/blob/main/charts/ferrite-sidecar/README.md
     - name: GitHub
       url: https://github.com/ferritelabs/ferrite

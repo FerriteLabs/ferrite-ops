@@ -86,6 +86,10 @@ assert_not_contains "$CONTENT" 'BUILDPLATFORM=linux/amd64' "Dockerfile.moonshot 
 # 7. ABI compatibility: runtime stage must be glibc-based (Debian), not
 #    Alpine (musl), matching the glibc builder — same F-12-style fix as
 #    the primary Dockerfile.
+assert_contains "$CONTENT" "FROM rust:1.98-slim-bookworm AS chef" \
+  "builder uses the audited Rust 1.98 Debian Bookworm image"
+assert_contains "$CONTENT" 'ABI matches the `rust:1.98-slim-bookworm` builder stage above' \
+  "ABI pairing comment names the actual Rust 1.98 builder"
 RUNTIME_STAGE_FROM="$(grep -E '^FROM .* AS runtime$' "$DOCKERFILE" | head -1)"
 assert_contains "$RUNTIME_STAGE_FROM" "debian" "runtime stage is based on a Debian (glibc) image"
 assert_not_contains "$CONTENT" "FROM alpine" "no build stage uses an Alpine (musl) base image"

@@ -56,6 +56,9 @@ assert_contains "$(cat "$QUICKSTART")" \
 assert_contains "$(cat "$DEFAULT_COMPOSE")" \
   "image: ferrite:\${FERRITE_VERSION:-${EXPECTED_VERSION}}" \
   "default Compose uses the active release instead of a floating latest tag"
+assert_not_contains "$(cat "$DEFAULT_COMPOSE")" \
+  "RUST_VERSION:" \
+  "default Compose does not advertise an unused Rust builder argument"
 assert_eq "2" \
   "$(grep -F -c "FERRITE_VERSION:-${EXPECTED_VERSION}" "$MOONSHOT_COMPOSE")" \
   "Moonshot Compose pins both build defaults to the active release"

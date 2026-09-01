@@ -43,7 +43,7 @@ To get started:
 5. ServiceMonitor is enabled. Prometheus Operator will automatically scrape metrics.
 {{- end }}
 
-For more information, visit: https://ferrite.dev/docs
+For more information, visit: https://github.com/ferritelabs/ferrite-docs
 
 {{- if not .Values.ferrite.tls.enabled }}
 

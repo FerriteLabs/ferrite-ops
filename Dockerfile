@@ -22,7 +22,7 @@
 # all, so re-declaring it bare there would silently lose the value.
 ARG FERRITE_VERSION=0.4.0
 ARG FERRITE_SOURCE_SHA256=b4db8cc8eb0d3c2cef4a019a47d550c347df69fb8a4f77550c814fae463005cf
-FROM rust:1.97-slim-bookworm AS chef
+FROM rust:1.98-slim-bookworm AS chef
 
 # Install cargo-chef for caching dependencies, plus curl/ca-certificates to
 # fetch the Ferrite source tarball (tar ships with the base image already).
@@ -189,7 +189,9 @@ RUN mkdir -p /etc/ferrite \
 # Runtime stage: Minimal image
 #
 # Uses debian-slim (glibc) rather than Alpine (musl) so the runtime's C
-# library ABI matches the `rust:1.95-slim-bookworm` builder stage above.
+# library ABI matches the `rust:1.98-slim-bookworm` builder stage above.
+# This exact Debian Bookworm/glibc builder-runtime invariant is protected by
+# AUDIT.md F-12.
 # The builder compiles and dynamically links against glibc (Debian
 # bookworm); this build does not target or statically link musl, so
 # running those binaries on an Alpine (musl) runtime is not guaranteed to

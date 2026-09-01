@@ -177,23 +177,11 @@ cp ~/rpmbuild/RPMS/x86_64/ferrite*.rpm repo/Packages/
 createrepo repo/
 ```
 
-Create a repo file for users:
+This repository does not currently advertise a hosted RPM endpoint. Distribute the generated package directly or attach it to a verified GitHub release until an owned package domain, TLS, signing, and repository metadata are configured.
 
 ```bash
-# /etc/yum.repos.d/ferrite.repo
-cat > ferrite.repo << EOF
-[ferrite]
-name=Ferrite Repository
-baseurl=https://packages.ferrite.dev/rpm/\$releasever/\$basearch/
-enabled=1
-gpgcheck=0
-EOF
-```
-
-Users can then install:
-```bash
-sudo cp ferrite.repo /etc/yum.repos.d/
-sudo dnf install ferrite
+# Install the generated local package
+sudo dnf install ~/rpmbuild/RPMS/x86_64/ferrite-*.rpm
 ```
 
 ## SELinux

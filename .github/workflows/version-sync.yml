@@ -104,13 +104,15 @@ jobs:
       #   OLDER           -> always skip. There is no override, manual or
       #                      automated: a version-sync run (whether triggered
       #                      by repository_dispatch or workflow_dispatch) can
-      #                      never move active-release.env backwards. A real
-      #                      rollback is an intentional, human-operated
-      #                      decision with broader implications (registry
-      #                      tags, GitOps revisions, RPM Release bumps, ...)
-      #                      than a version bump, so it is deliberately out of
-      #                      scope for this workflow and is deferred to a
-      #                      future, separate, explicitly human-driven process.
+      #                      never move active-release.env backwards. General
+      #                      release rollback/downgrade is not implemented by
+      #                      this repository: exact image and ops tags are
+      #                      immutable, so recovery is a strictly newer
+      #                      corrective release that this workflow rolls
+      #                      forward through every active pin. Flux's
+      #                      failed-upgrade remediation is a separate,
+      #                      controller-local Helm rollback and does not
+      #                      rewrite canonical release metadata or tags.
       - name: Guard release ordering
         id: guard
         env:
@@ -150,7 +152,7 @@ jobs:
               exit 1
               ;;
             OLDER)
-              echo "::warning::Candidate ${CANDIDATE_VERSION} is older than the canonical ${CURRENT_VERSION}; skipping downgrade. A downgrade is never applied automatically or via manual override; rollbacks are a separate, explicitly human-driven process."
+              echo "::warning::Candidate ${CANDIDATE_VERSION} is older than the canonical ${CURRENT_VERSION}; skipping downgrade. Release downgrade is unsupported: exact tags and canonical pins are immutable, so publish a strictly newer corrective release and roll forward."
               ;;
             *)
               echo "::error::Unexpected release-ordering classification: ${CLASS}"

@@ -84,11 +84,15 @@ jobs:
 
       - name: Docker Scout CVE scan
         uses: docker/scout-action@v1
-        if: ${{ env.DOCKER_USER != '' }}
+        if: ${{ env.DOCKERHUB_USERNAME != '' && env.DOCKERHUB_TOKEN != '' }}
         env:
-          DOCKER_USER: ${{ secrets.DOCKER_USERNAME }}
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
         with:
+          dockerhub-user: ${{ secrets.DOCKERHUB_USERNAME }}
+          dockerhub-password: ${{ secrets.DOCKERHUB_TOKEN }}
           command: cves
           image: "ferrite-scout:${{ github.sha }}"
           sarif-file: "scout-results.sarif"
           summary: true
+          write-comment: false

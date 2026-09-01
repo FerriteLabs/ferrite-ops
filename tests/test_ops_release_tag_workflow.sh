@@ -36,6 +36,12 @@ assert_contains "$CONTENT" '"refs/tags/${OPS_TAG}:refs/tags/${OPS_TAG}"' \
   "ops tag workflow pushes only the immutable tag ref"
 assert_contains "$CONTENT" "git ls-remote --exit-code --tags origin" \
   "ops tag workflow refuses an existing remote tag"
+assert_contains "$CONTENT" 'PREVIOUS_SHA: ${{ github.event.before }}' \
+  "ops tag workflow compares against the main tip from immediately before the triggering push"
+assert_contains "$CONTENT" '"$ORDER_SCRIPT" semver-cmp' \
+  "ops tag workflow uses the shared SemVer ordering guard for the shipped-version comparison"
+assert_contains "$CONTENT" "not strictly newer than the currently shipped" \
+  "ops tag workflow rejects duplicate or regressive canonical release pushes"
 assert_not_contains "$CONTENT" "git tag -f" \
   "ops tag workflow never force-replaces a tag"
 assert_not_contains "$CONTENT" "git push --force" \
@@ -63,68 +69,46 @@ assert_contains "$CONTENT" "needs.resolve.outputs.version" \
 assert_eq "1" "$(grep -c 'VERSION="${RAW_VERSION#v}"' "$WORKFLOW")" \
   "ops tag workflow normalizes an optional leading v exactly once"
 
-if ! command -v python3 >/dev/null 2>&1 ||
-  ! python3 -c "import yaml" >/dev/null 2>&1; then
-  echo "  skip: python3/PyYAML unavailable; skipping workflow extraction replay."
-  harness_summary
-  exit $?
-fi
-
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 RESOLVE_SCRIPT="${TMP}/resolve.sh"
 VALIDATE_SCRIPT="${TMP}/validate.sh"
 TAG_SCRIPT="${TMP}/tag.sh"
-if python3 - "$WORKFLOW" "$RESOLVE_SCRIPT" "$VALIDATE_SCRIPT" "$TAG_SCRIPT" <<'PYEOF'
-import sys
-import yaml
+if ruby -ryaml - "$WORKFLOW" "$RESOLVE_SCRIPT" "$VALIDATE_SCRIPT" "$TAG_SCRIPT" <<'RUBY'
+workflow_path, resolve_path, validate_path, tag_path = ARGV
+workflow = YAML.safe_load(File.read(workflow_path), aliases: true) || {}
 
-workflow_path, resolve_path, validate_path, tag_path = sys.argv[1:]
-with open(workflow_path) as workflow_file:
-    workflow = yaml.safe_load(workflow_file)
+trigger = (workflow["on"] || workflow[true] || {}).fetch("push", {})
+abort "tag workflow must trigger only on main" unless trigger["branches"] == ["main"]
+unless trigger["paths"] == ["active-release.env"]
+  abort "tag workflow must trigger ONLY on active-release.env changes, got: #{trigger["paths"].inspect}"
+end
 
-trigger = workflow.get(True, {}).get("push", {})
-if trigger.get("branches") != ["main"]:
-    raise SystemExit("tag workflow must trigger only on main")
-if trigger.get("paths") != ["active-release.env"]:
-    raise SystemExit(
-        f"tag workflow must trigger ONLY on active-release.env changes, got: {trigger.get('paths')}"
-    )
+permissions = workflow.fetch("permissions", {})
+unless permissions == {"contents" => "write"}
+  abort "tag workflow permissions are not least-privilege: #{permissions.inspect}"
+end
 
-permissions = workflow.get("permissions", {})
-if permissions != {"contents": "write"}:
-    raise SystemExit(f"tag workflow permissions are not least-privilege: {permissions}")
+resolve_steps = workflow.fetch("jobs").fetch("resolve").fetch("steps")
+resolve = resolve_steps.find { |step| step["name"] == "Read canonical version from this push" }.fetch("run")
 
-resolve_steps = workflow["jobs"]["resolve"]["steps"]
-resolve = next(
-    step["run"] for step in resolve_steps if step.get("name") == "Read canonical version from this push"
-)
+tag_job = workflow.fetch("jobs").fetch("tag")
+abort "tag job must depend on the resolve job" unless tag_job["needs"] == "resolve"
+concurrency = tag_job.fetch("concurrency", {})
+unless concurrency.fetch("group", "").include?("needs.resolve.outputs.version")
+  abort "tag job's concurrency group must be keyed on the resolved version"
+end
+unless concurrency["cancel-in-progress"] == false
+  abort "tag job's concurrency group must not cancel an in-flight tag push"
+end
 
-tag_job = workflow["jobs"]["tag"]
-if tag_job.get("needs") != "resolve":
-    raise SystemExit("tag job must depend on the resolve job")
-concurrency = tag_job.get("concurrency", {})
-if "needs.resolve.outputs.version" not in concurrency.get("group", ""):
-    raise SystemExit("tag job's concurrency group must be keyed on the resolved version")
-if concurrency.get("cancel-in-progress") is not False:
-    raise SystemExit("tag job's concurrency group must not cancel an in-flight tag push")
-
-steps = tag_job["steps"]
-validate = next(
-    step["run"] for step in steps if step.get("name") == "Validate canonical ops release"
-)
-tag = next(
-    step["run"]
-    for step in steps
-    if step.get("name") == "Create and push immutable annotated tag"
-)
-with open(resolve_path, "w") as output:
-    output.write(resolve)
-with open(validate_path, "w") as output:
-    output.write(validate)
-with open(tag_path, "w") as output:
-    output.write(tag)
-PYEOF
+steps = tag_job.fetch("steps")
+validate = steps.find { |step| step["name"] == "Validate canonical ops release" }.fetch("run")
+tag = steps.find { |step| step["name"] == "Create and push immutable annotated tag" }.fetch("run")
+File.write(resolve_path, resolve)
+File.write(validate_path, validate)
+File.write(tag_path, tag)
+RUBY
 then
   harness_ok "ops tag workflow has the expected trigger, permissions, job split, and concurrency"
 else
@@ -152,6 +136,23 @@ done
 git init -q -b main "$FIXTURE"
 git -C "$FIXTURE" config user.name "Test User"
 git -C "$FIXTURE" config user.email "test@example.invalid"
+sed -i.bak 's/^FERRITE_VERSION=.*/FERRITE_VERSION=0.3.0/' \
+  "${FIXTURE}/active-release.env"
+rm -f "${FIXTURE}/active-release.env.bak"
+git -C "$FIXTURE" add .
+git -C "$FIXTURE" commit -q -m "previous shipped release"
+PUSH_BEFORE_SHA="$(git -C "$FIXTURE" rev-parse HEAD)"
+for target in \
+  active-release.env \
+  Dockerfile \
+  Dockerfile.moonshot \
+  Dockerfile.playground \
+  charts/ferrite/Chart.yaml \
+  charts/ferrite-sidecar/Chart.yaml \
+  gitops/argocd/overlays/production.yaml \
+  gitops/flux/overlays/production.yaml; do
+  cp "${REPO_ROOT}/${target}" "${FIXTURE}/${target}"
+done
 git -C "$FIXTURE" add .
 git -C "$FIXTURE" commit -q -m "test fixture"
 git init -q --bare "$REMOTE"
@@ -223,7 +224,24 @@ fi
 echo "later change" >> "${FIXTURE}/active-release.env.later"
 git -C "$FIXTURE" add active-release.env.later
 git -C "$FIXTURE" commit -q -m "an unrelated later main advance"
+LATER_SHA="$(git -C "$FIXTURE" rev-parse HEAD)"
 git -C "$FIXTURE" push -q origin main
+
+NON_NEWER_PREVIOUS_SHA="$MERGED_SHA"
+if (
+  cd "$FIXTURE" &&
+    MERGED_SHA="$LATER_SHA" PREVIOUS_SHA="$NON_NEWER_PREVIOUS_SHA" VERSION="$EXPECTED_VERSION" \
+      GITHUB_OUTPUT="${TMP}/non_newer.out" \
+      ORDER_SCRIPT="${REPO_ROOT}/scripts/release-ordering.sh" \
+      bash "$VALIDATE_SCRIPT" >"${TMP}/non_newer.log" 2>&1
+); then
+  harness_fail "ops tag validation unexpectedly accepted a release that did not advance the shipped version"
+else
+  assert_contains "$(cat "${TMP}/non_newer.log")" \
+    "not strictly newer than the currently shipped" \
+    "ops tag validation rejects a duplicate/non-newer canonical release"
+fi
+
 git -C "$FIXTURE" reset -q --hard "$MERGED_SHA"
 
 OUTPUT="${TMP}/release.out"
@@ -231,7 +249,8 @@ OUTPUT="${TMP}/release.out"
 
 if (
   cd "$FIXTURE" &&
-    MERGED_SHA="$MERGED_SHA" VERSION="$EXPECTED_VERSION" GITHUB_OUTPUT="$OUTPUT" \
+    MERGED_SHA="$MERGED_SHA" PREVIOUS_SHA="$PUSH_BEFORE_SHA" \
+      VERSION="$EXPECTED_VERSION" GITHUB_OUTPUT="$OUTPUT" \
       ORDER_SCRIPT="${REPO_ROOT}/scripts/release-ordering.sh" bash "$VALIDATE_SCRIPT"
 ); then
   assert_contains "$(cat "$OUTPUT")" "version=${EXPECTED_VERSION}" \
@@ -276,7 +295,8 @@ sed -i.bak "s/appVersion: \"${EXPECTED_VERSION}\"/appVersion: \"9.9.9\"/" \
 rm -f "${FIXTURE}/charts/ferrite/Chart.yaml.bak"
 if (
   cd "$FIXTURE" &&
-    MERGED_SHA="$MERGED_SHA" VERSION="$EXPECTED_VERSION" GITHUB_OUTPUT="${TMP}/drift.out" \
+    MERGED_SHA="$MERGED_SHA" PREVIOUS_SHA="$PUSH_BEFORE_SHA" \
+      VERSION="$EXPECTED_VERSION" GITHUB_OUTPUT="${TMP}/drift.out" \
       ORDER_SCRIPT="${REPO_ROOT}/scripts/release-ordering.sh" bash "$VALIDATE_SCRIPT"
 ); then
   harness_fail "ops tag validation unexpectedly accepted chart/appVersion drift"
@@ -291,7 +311,7 @@ if command -v actionlint >/dev/null 2>&1; then
     harness_fail "actionlint rejected the immutable ops tag workflow"
   fi
 else
-  echo "  skip: actionlint not available; PyYAML/static/functional checks completed."
+  echo "  skip: actionlint not available; Ruby YAML/static/functional checks completed."
 fi
 
 harness_summary

@@ -82,6 +82,7 @@ jobs:
         id: release
         env:
           MERGED_SHA: ${{ github.sha }}
+          PREVIOUS_SHA: ${{ github.event.before }}
           VERSION: ${{ needs.resolve.outputs.version }}
           ORDER_SCRIPT: scripts/release-ordering.sh
         run: |
@@ -131,6 +132,47 @@ jobs:
           if [ "$(git rev-parse HEAD)" != "$MERGED_SHA" ]; then
             echo "::error::Checked-out commit does not match the merged push commit"
             exit 1
+          fi
+          if ! printf '%s\n' "$PREVIOUS_SHA" |
+            grep -qE '^([0-9a-f]{40}|[0-9a-f]{64})$'; then
+            echo "::error::Push event contains an invalid previous main SHA"
+            exit 1
+          fi
+
+          ZERO_SHA40="0000000000000000000000000000000000000000"
+          ZERO_SHA64="${ZERO_SHA40}000000000000000000000000"
+          if [ "$PREVIOUS_SHA" != "$ZERO_SHA40" ] &&
+            [ "$PREVIOUS_SHA" != "$ZERO_SHA64" ]; then
+            if ! git cat-file -e "${PREVIOUS_SHA}^{commit}" 2>/dev/null; then
+              echo "::error::Previous main commit is unavailable: ${PREVIOUS_SHA}"
+              exit 1
+            fi
+
+            if git cat-file -e "${PREVIOUS_SHA}:active-release.env" 2>/dev/null; then
+              PREVIOUS_ENV="$(git show "${PREVIOUS_SHA}:active-release.env")"
+              if [ "$(printf '%s\n' "$PREVIOUS_ENV" | grep -c '^FERRITE_VERSION=')" -ne 1 ]; then
+                echo "::error::Previous main release metadata does not define FERRITE_VERSION exactly once"
+                exit 1
+              fi
+              PREVIOUS_RAW_VERSION="$(printf '%s\n' "$PREVIOUS_ENV" |
+                sed -n 's/^FERRITE_VERSION=//p')"
+              PREVIOUS_VERSION="${PREVIOUS_RAW_VERSION#v}"
+              if ! bash "$ORDER_SCRIPT" validate "$PREVIOUS_VERSION"; then
+                echo "::error::Previous main release metadata contains an invalid version: ${PREVIOUS_RAW_VERSION}"
+                exit 1
+              fi
+
+              PRECEDENCE="$(bash "$ORDER_SCRIPT" semver-cmp "$VERSION" "$PREVIOUS_VERSION")"
+              if [ "$PRECEDENCE" != "gt" ]; then
+                echo "::error::Canonical release ${VERSION} is not strictly newer than the currently shipped ${PREVIOUS_VERSION}; refusing a release rollback or duplicate release metadata push."
+                exit 1
+              fi
+              echo "::notice::Canonical release ${VERSION} advances the previously shipped ${PREVIOUS_VERSION}."
+            else
+              echo "::notice::Previous main commit has no active-release.env; allowing the initial canonical release."
+            fi
+          else
+            echo "::notice::Repository has no previous main commit; allowing the initial canonical release."
           fi
 
           for dockerfile in "${DOCKERFILES[@]}"; do

@@ -1,6 +1,5 @@
 Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
 Upstream-Name: ferrite
-Upstream-Contact: Ferrite Maintainers <maintainers@ferrite.dev>
 Source: https://github.com/ferritelabs/ferrite
 
 Files: *
@@ -8,7 +7,7 @@ Copyright: 2024-2025 Ferrite Contributors
 License: Apache-2.0
 
 Files: debian/*
-Copyright: 2025 Ferrite Maintainers <maintainers@ferrite.dev>
+Copyright: 2025 Ferrite Maintainers
 License: Apache-2.0
 
 License: Apache-2.0

@@ -14,7 +14,7 @@
 # Access:  http://localhost:8080
 
 ARG FERRITE_VERSION=0.4.0
-FROM rust:1.97-slim-bookworm AS base
+FROM rust:1.98-slim-bookworm AS base
 
 # ca-certificates/curl to fetch the pinned source tarball (tar ships with
 # the base image already); pkg-config/libssl-dev to build it.

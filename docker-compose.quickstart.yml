@@ -68,5 +68,5 @@ services:
         echo "  Try FerriteQL:"
         echo "    redis-cli QUERY \"SELECT * FROM user:* LIMIT 10\""
         echo ""
-        echo "  Documentation: https://docs.ferrite.dev"
+        echo "  Documentation: https://github.com/ferritelabs/ferrite-docs"
         echo "══════════════════════════════════════════════════════"

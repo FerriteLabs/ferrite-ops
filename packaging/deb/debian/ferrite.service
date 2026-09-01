@@ -1,6 +1,6 @@
 [Unit]
 Description=Ferrite - High-Performance Key-Value Store
-Documentation=https://ferrite.dev/docs
+Documentation=https://github.com/ferritelabs/ferrite-docs
 After=network.target
 Wants=network-online.target
 

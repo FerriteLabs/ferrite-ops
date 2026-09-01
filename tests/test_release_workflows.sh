@@ -24,9 +24,10 @@ RELEASE_YML="${REPO_ROOT}/.github/workflows/release.yml"
 RECONCILE_YML="${REPO_ROOT}/.github/workflows/reconcile-release-tags.yml"
 VERSION_SYNC_YML="${REPO_ROOT}/.github/workflows/version-sync.yml"
 ORCHESTRATION_YML="${REPO_ROOT}/.github/workflows/release-orchestration.yml"
+DOCKER_SCAN_YML="${REPO_ROOT}/.github/workflows/docker-scan.yml"
 ACTIVE_RELEASE="${REPO_ROOT}/active-release.env"
 
-for f in "$RELEASE_YML" "$RECONCILE_YML" "$VERSION_SYNC_YML" "$ORCHESTRATION_YML" "$ACTIVE_RELEASE"; do
+for f in "$RELEASE_YML" "$RECONCILE_YML" "$VERSION_SYNC_YML" "$ORCHESTRATION_YML" "$DOCKER_SCAN_YML" "$ACTIVE_RELEASE"; do
   if [[ ! -f "$f" ]]; then
     echo "  FAIL: ${f} not found" >&2
     exit 1
@@ -49,6 +50,7 @@ RELEASE_CONTENT="$(cat "$RELEASE_YML")"
 RECONCILE_CONTENT="$(cat "$RECONCILE_YML")"
 VERSION_SYNC_CONTENT="$(cat "$VERSION_SYNC_YML")"
 ORCHESTRATION_CONTENT="$(cat "$ORCHESTRATION_YML")"
+DOCKER_SCAN_CONTENT="$(cat "$DOCKER_SCAN_YML")"
 CHECKSUM_SCRIPT_CONTENT="$(cat "${REPO_ROOT}/scripts/compute-source-checksum.sh")"
 LABELS_SCRIPT_CONTENT="$(cat "${REPO_ROOT}/scripts/verify-exact-image-labels.sh")"
 
@@ -204,6 +206,30 @@ assert_not_contains "$ORCHESTRATION_CONTENT" "charts/ferrite" \
   "release-orchestration.yml leaves every ferrite-ops version pin to version-sync.yml"
 assert_not_contains "$ORCHESTRATION_CONTENT" "update-ops:" \
   "release-orchestration.yml no longer opens a competing ferrite-ops version PR"
+
+# --- Docker Scout uses the same canonical Docker Hub secret contract -------
+assert_contains "$DOCKER_SCAN_CONTENT" \
+  'DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}' \
+  "docker-scan.yml uses the canonical Docker Hub username secret"
+assert_contains "$DOCKER_SCAN_CONTENT" \
+  'DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}' \
+  "docker-scan.yml uses the canonical Docker Hub token secret"
+assert_contains "$DOCKER_SCAN_CONTENT" \
+  "if: \${{ env.DOCKERHUB_USERNAME != '' && env.DOCKERHUB_TOKEN != '' }}" \
+  "Docker Scout eligibility requires both canonical Docker Hub credentials"
+assert_contains "$DOCKER_SCAN_CONTENT" \
+  'dockerhub-user: ${{ secrets.DOCKERHUB_USERNAME }}' \
+  "Docker Scout receives the canonical Docker Hub username"
+assert_contains "$DOCKER_SCAN_CONTENT" \
+  'dockerhub-password: ${{ secrets.DOCKERHUB_TOKEN }}' \
+  "Docker Scout receives the canonical Docker Hub token"
+assert_contains "$DOCKER_SCAN_CONTENT" \
+  "write-comment: false" \
+  "Docker Scout does not require pull-request write permission"
+assert_not_contains "$DOCKER_SCAN_CONTENT" 'secrets.DOCKER_USERNAME' \
+  "docker-scan.yml does not reference the stale DOCKER_USERNAME secret"
+assert_not_contains "$DOCKER_SCAN_CONTENT" "DOCKER_USER:" \
+  "docker-scan.yml does not introduce a second Docker Hub username alias"
 
 # --- Static checks: version-sync.yml ----------------------------------------
 for dockerfile in Dockerfile Dockerfile.moonshot Dockerfile.playground; do

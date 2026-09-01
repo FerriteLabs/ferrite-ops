@@ -24,7 +24,7 @@
 #     --build-arg FERRITE_SOURCE_SHA256=<sha256 of that version's tarball> .
 
 ARG FERRITE_VERSION=0.4.0
-FROM rust:1.97-slim-bookworm AS chef
+FROM rust:1.98-slim-bookworm AS chef
 
 # Install cargo-chef for caching dependencies, plus curl/ca-certificates to
 # fetch the Ferrite source tarball (tar ships with the base image already).
@@ -142,11 +142,10 @@ RUN mkdir -p /etc/ferrite \
 
 # ---------- Runtime stage ----------
 # Uses debian-slim (glibc) rather than Alpine (musl) so the runtime's C
-# library ABI matches the `rust:1.94-slim-bookworm` builder stage above.
-# Identical ABI-compatibility rationale/fix as the primary Dockerfile
-# (see AUDIT.md F-12): building with glibc and running on musl is not
-# guaranteed to work and can fail at startup with a missing dynamic
-# linker/library error.
+# library ABI matches the `rust:1.98-slim-bookworm` builder stage above.
+# This exact Debian Bookworm/glibc builder-runtime invariant is protected by
+# AUDIT.md F-12: building with glibc and running on musl is not guaranteed to
+# work and can fail at startup with a missing dynamic linker/library error.
 FROM debian:bookworm-slim AS runtime
 
 # Re-declare ARGs so they're visible in this stage (not automatically
