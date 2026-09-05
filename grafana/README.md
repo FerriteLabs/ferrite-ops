@@ -26,9 +26,10 @@ A comprehensive dashboard for monitoring Ferrite instances with:
 ### Import via API
 
 ```bash
+export GRAFANA_SERVICE_ACCOUNT_TOKEN="<grafana-service-account-token>"
 curl -X POST \
   -H "Content-Type: application/json" \
-  -H "Authorization: Bearer YOUR_API_KEY" \
+  --oauth2-bearer "$GRAFANA_SERVICE_ACCOUNT_TOKEN" \
   -d @ferrite-dashboard.json \
   http://localhost:3000/api/dashboards/import
 ```
@@ -159,6 +160,6 @@ To update the dashboard:
 
 ## More Information
 
-- [Ferrite Documentation](https://ferrite.dev/docs)
-- [Monitoring Guide](https://ferrite.dev/docs/operations/monitoring)
-- [Observability Guide](https://ferrite.dev/docs/operations/observability)
+- [Ferrite Documentation](https://github.com/ferritelabs/ferrite-docs)
+- [Grafana Monitoring Guide](https://github.com/ferritelabs/ferrite-ops/blob/main/grafana/README.md)
+- [Ferrite Source Repository](https://github.com/ferritelabs/ferrite)

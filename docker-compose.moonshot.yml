@@ -14,9 +14,11 @@ services:
   # ---------- Primary ----------
   ferrite-primary:
     build:
-      context: ../ferrite
-      dockerfile: ../ferrite-ops/Dockerfile.moonshot
+      context: .
+      dockerfile: Dockerfile.moonshot
       args:
+        FERRITE_VERSION: "${FERRITE_VERSION:-0.4.0}"
+        FERRITE_SOURCE_SHA256: "${FERRITE_SOURCE_SHA256:-b4db8cc8eb0d3c2cef4a019a47d550c347df69fb8a4f77550c814fae463005cf}"
         FERRITE_FEATURES: "${FERRITE_FEATURES:-forge-runtime}"
     image: ferrite:moonshot
     container_name: ferrite-primary
@@ -26,17 +28,10 @@ services:
       - "9090:9090"
     volumes:
       - ferrite-primary-data:/var/lib/ferrite/data
-      - ${FERRITE_CONFIG:-./ferrite.example.toml}:/etc/ferrite/ferrite.toml:ro
     environment:
       - RUST_LOG=${RUST_LOG:-ferrite=info}
       - FERRITE_DATA_DIR=/var/lib/ferrite/data
-      - FERRITE_BIND=0.0.0.0
-      - FERRITE_METRICS_BIND=0.0.0.0
       - FERRITE_LUCIDITY_SEED_HEX=${FERRITE_LUCIDITY_SEED_HEX:-}
-      - FERRITE_FORGE_ENABLED=${FERRITE_FORGE_ENABLED:-true}
-      - FERRITE_MNEMO_ENABLED=${FERRITE_MNEMO_ENABLED:-true}
-      - FERRITE_CHRONICLE_ENABLED=${FERRITE_CHRONICLE_ENABLED:-true}
-      - FERRITE_LUCIDITY_ENABLED=${FERRITE_LUCIDITY_ENABLED:-true}
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "/usr/local/bin/ferrite-cli", "PING"]
@@ -58,9 +53,11 @@ services:
   # ---------- Replica ----------
   ferrite-replica:
     build:
-      context: ../ferrite
-      dockerfile: ../ferrite-ops/Dockerfile.moonshot
+      context: .
+      dockerfile: Dockerfile.moonshot
       args:
+        FERRITE_VERSION: "${FERRITE_VERSION:-0.4.0}"
+        FERRITE_SOURCE_SHA256: "${FERRITE_SOURCE_SHA256:-b4db8cc8eb0d3c2cef4a019a47d550c347df69fb8a4f77550c814fae463005cf}"
         FERRITE_FEATURES: "${FERRITE_FEATURES:-forge-runtime}"
     image: ferrite:moonshot
     container_name: ferrite-replica
@@ -70,20 +67,13 @@ services:
       - "9091:9090"
     volumes:
       - ferrite-replica-data:/var/lib/ferrite/data
-      - ${FERRITE_CONFIG:-./ferrite.example.toml}:/etc/ferrite/ferrite.toml:ro
     environment:
       - RUST_LOG=${RUST_LOG:-ferrite=info}
       - FERRITE_DATA_DIR=/var/lib/ferrite/data
-      - FERRITE_BIND=0.0.0.0
-      - FERRITE_METRICS_BIND=0.0.0.0
       - FERRITE_REPLICATION_ROLE=replica
       - FERRITE_REPLICATION_PRIMARY_HOST=ferrite-primary
       - FERRITE_REPLICATION_PRIMARY_PORT=6379
       - FERRITE_LUCIDITY_SEED_HEX=${FERRITE_LUCIDITY_SEED_HEX:-}
-      - FERRITE_FORGE_ENABLED=${FERRITE_FORGE_ENABLED:-true}
-      - FERRITE_MNEMO_ENABLED=${FERRITE_MNEMO_ENABLED:-true}
-      - FERRITE_CHRONICLE_ENABLED=${FERRITE_CHRONICLE_ENABLED:-true}
-      - FERRITE_LUCIDITY_ENABLED=${FERRITE_LUCIDITY_ENABLED:-true}
     restart: unless-stopped
     depends_on:
       ferrite-primary:

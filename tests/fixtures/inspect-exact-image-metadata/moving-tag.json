@@ -1,0 +1,65 @@
+{
+  "image": "ghcr.io/ferritelabs/ferrite",
+  "tag": "1.2.3",
+  "initial": {
+    "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "manifest": {
+      "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "manifests": [
+        {
+          "digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+          "platform": {
+            "os": "linux",
+            "architecture": "amd64"
+          }
+        },
+        {
+          "digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+          "platform": {
+            "os": "linux",
+            "architecture": "arm64"
+          }
+        }
+      ]
+    },
+    "image": {
+      "linux/amd64": {
+        "config": {
+          "Labels": {
+            "org.opencontainers.image.version": "1.2.3",
+            "dev.ferritelabs.image.source-sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+          }
+        }
+      },
+      "linux/arm64": {
+        "config": {
+          "Labels": {
+            "org.opencontainers.image.version": "1.2.3",
+            "dev.ferritelabs.image.source-sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+          }
+        }
+      }
+    }
+  },
+  "moved": {
+    "digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "image": {
+      "linux/amd64": {
+        "config": {
+          "Labels": {
+            "org.opencontainers.image.version": "9.9.9",
+            "dev.ferritelabs.image.source-sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+          }
+        }
+      },
+      "linux/arm64": {
+        "config": {
+          "Labels": {
+            "org.opencontainers.image.version": "9.9.9",
+            "dev.ferritelabs.image.source-sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+          }
+        }
+      }
+    }
+  }
+}

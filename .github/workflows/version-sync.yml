@@ -1,16 +1,28 @@
 # Triggered by ferrite core repo after a version bump to sync versions
 # across Dockerfile, Helm chart, RPM spec, and other config files.
+#
+# `ferrite-release` is the real repository_dispatch event core's release
+# workflow emits (see ferrite/.github/workflows/release.yml and
+# release-full.yml). `version-sync` is kept as an additional trigger only for
+# backward compatibility with any external caller still using it directly;
+# this workflow is the single, comprehensive place that keeps
+# active-release.env, every Dockerfile, both Helm charts, Compose, GitOps,
+# Terraform, packaging, and the release workflow's own default in sync,
+# rather than any other workflow performing a partial, competing update.
 
 name: Version Sync
 
 on:
   repository_dispatch:
-    types: [version-sync]
+    types: [ferrite-release, version-sync]
   workflow_dispatch:
     inputs:
       version:
-        description: 'New version to sync (e.g. 0.3.1)'
+        description: 'New version to sync (e.g. 0.4.1)'
         required: true
+      sha256:
+        description: 'Source tarball SHA256 (optional — computed automatically if empty)'
+        required: false
 
 permissions:
   contents: write
@@ -25,42 +37,311 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Extract version
+      - name: Extract version and source checksum
         id: version
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          DISPATCH_VERSION: ${{ github.event.client_payload.version }}
+          WORKFLOW_VERSION: ${{ inputs.version }}
+          INPUT_SHA256: ${{ github.event.client_payload.sha256 || inputs.sha256 }}
+          REPOSITORY_OWNER: ${{ github.repository_owner }}
+          CHECKSUM_SCRIPT: scripts/compute-source-checksum.sh
         run: |
-          if [ "${{ github.event_name }}" = "repository_dispatch" ]; then
-            VERSION="${{ github.event.client_payload.version }}"
-          else
-            VERSION="${{ inputs.version }}"
+          set -euo pipefail
+
+          case "$EVENT_NAME" in
+            repository_dispatch) VERSION="$DISPATCH_VERSION" ;;
+            workflow_dispatch) VERSION="$WORKFLOW_VERSION" ;;
+            *)
+              echo "::error::Unsupported version sync event: ${EVENT_NAME}"
+              exit 1
+              ;;
+          esac
+          # Accept either "v0.4.1" or "0.4.1".
+          VERSION="${VERSION#v}"
+
+          if [ -z "$VERSION" ]; then
+            echo "::error::No version specified"
+            exit 1
           fi
+
+          if ! printf '%s\n' "$VERSION" |
+            grep -qE '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?$'; then
+            echo "::error::Invalid semver: $VERSION"
+            exit 1
+          fi
+          if ! printf '%s\n' "$REPOSITORY_OWNER" | grep -qE '^[A-Za-z0-9_.-]+$'; then
+            echo "::error::Invalid repository owner"
+            exit 1
+          fi
+
+          # The shared checksum helper ALWAYS downloads and computes the
+          # canonical source archive checksum itself; a supplied INPUT_SHA256
+          # (from a repository_dispatch payload or a manual workflow_dispatch
+          # input) is never trusted as truth on its own. If supplied, the
+          # helper validates its shape and then requires it to match the
+          # freshly computed canonical value byte-for-byte, failing loudly on
+          # any mismatch instead of silently accepting an unverified value.
+          CHECKSUM_ERR_LOG="$(mktemp)"
+          trap 'rm -f "$CHECKSUM_ERR_LOG"' EXIT
+          if ! SHA256="$(bash "$CHECKSUM_SCRIPT" "$REPOSITORY_OWNER" "$VERSION" "$INPUT_SHA256" 2>"$CHECKSUM_ERR_LOG")"; then
+            echo "::error::$(cat "$CHECKSUM_ERR_LOG")"
+            exit 1
+          fi
+          cat "$CHECKSUM_ERR_LOG" >&2
+
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
-          echo "📦 Syncing to version ${VERSION}"
+          echo "sha256=${SHA256}" >> "$GITHUB_OUTPUT"
+          echo "📦 Syncing to version ${VERSION} (source SHA256: ${SHA256})"
 
-      - name: Update Dockerfile
+      # Compare the candidate release against the canonical active-release.env
+      # from the checked-out repository (a trustworthy artifact, not raw input)
+      # and refuse to move backwards. An automated ferrite-release dispatch that
+      # arrives out of order or is retried can never regress the canonical pins:
+      #   NEWER           -> proceed with the sync PR.
+      #   EQUAL_SAME      -> no-op; the canonical release already matches.
+      #   EQUAL_DIFFERENT -> fail loudly; a released version's source changed.
+      #   OLDER           -> always skip. There is no override, manual or
+      #                      automated: a version-sync run (whether triggered
+      #                      by repository_dispatch or workflow_dispatch) can
+      #                      never move active-release.env backwards. General
+      #                      release rollback/downgrade is not implemented by
+      #                      this repository: exact image and ops tags are
+      #                      immutable, so recovery is a strictly newer
+      #                      corrective release that this workflow rolls
+      #                      forward through every active pin. Flux's
+      #                      failed-upgrade remediation is a separate,
+      #                      controller-local Helm rollback and does not
+      #                      rewrite canonical release metadata or tags.
+      - name: Guard release ordering
+        id: guard
+        env:
+          CANDIDATE_VERSION: ${{ steps.version.outputs.version }}
+          CANDIDATE_SHA256: ${{ steps.version.outputs.sha256 }}
+          ORDER_SCRIPT: scripts/release-ordering.sh
         run: |
-          VERSION="${{ steps.version.outputs.version }}"
-          if grep -q 'ARG FERRITE_VERSION' Dockerfile; then
-            sed -i "s/ARG FERRITE_VERSION=.*/ARG FERRITE_VERSION=${VERSION}/" Dockerfile
+          set -euo pipefail
+
+          ACTIVE_RELEASE="active-release.env"
+          CURRENT_VERSION="$(sed -n 's/^FERRITE_VERSION=//p' "$ACTIVE_RELEASE")"
+          CURRENT_SHA256="$(sed -n 's/^FERRITE_SOURCE_SHA256=//p' "$ACTIVE_RELEASE")"
+          if ! printf '%s\n' "$CURRENT_VERSION" |
+            grep -qE '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?$'; then
+            echo "::error::active-release.env contains an invalid canonical version"
+            exit 1
+          fi
+          if ! printf '%s\n' "$CURRENT_SHA256" | grep -qE '^[0-9a-f]{64}$'; then
+            echo "::error::active-release.env contains an invalid canonical checksum"
+            exit 1
           fi
 
-      - name: Update Helm chart
+          CLASS="$(bash "$ORDER_SCRIPT" classify \
+            "$CANDIDATE_VERSION" "$CANDIDATE_SHA256" "$CURRENT_VERSION" "$CURRENT_SHA256")"
+          echo "::notice::Release ordering: candidate ${CANDIDATE_VERSION} vs canonical ${CURRENT_VERSION} => ${CLASS}"
+
+          PROCEED=false
+          case "$CLASS" in
+            NEWER)
+              PROCEED=true
+              ;;
+            EQUAL_SAME)
+              echo "::notice::Candidate ${CANDIDATE_VERSION} already matches the canonical release with an identical source checksum; nothing to sync."
+              ;;
+            EQUAL_DIFFERENT)
+              echo "::error::Candidate ${CANDIDATE_VERSION} matches the canonical version but its source checksum differs (${CANDIDATE_SHA256} != ${CURRENT_SHA256}). Refusing to silently rewrite a released version's source."
+              exit 1
+              ;;
+            OLDER)
+              echo "::warning::Candidate ${CANDIDATE_VERSION} is older than the canonical ${CURRENT_VERSION}; skipping downgrade. Release downgrade is unsupported: exact tags and canonical pins are immutable, so publish a strictly newer corrective release and roll forward."
+              ;;
+            *)
+              echo "::error::Unexpected release-ordering classification: ${CLASS}"
+              exit 1
+              ;;
+          esac
+
+          echo "proceed=${PROCEED}" >> "$GITHUB_OUTPUT"
+
+      - name: Synchronize active release metadata and pins
+        if: steps.guard.outputs.proceed == 'true'
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          SHA256: ${{ steps.version.outputs.sha256 }}
         run: |
-          VERSION="${{ steps.version.outputs.version }}"
-          CHART="charts/ferrite/Chart.yaml"
-          if [ -f "$CHART" ]; then
-            sed -i "s/^version:.*/version: ${VERSION}/" "$CHART"
-            sed -i "s/^appVersion:.*/appVersion: ${VERSION}/" "$CHART"
+          set -euo pipefail
+
+          if ! printf '%s\n' "$VERSION" |
+            grep -qE '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?$'; then
+            echo "::error::Invalid normalized release version"
+            exit 1
           fi
+          if ! printf '%s\n' "$SHA256" | grep -qE '^[0-9a-f]{64}$'; then
+            echo "::error::Invalid normalized source SHA256"
+            exit 1
+          fi
+
+          ACTIVE_RELEASE="active-release.env"
+          DOCKERFILES=(Dockerfile Dockerfile.moonshot Dockerfile.playground)
+          PRIMARY_CHART="charts/ferrite/Chart.yaml"
+          SIDECAR_CHART="charts/ferrite-sidecar/Chart.yaml"
+          QUICKSTART_COMPOSE="docker-compose.quickstart.yml"
+          DEFAULT_COMPOSE="docker-compose.yml"
+          MOONSHOT_COMPOSE="docker-compose.moonshot.yml"
+          ARGOCD_PRODUCTION="gitops/argocd/overlays/production.yaml"
+          FLUX_PRODUCTION="gitops/flux/overlays/production.yaml"
+          KUSTOMIZE_STATEFULSET="gitops/kustomize/base/statefulset.yaml"
+          TERRAFORM_FILES=(
+            terraform/common/variables.tf
+            terraform/aws-ecs/main.tf
+            terraform/aws-eks/main.tf
+          )
+          TERRAFORM_README="terraform/README.md"
+          RELEASE_WORKFLOW=".github/workflows/release.yml"
+          TARGETS=(
+            "$ACTIVE_RELEASE"
+            "${DOCKERFILES[@]}"
+            "$PRIMARY_CHART"
+            "$SIDECAR_CHART"
+            "$QUICKSTART_COMPOSE"
+            "$DEFAULT_COMPOSE"
+            "$MOONSHOT_COMPOSE"
+            "$ARGOCD_PRODUCTION"
+            "$FLUX_PRODUCTION"
+            "$KUSTOMIZE_STATEFULSET"
+            "${TERRAFORM_FILES[@]}"
+            "$TERRAFORM_README"
+            "$RELEASE_WORKFLOW"
+          )
+
+          # Validate all targets before staging any edit. The complete
+          # replacement set is then revalidated in a temporary tree before
+          # the working tree changes, preventing a structurally drifted file
+          # from leaving a partial active-release update behind.
+          for target in "${TARGETS[@]}"; do
+            test -f "$target"
+          done
+          test "$(grep -c '^FERRITE_VERSION=' "$ACTIVE_RELEASE")" -eq 1
+          test "$(grep -c '^FERRITE_SOURCE_SHA256=' "$ACTIVE_RELEASE")" -eq 1
+          for dockerfile in "${DOCKERFILES[@]}"; do
+            test "$(grep -c '^ARG FERRITE_VERSION=' "$dockerfile")" -eq 1
+            test "$(grep -c '^ARG FERRITE_SOURCE_SHA256=' "$dockerfile")" -eq 1
+          done
+          test "$(grep -c '^version:' "$PRIMARY_CHART")" -eq 1
+          test "$(grep -c '^appVersion:' "$PRIMARY_CHART")" -eq 1
+          test "$(grep -c '^appVersion:' "$SIDECAR_CHART")" -eq 1
+          test "$(grep -c '^    image: ghcr.io/ferritelabs/ferrite:' "$QUICKSTART_COMPOSE")" -eq 1
+          test "$(grep -c "image: ferrite:\${FERRITE_VERSION:-" "$DEFAULT_COMPOSE")" -eq 1
+          test "$(grep -c "FERRITE_VERSION: \"\${FERRITE_VERSION:-" "$MOONSHOT_COMPOSE")" -eq 2
+          test "$(grep -c "FERRITE_SOURCE_SHA256: \"\${FERRITE_SOURCE_SHA256:-" "$MOONSHOT_COMPOSE")" -eq 2
+          test "$(grep -c '^    targetRevision: ferrite-ops-v' "$ARGOCD_PRODUCTION")" -eq 1
+          test "$(grep -c '^        - name: image.tag$' "$ARGOCD_PRODUCTION")" -eq 1
+          test "$(grep -c '^    tag: ferrite-ops-v' "$FLUX_PRODUCTION")" -eq 1
+          test "$(grep -c '^      repository: ghcr.io/ferritelabs/ferrite$' "$FLUX_PRODUCTION")" -eq 1
+          test "$(grep -c '^      tag: "' "$FLUX_PRODUCTION")" -eq 1
+          test "$(grep -c '^          image: ghcr.io/ferritelabs/ferrite:' "$KUSTOMIZE_STATEFULSET")" -eq 1
+          for terraform_file in "${TERRAFORM_FILES[@]}"; do
+            test "$(grep -c '^variable "ferrite_version"' "$terraform_file")" -eq 1
+          done
+          test "$(grep -c 'ferrite_version[[:space:]]*=' "$TERRAFORM_README")" -eq 2
+          test "$(grep -c "^        default: 'v" "$RELEASE_WORKFLOW")" -eq 1
+
+          STAGING_DIR="$(mktemp -d)"
+          trap 'rm -rf "$STAGING_DIR"' EXIT
+          for target in "${TARGETS[@]}"; do
+            mkdir -p "$STAGING_DIR/$(dirname "$target")"
+            cp "$target" "$STAGING_DIR/$target"
+          done
+
+          perl -pi -e "s/^FERRITE_VERSION=.*/FERRITE_VERSION=${VERSION}/" "$STAGING_DIR/$ACTIVE_RELEASE"
+          perl -pi -e "s/^FERRITE_SOURCE_SHA256=.*/FERRITE_SOURCE_SHA256=${SHA256}/" "$STAGING_DIR/$ACTIVE_RELEASE"
+          for dockerfile in "${DOCKERFILES[@]}"; do
+            perl -pi -e "s/^ARG FERRITE_VERSION=.*/ARG FERRITE_VERSION=${VERSION}/" "$STAGING_DIR/$dockerfile"
+            perl -pi -e "s/^ARG FERRITE_SOURCE_SHA256=.*/ARG FERRITE_SOURCE_SHA256=${SHA256}/" "$STAGING_DIR/$dockerfile"
+          done
+          perl -pi -e "s/^version:.*/version: ${VERSION}/" "$STAGING_DIR/$PRIMARY_CHART"
+          perl -pi -e "s/^appVersion:.*/appVersion: \"${VERSION}\"/" "$STAGING_DIR/$PRIMARY_CHART"
+          perl -pi -e "s/^appVersion:.*/appVersion: \"${VERSION}\"/" "$STAGING_DIR/$SIDECAR_CHART"
+          perl -pi -e "s#^(    image: ghcr\\.io/ferritelabs/ferrite:).*#\${1}${VERSION}#" "$STAGING_DIR/$QUICKSTART_COMPOSE"
+          perl -pi -e "s#(image: ferrite:\\\${FERRITE_VERSION:-)[^}]+(})#\${1}${VERSION}\${2}#" "$STAGING_DIR/$DEFAULT_COMPOSE"
+          perl -pi -e "s#(FERRITE_VERSION: \"\\\${FERRITE_VERSION:-)[^}]+(}\")#\${1}${VERSION}\${2}#" "$STAGING_DIR/$MOONSHOT_COMPOSE"
+          perl -pi -e "s#(FERRITE_SOURCE_SHA256: \"\\\${FERRITE_SOURCE_SHA256:-)[^}]+(}\")#\${1}${SHA256}\${2}#" "$STAGING_DIR/$MOONSHOT_COMPOSE"
+          perl -pi -e "s/^    targetRevision: ferrite-ops-v.*/    targetRevision: ferrite-ops-v${VERSION}/" "$STAGING_DIR/$ARGOCD_PRODUCTION"
+          # shellcheck disable=SC2016
+          VERSION="$VERSION" perl -0pi -e \
+            's/(- name: image\.tag\s*\n\s*value: ")[^"]*(")/$1 . $ENV{VERSION} . $2/se' \
+            "$STAGING_DIR/$ARGOCD_PRODUCTION"
+          perl -pi -e "s/^    tag: ferrite-ops-v.*/    tag: ferrite-ops-v${VERSION}/" "$STAGING_DIR/$FLUX_PRODUCTION"
+          perl -pi -e "s/^      tag: \".*\"/      tag: \"${VERSION}\"/" "$STAGING_DIR/$FLUX_PRODUCTION"
+          perl -pi -e "s#^(          image: ghcr\\.io/ferritelabs/ferrite:).*#\${1}${VERSION}#" "$STAGING_DIR/$KUSTOMIZE_STATEFULSET"
+          # shellcheck disable=SC2016
+          for terraform_file in "${TERRAFORM_FILES[@]}"; do
+            VERSION="$VERSION" perl -0pi -e \
+              's/(variable "ferrite_version" \{.*?default\s*=\s*")[^"]*(")/$1 . $ENV{VERSION} . $2/se' \
+              "$STAGING_DIR/$terraform_file"
+          done
+          perl -pi -e "s/(ferrite_version\\s*=\\s*)\"[^\"]*\"/\${1}\"${VERSION}\"/" "$STAGING_DIR/$TERRAFORM_README"
+          perl -pi -e "s/^(        default: ')v?[^']*(')/\${1}v${VERSION}\${2}/" "$STAGING_DIR/$RELEASE_WORKFLOW"
+
+          grep -qx "FERRITE_VERSION=${VERSION}" "$STAGING_DIR/$ACTIVE_RELEASE"
+          grep -qx "FERRITE_SOURCE_SHA256=${SHA256}" "$STAGING_DIR/$ACTIVE_RELEASE"
+          for dockerfile in "${DOCKERFILES[@]}"; do
+            grep -qx "ARG FERRITE_VERSION=${VERSION}" "$STAGING_DIR/$dockerfile"
+            grep -qx "ARG FERRITE_SOURCE_SHA256=${SHA256}" "$STAGING_DIR/$dockerfile"
+          done
+          grep -qx "version: ${VERSION}" "$STAGING_DIR/$PRIMARY_CHART"
+          grep -qx "appVersion: \"${VERSION}\"" "$STAGING_DIR/$PRIMARY_CHART"
+          grep -qx "appVersion: \"${VERSION}\"" "$STAGING_DIR/$SIDECAR_CHART"
+          grep -qx "    image: ghcr.io/ferritelabs/ferrite:${VERSION}" "$STAGING_DIR/$QUICKSTART_COMPOSE"
+          grep -qx "    image: ferrite:\${FERRITE_VERSION:-${VERSION}}" "$STAGING_DIR/$DEFAULT_COMPOSE"
+          test "$(grep -c "FERRITE_VERSION:-${VERSION}" "$STAGING_DIR/$MOONSHOT_COMPOSE")" -eq 2
+          test "$(grep -c "FERRITE_SOURCE_SHA256:-${SHA256}" "$STAGING_DIR/$MOONSHOT_COMPOSE")" -eq 2
+          grep -qx "    targetRevision: ferrite-ops-v${VERSION}" "$STAGING_DIR/$ARGOCD_PRODUCTION"
+          grep -A1 '^        - name: image.tag$' "$STAGING_DIR/$ARGOCD_PRODUCTION" |
+            grep -qx "          value: \"${VERSION}\""
+          grep -qx "    tag: ferrite-ops-v${VERSION}" "$STAGING_DIR/$FLUX_PRODUCTION"
+          grep -qx "      repository: ghcr.io/ferritelabs/ferrite" "$STAGING_DIR/$FLUX_PRODUCTION"
+          grep -qx "      tag: \"${VERSION}\"" "$STAGING_DIR/$FLUX_PRODUCTION"
+          grep -qx "          image: ghcr.io/ferritelabs/ferrite:${VERSION}" "$STAGING_DIR/$KUSTOMIZE_STATEFULSET"
+          for terraform_file in "${TERRAFORM_FILES[@]}"; do
+            grep -A5 '^variable "ferrite_version"' "$STAGING_DIR/$terraform_file" |
+              grep -q "default     = \"${VERSION}\""
+          done
+          test "$(grep -c "ferrite_version[[:space:]]*= \"${VERSION}\"" "$STAGING_DIR/$TERRAFORM_README")" -eq 2
+          grep -qx "        default: 'v${VERSION}'" "$STAGING_DIR/$RELEASE_WORKFLOW"
+
+          for target in "${TARGETS[@]}"; do
+            mv "$STAGING_DIR/$target" "$target"
+          done
 
       - name: Update RPM spec
+        if: steps.guard.outputs.proceed == 'true'
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
         run: |
-          VERSION="${{ steps.version.outputs.version }}"
+          set -euo pipefail
+          if ! printf '%s\n' "$VERSION" |
+            grep -qE '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?$'; then
+            echo "::error::Invalid normalized release version"
+            exit 1
+          fi
           SPEC="packaging/rpm/ferrite.spec"
-          if [ -f "$SPEC" ]; then
-            sed -i "s/^Version:.*/Version:        ${VERSION}/" "$SPEC"
+          if [ ! -f "$SPEC" ]; then
+            echo "::error::RPM spec not found: ${SPEC}"
+            exit 1
+          fi
+          if printf '%s\n' "$VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            test "$(grep -c '^Version:' "$SPEC")" -eq 1
+            test "$(grep -c '^Release:' "$SPEC")" -eq 1
+            perl -pi -e "s/^Version:.*/Version:        ${VERSION}/" "$SPEC"
+            perl -pi -e 's/^Release:.*/Release:        1%{?dist}/' "$SPEC"
+            grep -qx "Version:        ${VERSION}" "$SPEC"
+            grep -Fqx 'Release:        1%{?dist}' "$SPEC"
+          else
+            echo "Skipping RPM spec update for prerelease ${VERSION}; RPM Version remains on the latest stable release."
           fi
 
       - name: Create version sync PR
+        if: steps.guard.outputs.proceed == 'true'
         uses: peter-evans/create-pull-request@v6
         with:
           title: "chore: sync version to v${{ steps.version.outputs.version }}"
@@ -68,11 +349,13 @@ jobs:
             Automated version sync triggered by ferrite core version bump.
 
             **Version**: `${{ steps.version.outputs.version }}`
+            **Source SHA256**: `${{ steps.version.outputs.sha256 }}`
 
             Updates:
-            - Dockerfile `FERRITE_VERSION` arg
-            - Helm chart `version` and `appVersion`
-            - RPM spec `Version`
+            - Canonical `active-release.env` metadata and every active release pin
+            - All three Dockerfiles' `FERRITE_VERSION` and `FERRITE_SOURCE_SHA256` args
+            - Helm, Compose, GitOps, Terraform, and release-dispatch defaults
+            - RPM spec `Version`/`Release` for stable releases only
           branch: version-sync/${{ steps.version.outputs.version }}
           commit-message: "chore: sync version to v${{ steps.version.outputs.version }}"
           labels: automated,version-sync

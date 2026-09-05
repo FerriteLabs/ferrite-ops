@@ -1,0 +1,257 @@
+name: Tag Immutable Ops Release
+
+# Triggers ONLY when the canonical active-release.env changes on main — not
+# on unrelated pushes that happen to touch a Dockerfile, chart, or GitOps
+# overlay without a corresponding release-metadata bump. Every other release
+# pin (Dockerfiles, charts, Compose, GitOps, packaging, release.yml's
+# default) is still cross-validated against active-release.env below before
+# tagging, so drift between them and the canonical version still fails
+# loudly — it just no longer re-triggers this workflow on its own.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - active-release.env
+
+permissions:
+  contents: write
+
+jobs:
+  # Resolves the canonical version from this exact push commit. Kept as its
+  # own job so the "tag" job's concurrency group below can be keyed on the
+  # canonical version (job-level concurrency expressions may reference
+  # `needs.*.outputs`, but not another step's outputs within the same job).
+  resolve:
+    name: Resolve canonical release version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+
+      - name: Read canonical version from this push
+        id: version
+        env:
+          ORDER_SCRIPT: scripts/release-ordering.sh
+        run: |
+          set -euo pipefail
+
+          ACTIVE_RELEASE="active-release.env"
+          if [ ! -f "$ACTIVE_RELEASE" ]; then
+            echo "::error::Required release file is missing: ${ACTIVE_RELEASE}"
+            exit 1
+          fi
+          test "$(grep -c '^FERRITE_VERSION=' "$ACTIVE_RELEASE")" -eq 1
+          RAW_VERSION="$(sed -n 's/^FERRITE_VERSION=//p' "$ACTIVE_RELEASE")"
+          # Normalize exactly once for the entire workflow. The tag job
+          # consumes this output and never strips a prefix again.
+          VERSION="${RAW_VERSION#v}"
+          # The trusted shared validator (not a locally duplicated regex)
+          # enforces strict SemVer 2.0: it rejects a leading zero in the
+          # core (e.g. "01.2.3") AND in any purely-numeric pre-release
+          # identifier (e.g. "1.2.3-01"), which a looser shape-only regex
+          # would silently accept.
+          if ! bash "$ORDER_SCRIPT" validate "$VERSION"; then
+            echo "::error::active-release.env contains a canonical version that fails strict SemVer 2.0 validation (leading zeros in the core or a numeric pre-release identifier are rejected): ${VERSION}"
+            exit 1
+          fi
+
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+  tag:
+    name: Validate and tag merged release
+    needs: resolve
+    runs-on: ubuntu-latest
+    # Keyed on the canonical version (not the commit SHA), so a retried or
+    # duplicate push for the SAME version serializes instead of racing a
+    # concurrent tag creation/push; cancel-in-progress is false because a
+    # git tag push must run to completion rather than be cut off mid-flight.
+    concurrency:
+      group: ferrite-ops-tag-${{ needs.resolve.outputs.version }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+
+      - name: Validate canonical ops release
+        id: release
+        env:
+          MERGED_SHA: ${{ github.sha }}
+          PREVIOUS_SHA: ${{ github.event.before }}
+          VERSION: ${{ needs.resolve.outputs.version }}
+          ORDER_SCRIPT: scripts/release-ordering.sh
+        run: |
+          set -euo pipefail
+
+          ACTIVE_RELEASE="active-release.env"
+          DOCKERFILES=(Dockerfile Dockerfile.moonshot Dockerfile.playground)
+          PRIMARY_CHART="charts/ferrite/Chart.yaml"
+          SIDECAR_CHART="charts/ferrite-sidecar/Chart.yaml"
+          ARGOCD_PRODUCTION="gitops/argocd/overlays/production.yaml"
+          FLUX_PRODUCTION="gitops/flux/overlays/production.yaml"
+
+          for target in \
+            "$ACTIVE_RELEASE" \
+            "${DOCKERFILES[@]}" \
+            "$PRIMARY_CHART" \
+            "$SIDECAR_CHART" \
+            "$ARGOCD_PRODUCTION" \
+            "$FLUX_PRODUCTION"; do
+            if [ ! -f "$target" ]; then
+              echo "::error::Required release file is missing: ${target}"
+              exit 1
+            fi
+          done
+
+          test "$(grep -c '^FERRITE_VERSION=' "$ACTIVE_RELEASE")" -eq 1
+          test "$(grep -c '^FERRITE_SOURCE_SHA256=' "$ACTIVE_RELEASE")" -eq 1
+          RAW_VERSION="$(sed -n 's/^FERRITE_VERSION=//p' "$ACTIVE_RELEASE")"
+          SHA256="$(sed -n 's/^FERRITE_SOURCE_SHA256=//p' "$ACTIVE_RELEASE")"
+          case "$RAW_VERSION" in
+            "$VERSION"|"v${VERSION}") ;;
+            *)
+              echo "::error::active-release.env changed after the resolve job (${RAW_VERSION} != ${VERSION})"
+              exit 1
+              ;;
+          esac
+          # Trusted shared validator (see the "resolve" job above): rejects
+          # leading zeros in the core or in a numeric pre-release identifier.
+          if ! bash "$ORDER_SCRIPT" validate "$VERSION"; then
+            echo "::error::active-release.env contains a canonical version that fails strict SemVer 2.0 validation: ${VERSION}"
+            exit 1
+          fi
+          if ! printf '%s\n' "$SHA256" | grep -qE '^[0-9a-f]{64}$'; then
+            echo "::error::active-release.env contains an invalid canonical source SHA256"
+            exit 1
+          fi
+          if [ "$(git rev-parse HEAD)" != "$MERGED_SHA" ]; then
+            echo "::error::Checked-out commit does not match the merged push commit"
+            exit 1
+          fi
+          if ! printf '%s\n' "$PREVIOUS_SHA" |
+            grep -qE '^([0-9a-f]{40}|[0-9a-f]{64})$'; then
+            echo "::error::Push event contains an invalid previous main SHA"
+            exit 1
+          fi
+
+          ZERO_SHA40="0000000000000000000000000000000000000000"
+          ZERO_SHA64="${ZERO_SHA40}000000000000000000000000"
+          if [ "$PREVIOUS_SHA" != "$ZERO_SHA40" ] &&
+            [ "$PREVIOUS_SHA" != "$ZERO_SHA64" ]; then
+            if ! git cat-file -e "${PREVIOUS_SHA}^{commit}" 2>/dev/null; then
+              echo "::error::Previous main commit is unavailable: ${PREVIOUS_SHA}"
+              exit 1
+            fi
+
+            if git cat-file -e "${PREVIOUS_SHA}:active-release.env" 2>/dev/null; then
+              PREVIOUS_ENV="$(git show "${PREVIOUS_SHA}:active-release.env")"
+              if [ "$(printf '%s\n' "$PREVIOUS_ENV" | grep -c '^FERRITE_VERSION=')" -ne 1 ]; then
+                echo "::error::Previous main release metadata does not define FERRITE_VERSION exactly once"
+                exit 1
+              fi
+              PREVIOUS_RAW_VERSION="$(printf '%s\n' "$PREVIOUS_ENV" |
+                sed -n 's/^FERRITE_VERSION=//p')"
+              PREVIOUS_VERSION="${PREVIOUS_RAW_VERSION#v}"
+              if ! bash "$ORDER_SCRIPT" validate "$PREVIOUS_VERSION"; then
+                echo "::error::Previous main release metadata contains an invalid version: ${PREVIOUS_RAW_VERSION}"
+                exit 1
+              fi
+
+              PRECEDENCE="$(bash "$ORDER_SCRIPT" semver-cmp "$VERSION" "$PREVIOUS_VERSION")"
+              if [ "$PRECEDENCE" != "gt" ]; then
+                echo "::error::Canonical release ${VERSION} is not strictly newer than the currently shipped ${PREVIOUS_VERSION}; refusing a release rollback or duplicate release metadata push."
+                exit 1
+              fi
+              echo "::notice::Canonical release ${VERSION} advances the previously shipped ${PREVIOUS_VERSION}."
+            else
+              echo "::notice::Previous main commit has no active-release.env; allowing the initial canonical release."
+            fi
+          else
+            echo "::notice::Repository has no previous main commit; allowing the initial canonical release."
+          fi
+
+          for dockerfile in "${DOCKERFILES[@]}"; do
+            test "$(grep -c '^ARG FERRITE_VERSION=' "$dockerfile")" -eq 1
+            test "$(grep -c '^ARG FERRITE_SOURCE_SHA256=' "$dockerfile")" -eq 1
+            grep -qx "ARG FERRITE_VERSION=${VERSION}" "$dockerfile"
+            grep -qx "ARG FERRITE_SOURCE_SHA256=${SHA256}" "$dockerfile"
+          done
+          grep -qx "version: ${VERSION}" "$PRIMARY_CHART"
+          grep -qx "appVersion: \"${VERSION}\"" "$PRIMARY_CHART"
+          grep -qx "appVersion: \"${VERSION}\"" "$SIDECAR_CHART"
+          grep -qx "    targetRevision: ferrite-ops-v${VERSION}" "$ARGOCD_PRODUCTION"
+          grep -A1 '^        - name: image.tag$' "$ARGOCD_PRODUCTION" |
+            grep -qx "          value: \"${VERSION}\""
+          grep -qx "    tag: ferrite-ops-v${VERSION}" "$FLUX_PRODUCTION"
+          grep -qx "      repository: ghcr.io/ferritelabs/ferrite" "$FLUX_PRODUCTION"
+          grep -qx "      tag: \"${VERSION}\"" "$FLUX_PRODUCTION"
+          if grep -Eq 'targetRevision:[[:space:]]*(HEAD|main)$|^[[:space:]]+(branch:[[:space:]]*main|tag:[[:space:]]*v[0-9])$' \
+            "$ARGOCD_PRODUCTION" "$FLUX_PRODUCTION"; then
+            echo "::error::Production GitOps sources must use the immutable ferrite-ops release tag"
+            exit 1
+          fi
+
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "tag=ferrite-ops-v${VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Create and push immutable annotated tag
+        env:
+          MERGED_SHA: ${{ github.sha }}
+          VERSION: ${{ steps.release.outputs.version }}
+          OPS_TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          set -euo pipefail
+
+          if ! printf '%s\n' "$OPS_TAG" | grep -qE '^ferrite-ops-v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?$'; then
+            echo "::error::Invalid immutable ops tag: ${OPS_TAG}"
+            exit 1
+          fi
+          if [ "$OPS_TAG" != "ferrite-ops-v${VERSION}" ]; then
+            echo "::error::Immutable ops tag does not match the canonical version"
+            exit 1
+          fi
+          if [ "$(git rev-parse HEAD)" != "$MERGED_SHA" ]; then
+            echo "::error::Refusing to tag a commit other than the merged push commit"
+            exit 1
+          fi
+          if git rev-parse --verify --quiet "refs/tags/${OPS_TAG}" >/dev/null; then
+            echo "::error::Immutable ops tag already exists locally: ${OPS_TAG}"
+            exit 1
+          fi
+
+          remote_status=0
+          git ls-remote --exit-code --tags origin "refs/tags/${OPS_TAG}" >/dev/null 2>&1 ||
+            remote_status=$?
+          case "$remote_status" in
+            0)
+              echo "::error::Immutable ops tag already exists on origin: ${OPS_TAG}"
+              exit 1
+              ;;
+            2) ;;
+            *)
+              echo "::error::Could not verify whether ${OPS_TAG} already exists on origin"
+              exit 1
+              ;;
+          esac
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "$OPS_TAG" "$MERGED_SHA" -m "Ferrite ops release ${VERSION}"
+
+          # The immutable target is the push event's exact SHA, not whatever
+          # commit main happens to point at when this queued job eventually
+          # runs. The version-scoped concurrency group serializes duplicate
+          # events for this tag, the remote preflight above gives a clear
+          # error for an existing tag, and this ordinary non-force ref push
+          # is the final server-side non-overwrite guard if another writer
+          # creates the same tag between the preflight and this command.
+          if ! git push origin \
+            "refs/tags/${OPS_TAG}:refs/tags/${OPS_TAG}"; then
+            echo "::error::Immutable ops tag push was rejected. The tag may have been created concurrently; refusing to overwrite or rebind it."
+            exit 1
+          fi

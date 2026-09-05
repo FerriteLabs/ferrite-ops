@@ -1,12 +1,12 @@
 # Ferrite RPM Spec File
 
 Name:           ferrite
-Version:        0.3.0
+Version:        0.4.0
 Release:        1%{?dist}
 Summary:        High-performance, tiered-storage key-value store
 
 License:        Apache-2.0
-URL:            https://ferrite.rs
+URL:            https://github.com/ferritelabs/ferrite
 Source0:        %{name}-%{version}.tar.gz
 
 BuildRequires:  rust >= 1.80

@@ -31,7 +31,7 @@ spec:
 
   values:
     image:
-      repository: ferritelabs/ferrite
+      repository: ghcr.io/ferritelabs/ferrite
       tag: "latest"
       pullPolicy: IfNotPresent
 

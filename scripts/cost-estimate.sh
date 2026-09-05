@@ -45,6 +45,9 @@ OPTIONS:
     --dataset-size <GB>    Total dataset size in GB (default: 100)
     --hot-ratio <0.0-1.0>  Fraction of data accessed frequently (default: 0.2)
     --cloud <aws|gcp|azure> Cloud provider (default: aws)
+    --region <name>         Cloud region, shown in the report for reference
+                            only; pricing does not currently vary by region
+                            (default: none)
     --replication <N>       Replication factor (default: 1)
     -h, --help              Show this help
 
@@ -62,6 +65,7 @@ while [[ $# -gt 0 ]]; do
         --dataset-size) DATASET_SIZE_GB="$2"; shift 2 ;;
         --hot-ratio) HOT_RATIO="$2"; shift 2 ;;
         --cloud) CLOUD="$2"; shift 2 ;;
+        --region) REGION="$2"; shift 2 ;;
         --replication) REPLICATION="$2"; shift 2 ;;
         -h|--help) usage ;;
         *) echo "Unknown option: $1"; usage ;;
@@ -128,6 +132,9 @@ echo "  ────────────────────────
 printf "  Dataset Size:      %'d GB\n" "$DATASET_SIZE_GB"
 printf "  Hot Data Ratio:    %.0f%%\n" "$(echo "$HOT_RATIO * 100" | bc)"
 printf "  Cloud Provider:    %s\n" "$CLOUD_NAME"
+if [ -n "$REGION" ]; then
+    printf "  Region:            %s\n" "$REGION"
+fi
 printf "  Replication:       %dx\n" "$REPLICATION"
 echo ""
 echo "  Redis (memory-only)                        Monthly Cost"

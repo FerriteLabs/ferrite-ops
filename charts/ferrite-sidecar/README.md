@@ -195,7 +195,7 @@ helm install ferrite-cache ./charts/ferrite-sidecar \
 | Parameter | Description | Default |
 |-----------|-------------|---------|
 | `sidecar.image.repository` | Sidecar Ferrite image repository | `ghcr.io/ferritelabs/ferrite` |
-| `sidecar.image.tag` | Sidecar Ferrite image tag | `latest` |
+| `sidecar.image.tag` | Sidecar Ferrite image tag (defaults to the chart `appVersion`) | `""` |
 | `sidecar.resources.requests.cpu` | Sidecar CPU request | `100m` |
 | `sidecar.resources.requests.memory` | Sidecar memory request | `256Mi` |
 | `sidecar.resources.limits.cpu` | Sidecar CPU limit | `500m` |
@@ -384,4 +384,4 @@ kubectl label namespace my-app ferrite.dev/inject=enabled
 
 ## Documentation
 
-See the full documentation at [ferrite.dev/docs/deployment/kubernetes-sidecar](https://ferrite.dev/docs/deployment/kubernetes-sidecar).
+See this chart's maintained documentation in the [Ferrite sidecar chart README](https://github.com/ferritelabs/ferrite-ops/blob/main/charts/ferrite-sidecar/README.md).

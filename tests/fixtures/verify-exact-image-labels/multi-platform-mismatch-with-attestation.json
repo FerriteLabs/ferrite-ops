@@ -1,0 +1,15 @@
+{
+  "manifest": {
+    "digest": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+    "manifests": [
+      {"digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111", "platform": {"os": "linux", "architecture": "amd64"}},
+      {"digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222", "platform": {"os": "linux", "architecture": "arm64"}},
+      {"digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333", "platform": {"os": "unknown", "architecture": "unknown"}, "annotations": {"vnd.docker.reference.type": "attestation-manifest"}}
+    ]
+  },
+  "image": {
+    "linux/amd64": {"config": {"Labels": {"org.opencontainers.image.version": "1.2.3", "dev.ferritelabs.image.source-sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}},
+    "linux/arm64": {"config": {"Labels": {"org.opencontainers.image.version": "1.2.3", "dev.ferritelabs.image.source-sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}}},
+    "unknown/unknown": {"config": {"Labels": {"moby.buildkit.buildinfo.v1": "attestation"}}}
+  }
+}

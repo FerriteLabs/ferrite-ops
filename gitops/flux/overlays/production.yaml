@@ -8,8 +8,8 @@ spec:
   interval: 10m
   url: https://github.com/ferritelabs/ferrite-ops.git
   ref:
-    # Pin to a release tag in production.
-    tag: v0.3.0
+    # Pin to an immutable ferrite-ops release tag in production.
+    tag: ferrite-ops-v0.4.0
 ---
 apiVersion: helm.toolkit.fluxcd.io/v2
 kind: HelmRelease
@@ -32,8 +32,8 @@ spec:
 
   values:
     image:
-      repository: ferritelabs/ferrite
-      tag: "0.3.0"
+      repository: ghcr.io/ferritelabs/ferrite
+      tag: "0.4.0"
       pullPolicy: IfNotPresent
 
     replicaCount: 3

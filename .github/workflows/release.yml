@@ -8,27 +8,298 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Image tag (e.g. v0.1.0 or latest)'
+        description: 'Ferrite release version (e.g. v0.4.0 or 0.4.0)'
         required: true
-        default: 'latest'
+        default: 'v0.4.0'
 
+# NOTE: this workflow only builds, signs, and publishes the Ferrite image.
+# Chart, Dockerfile-default, Compose, GitOps, Terraform, and packaging pin
+# updates are handled exclusively by version-sync.yml, which is triggered by
+# the same `ferrite-release` repository_dispatch event core emits — keeping
+# exactly one workflow responsible for that comprehensive update instead of
+# a second, partial chart-only bump racing it.
+#
+# Release model — the exact version tag is immutable end-to-end:
+#   0. prepare — the ONE trusted place that derives this run's release
+#      version from the triggering event and normalizes it (stripping an
+#      optional leading "v") BEFORE any build, scan, sign, or registry write
+#      happens. Every job below consumes prepare's validated, normalized
+#      `version` output instead of re-deriving it from raw event data. This
+#      is deliberately NOT a workflow-level `concurrency:` keyed on the raw
+#      event value: a `v1.2.3` tag push and a `1.2.3` workflow_dispatch input
+#      describe the exact SAME release but would produce two DIFFERENT raw
+#      concurrency-group strings and never serialize against each other.
+#      Instead, one release-transaction job carries a job-level
+#      `concurrency:` keyed on prepare's normalized version, so any two runs
+#      — however differently the version was spelled — that resolve to the
+#      same normalized version always queue behind each other for the ENTIRE
+#      candidate-build-through-exact-promotion transaction.
+#   1. release-transaction — first checks whether the exact version tag already
+#      exists on GHCR (a previous, successful run of this exact version). If
+#      it does, its signature and its baked version/source-checksum labels
+#      are verified against what this run would publish: a match is treated
+#      as an already-complete, idempotent release (no rebuild, no
+#      replacement); a mismatch or an unsigned/unverifiable existing tag
+#      FAILS the run outright rather than silently diverging from it.
+#      Otherwise, this job builds the multi-arch image and pushes ONLY a
+#      unique, throwaway CANDIDATE tag (`candidate-<run id>-<run attempt>`)
+#      — never the exact version tag itself — then scans it with Trivy,
+#      signs it with cosign, and generates/attaches/attests its SBOM and SLSA
+#      provenance, all against that candidate tag/digest.
+#      It then verifies the signature and SBOM attestation and runs a live
+#      smoke test against the resolved digest (the candidate's, or the
+#      pre-existing tag's, in the idempotent case).
+#   2. Exact promotion — ONLY after every prior transaction step succeeds,
+#      the same locked job
+#      promotes that fully verified digest to the real, immutable exact
+#      version tag with `docker buildx imagetools create` (no rebuild). It
+#      re-checks immediately beforehand whether the exact tag already exists;
+#      an existing tag with a matching digest is left alone (idempotent
+#      no-op), and one with a *different* digest is refused outright — on
+#      GHCR and, independently, on the optional Docker Hub mirror (copied
+#      with a real cross-registry blob copy — see the exact-promotion step
+#      below — and digest-verified after the copy, since `imagetools create`
+#      does not reliably copy blob content across DIFFERENT registries).
+#      Because exact promotion remains inside the version-locked transaction
+#      and runs only once build, verify, and smoke-test have all succeeded,
+#      a failed run can never leave an
+#      unverified exact tag behind: the exact tag is the LAST thing this
+#      workflow ever writes, not the first. The throwaway candidate tag is
+#      NOT the exact tag and is left in the registry as a harmless,
+#      clearly-named build artifact; registry-level retention/cleanup of
+#      candidate-* tags is intentionally out of scope here (see AUDIT.md).
+#   3. reconcile-release-tags.yml runs after this workflow succeeds. It
+#      ignores the triggering release as a source of desired state and
+#      instead enumerates every paginated GHCR package version, accepts only
+#      signed immutable exact stable SemVer tags with matching version/source
+#      metadata, and computes the maxima for `latest`, every major, and every
+#      major.minor series. Manual and scheduled runs repair missed/coalesced
+#      events and stale or missing floating tags from the same complete state.
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository_owner }}/ferrite
   DOCKERHUB_IMAGE: ferritelabs/ferrite
 
 jobs:
-  build-and-push:
-    name: Build & Push Docker Image
+  # ── Step 0: Derive and validate this run's normalized release version ──────
+  # The ONLY place in this workflow that determines the release version from
+  # the triggering event, strips an optional leading "v", and validates it
+  # (both a loose shape check and the shared strict-SemVer validator). Every
+  # other job consumes this job's `version` output instead of re-deriving it
+  # from raw event data, and release-transaction keys its one job-level
+  # `concurrency:` group on this exact, normalized value — so a
+  # `v1.2.3` tag push and a `1.2.3` workflow_dispatch input, which describe
+  # the identical release but would otherwise produce two different raw
+  # strings, always serialize against each other instead of racing.
+  prepare:
+    name: Prepare Release
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.release_meta.outputs.version }}
+      sha256: ${{ steps.release_meta.outputs.sha256 }}
+      major: ${{ steps.release_meta.outputs.major }}
+      major_minor: ${{ steps.release_meta.outputs.major_minor }}
+      stable: ${{ steps.release_meta.outputs.stable }}
+      candidate_tag: ${{ steps.release_meta.outputs.candidate_tag }}
+      build_args: ${{ steps.release_meta.outputs.build_args }}
+      certificate_identity_regexp: ${{ steps.release_meta.outputs.certificate_identity_regexp }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # Determine the Ferrite source version to bake into this image, from
+      # whichever trigger fired this workflow, and its verified source
+      # tarball checksum. This is passed explicitly to the Docker build
+      # below via FERRITE_VERSION/FERRITE_SOURCE_SHA256 build-args rather
+      # than relying on the Dockerfile's pinned defaults, so that release
+      # images are always built from the exact version this workflow run
+      # is releasing. Also derives a unique, throwaway candidate tag for
+      # this specific run/attempt — the exact version tag is never pushed
+      # directly; it is only created at the end of the locked transaction
+      # from a fully verified candidate digest.
+      - name: Determine release version and source checksum
+        id: release_meta
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          WORKFLOW_REF: ${{ github.ref }}
+          DISPATCH_VERSION: ${{ github.event.client_payload.version }}
+          WORKFLOW_TAG: ${{ inputs.tag }}
+          REPOSITORY: ${{ github.repository }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          ORDER_SCRIPT: scripts/release-ordering.sh
+          CHECKSUM_SCRIPT: scripts/compute-source-checksum.sh
+        run: |
+          set -euo pipefail
+
+          RAW_VERSION=""
+          case "$EVENT_NAME" in
+            push)
+              # Triggered by a `v*` tag push; GITHUB_REF_NAME is the tag itself.
+              RAW_VERSION="${GITHUB_REF_NAME}"
+              ;;
+            repository_dispatch)
+              RAW_VERSION="$DISPATCH_VERSION"
+              ;;
+            workflow_dispatch)
+              RAW_VERSION="$WORKFLOW_TAG"
+              ;;
+            *)
+              echo "::error::Unsupported release event: ${EVENT_NAME}"
+              exit 1
+              ;;
+          esac
+
+          # Tags/payloads may use either "v0.4.0" or "0.4.0"; normalize.
+          VERSION="${RAW_VERSION#v}"
+
+          if [ -z "$VERSION" ]; then
+            echo "::error::Could not determine a Ferrite release version from event '${EVENT_NAME}'."
+            exit 1
+          fi
+
+          if ! printf '%s\n' "$VERSION" |
+            grep -qE '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?$'; then
+            echo "::error::Invalid semver version derived for this release: '${VERSION}'"
+            exit 1
+          fi
+          # Belt-and-suspenders: also run the shared strict-SemVer validator
+          # (rejects leading zeros in the core or a numeric pre-release
+          # identifier), so a release can never publish a version that the
+          # rest of the release/version-sync/supersession tooling would
+          # refuse to compare correctly.
+          if ! bash "$ORDER_SCRIPT" validate "$VERSION"; then
+            echo "::error::Version '${VERSION}' failed strict SemVer validation"
+            exit 1
+          fi
+          if ! printf '%s\n' "$REPOSITORY" | grep -qE '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$'; then
+            echo "::error::Invalid repository identity"
+            exit 1
+          fi
+          if [ -z "$DEFAULT_BRANCH" ] ||
+            ! git check-ref-format "refs/heads/${DEFAULT_BRANCH}" >/dev/null 2>&1; then
+            echo "::error::Could not determine a valid configured default branch"
+            exit 1
+          fi
+
+          # Pair each accepted event with the only ref it is trusted to use.
+          # This runs before checksum retrieval and before any job with
+          # registry credentials or write permissions can start.
+          case "$EVENT_NAME" in
+            push)
+              EXPECTED_REF="refs/tags/v${VERSION}"
+              if [ "$WORKFLOW_REF" != "$EXPECTED_REF" ] ||
+                [ "$RAW_VERSION" != "v${VERSION}" ]; then
+                echo "::error::Push releases must run on the exact candidate tag ${EXPECTED_REF}; got ref '${WORKFLOW_REF}' and tag '${RAW_VERSION}'."
+                exit 1
+              fi
+              ;;
+            repository_dispatch|workflow_dispatch)
+              DEFAULT_REF="refs/heads/${DEFAULT_BRANCH}"
+              if [ "$WORKFLOW_REF" != "refs/heads/main" ] &&
+                [ "$WORKFLOW_REF" != "$DEFAULT_REF" ]; then
+                echo "::error::Dispatch releases must run on refs/heads/main or the configured default branch ${DEFAULT_REF}; got '${WORKFLOW_REF}'."
+                exit 1
+              fi
+              ;;
+          esac
+
+          REGEX_REPOSITORY="$(python3 - "$REPOSITORY" <<'PYEOF'
+          import re
+          import sys
+          print(re.escape(sys.argv[1]))
+          PYEOF
+          )"
+          REGEX_VERSION="$(python3 - "$VERSION" <<'PYEOF'
+          import re
+          import sys
+          print(re.escape(sys.argv[1]))
+          PYEOF
+          )"
+          REGEX_DEFAULT_BRANCH="$(python3 - "$DEFAULT_BRANCH" <<'PYEOF'
+          import re
+          import sys
+          print(re.escape(sys.argv[1]))
+          PYEOF
+          )"
+          TRUSTED_REFS="tags/v${REGEX_VERSION}|heads/main"
+          if [ "$DEFAULT_BRANCH" != "main" ]; then
+            TRUSTED_REFS="${TRUSTED_REFS}|heads/${REGEX_DEFAULT_BRANCH}"
+          fi
+          CERTIFICATE_IDENTITY_REGEXP="^https://github\\.com/${REGEX_REPOSITORY}/\\.github/workflows/release\\.yml@refs/(${TRUSTED_REFS})$"
+
+          # Shared with version-sync.yml and release-orchestration.yml so
+          # every workflow that needs the canonical Ferrite source checksum
+          # computes it the exact same way. release.yml has no
+          # caller-supplied checksum input of its own; the helper always
+          # downloads and computes the canonical value fresh.
+          REPOSITORY_OWNER="${REPOSITORY%%/*}"
+          CHECKSUM_ERR_LOG="$(mktemp)"
+          trap 'rm -f "$CHECKSUM_ERR_LOG"' EXIT
+          if ! SHA256="$(bash "$CHECKSUM_SCRIPT" "$REPOSITORY_OWNER" "$VERSION" 2>"$CHECKSUM_ERR_LOG")"; then
+            echo "::error::$(cat "$CHECKSUM_ERR_LOG")"
+            exit 1
+          fi
+          cat "$CHECKSUM_ERR_LOG" >&2
+
+          echo "::notice::Building Ferrite v${VERSION} (source SHA256: ${SHA256})"
+
+          MAJOR="${VERSION%%.*}"
+          MAJOR_MINOR="${VERSION%.*}"
+          if [[ "$VERSION" == *-* ]]; then
+            STABLE=false
+          else
+            STABLE=true
+          fi
+
+          # Unique per run AND per retry attempt: a re-run of a failed
+          # attempt gets its own candidate tag rather than reusing one that
+          # may have failed mid-build.
+          CANDIDATE_TAG="candidate-${RUN_ID}-${RUN_ATTEMPT}"
+
+          {
+            echo "version=${VERSION}"
+            echo "sha256=${SHA256}"
+            echo "major=${MAJOR}"
+            echo "major_minor=${MAJOR_MINOR}"
+            echo "stable=${STABLE}"
+            echo "candidate_tag=${CANDIDATE_TAG}"
+            echo "certificate_identity_regexp=${CERTIFICATE_IDENTITY_REGEXP}"
+            echo "build_args<<FERRITE_BUILD_ARGS_EOF"
+            printf 'FERRITE_VERSION=%s\n' "$VERSION"
+            printf 'FERRITE_SOURCE_SHA256=%s\n' "$SHA256"
+            echo "FERRITE_BUILD_ARGS_EOF"
+          } >> "$GITHUB_OUTPUT"
+
+  release-transaction:
+    name: Release Transaction
+    needs: prepare
+    runs-on: ubuntu-latest
+    # One lock covers the complete exact-release transaction: existing-tag
+    # check, candidate build, scan, signing/attestation, verification, smoke
+    # test, and exact-tag promotion. A duplicate run cannot enter after a
+    # build lock is released but before promotion because there is no lock
+    # gap and no second exact-promotion job.
+    concurrency:
+      group: ferrite-release-exact-${{ needs.prepare.outputs.version }}
+      cancel-in-progress: false
     permissions:
       contents: read
       packages: write
       id-token: write
       attestations: write
     outputs:
-      digest: ${{ steps.build.outputs.digest }}
+      digest: ${{ steps.artifact.outputs.digest }}
       image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+      version: ${{ needs.prepare.outputs.version }}
+      major: ${{ needs.prepare.outputs.major }}
+      major_minor: ${{ needs.prepare.outputs.major_minor }}
+      stable: ${{ needs.prepare.outputs.stable }}
+      candidate_tag: ${{ needs.prepare.outputs.candidate_tag }}
+      idempotent: ${{ steps.check_existing.outputs.idempotent }}
+      dockerhub_enabled: ${{ steps.dockerhub.outputs.enabled }}
     steps:
       - uses: actions/checkout@v4
 
@@ -42,72 +313,266 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Determine Docker Hub publishing eligibility
+        id: dockerhub
+        env:
+          DOCKERHUB_ENABLED: ${{ vars.DOCKERHUB_ENABLED }}
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          ENABLED=false
+          if [ "$DOCKERHUB_ENABLED" = "true" ]; then
+            if [ -n "$DOCKERHUB_USERNAME" ] && [ -n "$DOCKERHUB_TOKEN" ]; then
+              ENABLED=true
+            else
+              echo "::warning::DOCKERHUB_ENABLED is true, but Docker Hub credentials are not fully configured; publishing GHCR only."
+            fi
+          fi
+          echo "enabled=${ENABLED}" >> "$GITHUB_OUTPUT"
+
       - name: Log in to Docker Hub
         uses: docker/login-action@v3
-        if: vars.DOCKERHUB_ENABLED == 'true'
+        if: steps.dockerhub.outputs.enabled == 'true'
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Extract metadata (tags, labels)
+      # Installed early so it is available both for verifying a pre-existing
+      # exact tag below AND for signing a freshly built candidate later.
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@v3
+
+      # Checks whether the exact version tag this run would publish ALREADY
+      # exists on GHCR from a previous, successful run. If so, its signature
+      # and its baked org.opencontainers.image.version / source-sha256
+      # labels are verified against this run's version/checksum:
+      #   - a full match means this version is already fully published and
+      #     verified — idempotent=true, and every build/scan/sign/attest
+      #     step below is skipped entirely (no rebuild, no replacement).
+      #   - a missing tag means this is the first publish of this exact
+      #     version — idempotent=false, proceed to build normally.
+      #   - a tag that exists but has different metadata, or that cannot be
+      #     verified with cosign, means the existing exact tag is corrupt,
+      #     unsigned, or was tampered with — this FAILS the run immediately,
+      #     before any build step runs, rather than silently diverging from
+      #     (or rebuilding over) a broken published release.
+      - name: Check existing exact GHCR tag
+        id: check_existing
+        env:
+          GHCR_IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+          SHA256: ${{ needs.prepare.outputs.sha256 }}
+          CERTIFICATE_IDENTITY_REGEXP: ${{ needs.prepare.outputs.certificate_identity_regexp }}
+          METADATA_SCRIPT: scripts/inspect-exact-image-metadata.sh
+          LABELS_SCRIPT: scripts/verify-exact-image-labels.sh
+        run: |
+          set -euo pipefail
+
+          ERR_LOG="$(mktemp)"
+          trap 'rm -f "$ERR_LOG"' EXIT
+
+          METADATA_JSON=""
+          if ! METADATA_JSON="$(bash "$METADATA_SCRIPT" "$GHCR_IMAGE" "$VERSION" 2>"$ERR_LOG")"; then
+            if grep -qiE 'not found|manifest unknown|no such manifest|MANIFEST_UNKNOWN' "$ERR_LOG"; then
+              echo "::notice::No existing ${GHCR_IMAGE}:${VERSION} tag; this is the first publish of this exact version."
+              echo "idempotent=false" >> "$GITHUB_OUTPUT"
+              echo "existing_digest=" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            echo "::error::Could not inspect the existing ${GHCR_IMAGE}:${VERSION} tag:"
+            cat "$ERR_LOG" >&2
+            exit 1
+          fi
+
+          MANIFEST_DIGEST="$(printf '%s' "$METADATA_JSON" | jq -r '.digest // empty')"
+          if [ -z "$MANIFEST_DIGEST" ]; then
+            echo "::error::${GHCR_IMAGE}:${VERSION} exists but its manifest digest could not be determined."
+            exit 1
+          fi
+
+          # Shared with reconcile-release-tags.yml's own exact-source
+          # verification step so the two workflows cannot drift. Metadata was
+          # resolved once above and its `.Image` platform/config view was read
+          # through GHCR_IMAGE@MANIFEST_DIGEST, never the mutable tag. The
+          # label helper uses descriptor metadata from `.Manifest` to exclude
+          # only BuildKit provenance/SBOM attestation entries, then requires
+          # EVERY runtime platform config in `.Image` to carry this run's
+          # exact version/checksum labels.
+          if ! printf '%s' "$METADATA_JSON" |
+            bash "$LABELS_SCRIPT" exact "$VERSION" "$SHA256" 2>"$ERR_LOG"; then
+            echo "::error::${GHCR_IMAGE}:${VERSION} already exists but at least one platform's baked metadata does not match this release exactly (expected version='${VERSION}', sha256='${SHA256}'). Refusing to silently diverge from, or rebuild over, a mismatched or mixed-platform exact tag."
+            cat "$ERR_LOG" >&2
+            exit 1
+          fi
+
+          if ! cosign verify \
+            --certificate-oidc-issuer=https://token.actions.githubusercontent.com \
+            --certificate-identity-regexp="$CERTIFICATE_IDENTITY_REGEXP" \
+            "${GHCR_IMAGE}@${MANIFEST_DIGEST}" >/dev/null 2>"$ERR_LOG"; then
+            echo "::error::${GHCR_IMAGE}:${VERSION} (${MANIFEST_DIGEST}) already exists but its signature could not be verified:"
+            cat "$ERR_LOG" >&2
+            echo "::error::Refusing to treat an unsigned or unverifiable existing exact tag as safe."
+            exit 1
+          fi
+
+          echo "::notice::${GHCR_IMAGE}:${VERSION} already exists, is verified, and matches this release exactly; treating as an idempotent no-op (no rebuild, no replacement)."
+          echo "idempotent=true" >> "$GITHUB_OUTPUT"
+          echo "existing_digest=${MANIFEST_DIGEST}" >> "$GITHUB_OUTPUT"
+
+      # The steps below publish ONLY a unique, throwaway candidate tag — the
+      # exact, immutable version tag itself is never pushed here; it is only
+      # ever created at the end of this same locked transaction, once every
+      # verification and smoke-test step below has succeeded. Every
+      # step in this block is skipped entirely when check_existing found an
+      # already-verified, matching exact tag (idempotent no-op): no rebuild,
+      # no re-signing, no re-attesting.
+      # The candidate tag itself is a throwaway, run-specific string
+      # (candidate-<run id>-<run attempt>), but the image's baked
+      # org.opencontainers.image.version label MUST be the real release
+      # SemVer: docker/metadata-action derives that label from the tag list
+      # by default, which for a bare `type=raw` tag would otherwise bake the
+      # candidate string itself into the label. check_existing's idempotent
+      # verification above and the independent reconciliation workflow both
+      # read this exact label back from the registry expecting the immutable
+      # exact SemVer value, so it is explicitly overridden here rather than
+      # left to derive from the candidate tag.
+      - name: Extract metadata (tags, labels) — GHCR candidate
         id: meta
+        if: steps.check_existing.outputs.idempotent != 'true'
         uses: docker/metadata-action@v5
         with:
-          images: |
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-            ${{ env.DOCKERHUB_IMAGE }}
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          flavor: |
+            latest=false
           tags: |
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=semver,pattern={{major}}
-            type=raw,value=latest,enable={{is_default_branch}}
-            type=raw,value=${{ inputs.tag }},enable=${{ github.event_name == 'workflow_dispatch' }}
+            type=raw,value=${{ needs.prepare.outputs.candidate_tag }}
+          labels: |
+            org.opencontainers.image.version=${{ needs.prepare.outputs.version }}
 
-      - name: Build and push (amd64 + arm64)
+      # Docker Hub is optional: this step (and therefore every Docker Hub
+      # tag) only runs when the repository variable DOCKERHUB_ENABLED is
+      # explicitly set to 'true' and both login credentials are configured
+      # — the same eligibility output that gates the "Log in to Docker Hub"
+      # step above. If the variable is unset/false or either credential is
+      # missing, this step does not run, steps.meta_dockerhub.outputs.tags
+      # is empty, and no Docker Hub tag is generated or pushed.
+      - name: Extract metadata (tags, labels) — Docker Hub candidate
+        id: meta_dockerhub
+        if: steps.check_existing.outputs.idempotent != 'true' && steps.dockerhub.outputs.enabled == 'true'
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.DOCKERHUB_IMAGE }}
+          flavor: |
+            latest=false
+          tags: |
+            type=raw,value=${{ needs.prepare.outputs.candidate_tag }}
+          labels: |
+            org.opencontainers.image.version=${{ needs.prepare.outputs.version }}
+
+      # Combine the always-on GHCR tags/labels with the optional Docker Hub
+      # tags (empty when meta_dockerhub did not run) into the single tag/
+      # label list passed to the build-push step below, so a disabled or
+      # missing DOCKERHUB_ENABLED variable never adds a Docker Hub tag.
+      - name: Combine registry tags and labels
+        id: meta_combined
+        if: steps.check_existing.outputs.idempotent != 'true'
+        env:
+          GHCR_TAGS: ${{ steps.meta.outputs.tags }}
+          GHCR_LABELS: ${{ steps.meta.outputs.labels }}
+          DOCKERHUB_TAGS: ${{ steps.meta_dockerhub.outputs.tags }}
+        run: |
+          set -euo pipefail
+          {
+            echo "tags<<FERRITE_META_TAGS_EOF"
+            printf '%s\n' "$GHCR_TAGS"
+            if [ -n "$DOCKERHUB_TAGS" ]; then
+              printf '%s\n' "$DOCKERHUB_TAGS"
+            fi
+            echo "FERRITE_META_TAGS_EOF"
+            echo "labels<<FERRITE_META_LABELS_EOF"
+            printf '%s\n' "$GHCR_LABELS"
+            echo "FERRITE_META_LABELS_EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Build and push candidate (amd64 + arm64)
         id: build
+        if: steps.check_existing.outputs.idempotent != 'true'
         uses: docker/build-push-action@v6
         with:
           context: .
           platforms: linux/amd64,linux/arm64
           push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
+          tags: ${{ steps.meta_combined.outputs.tags }}
+          labels: ${{ steps.meta_combined.outputs.labels }}
+          build-args: ${{ needs.prepare.outputs.build_args }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
           provenance: true
           sbom: true
 
-      # --- Supply Chain Security ---
+      - name: Resolve candidate or existing exact digest
+        id: artifact
+        env:
+          IDEMPOTENT: ${{ steps.check_existing.outputs.idempotent }}
+          EXISTING_DIGEST: ${{ steps.check_existing.outputs.existing_digest }}
+          BUILT_DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
 
-      - name: Install Cosign
-        uses: sigstore/cosign-installer@v3
+          if [ "$IDEMPOTENT" = "true" ]; then
+            DIGEST="$EXISTING_DIGEST"
+          else
+            DIGEST="$BUILT_DIGEST"
+          fi
+          if ! printf '%s\n' "$DIGEST" | grep -qE '^sha256:[0-9a-f]{64}$'; then
+            echo "::error::Release transaction could not resolve a valid image digest"
+            exit 1
+          fi
+          echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
+
+      # --- Supply Chain Security (candidate only) ---
+
+      - name: Scan candidate image with Trivy
+        if: steps.check_existing.outputs.idempotent != 'true'
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.artifact.outputs.digest }}
+          format: table
+          severity: CRITICAL,HIGH
+          exit-code: '1'
 
       - name: Sign container image with Cosign (keyless OIDC)
+        if: steps.check_existing.outputs.idempotent != 'true'
         env:
-          DIGEST: ${{ steps.build.outputs.digest }}
+          DIGEST: ${{ steps.artifact.outputs.digest }}
         run: |
           cosign sign --yes \
             "${REGISTRY}/${IMAGE_NAME}@${DIGEST}"
 
       - name: Generate SBOM with anchore/sbom-action
+        if: steps.check_existing.outputs.idempotent != 'true'
         uses: anchore/sbom-action@v0
         with:
-          image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.build.outputs.digest }}
+          image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.artifact.outputs.digest }}
           format: spdx-json
           output-file: sbom-spdx.json
           upload-artifact: true
 
       - name: Attach SBOM to container image
+        if: steps.check_existing.outputs.idempotent != 'true'
         env:
-          DIGEST: ${{ steps.build.outputs.digest }}
+          DIGEST: ${{ steps.artifact.outputs.digest }}
         run: |
           cosign attach sbom \
             --sbom sbom-spdx.json \
             "${REGISTRY}/${IMAGE_NAME}@${DIGEST}"
 
       - name: Attest SBOM with Cosign (keyless OIDC)
+        if: steps.check_existing.outputs.idempotent != 'true'
         env:
-          DIGEST: ${{ steps.build.outputs.digest }}
+          DIGEST: ${{ steps.artifact.outputs.digest }}
         run: |
           cosign attest --yes \
             --predicate sbom-spdx.json \
@@ -115,94 +580,169 @@ jobs:
             "${REGISTRY}/${IMAGE_NAME}@${DIGEST}"
 
       - name: Generate SLSA provenance attestation
+        if: steps.check_existing.outputs.idempotent != 'true'
         uses: actions/attest-build-provenance@v2
         with:
           subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          subject-digest: ${{ steps.build.outputs.digest }}
+          subject-digest: ${{ steps.artifact.outputs.digest }}
           push-to-registry: true
 
-  verify:
-    name: Verify Signatures & Attestations
-    runs-on: ubuntu-latest
-    needs: build-and-push
-    permissions:
-      contents: read
-      packages: read
-      id-token: write
-    steps:
-      - name: Install Cosign
-        uses: sigstore/cosign-installer@v3
-
-      - name: Log in to GitHub Container Registry
-        uses: docker/login-action@v3
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
+      # Re-verify both a fresh candidate and an idempotently reused exact
+      # digest before any live execution or exact-tag write.
       - name: Verify container signature
         env:
-          IMAGE: ${{ needs.build-and-push.outputs.image }}
-          DIGEST: ${{ needs.build-and-push.outputs.digest }}
+          IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          DIGEST: ${{ steps.artifact.outputs.digest }}
+          CERTIFICATE_IDENTITY_REGEXP: ${{ needs.prepare.outputs.certificate_identity_regexp }}
         run: |
           cosign verify \
             --certificate-oidc-issuer=https://token.actions.githubusercontent.com \
-            --certificate-identity-regexp="^https://github\\.com/${{ github.repository_owner }}/" \
+            --certificate-identity-regexp="$CERTIFICATE_IDENTITY_REGEXP" \
             "${IMAGE}@${DIGEST}"
 
       - name: Verify SBOM attestation
         env:
-          IMAGE: ${{ needs.build-and-push.outputs.image }}
-          DIGEST: ${{ needs.build-and-push.outputs.digest }}
+          IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          DIGEST: ${{ steps.artifact.outputs.digest }}
+          CERTIFICATE_IDENTITY_REGEXP: ${{ needs.prepare.outputs.certificate_identity_regexp }}
         run: |
           cosign verify-attestation \
             --type spdxjson \
             --certificate-oidc-issuer=https://token.actions.githubusercontent.com \
-            --certificate-identity-regexp="^https://github\\.com/${{ github.repository_owner }}/" \
+            --certificate-identity-regexp="$CERTIFICATE_IDENTITY_REGEXP" \
             "${IMAGE}@${DIGEST}"
 
-  # Bump Chart.yaml version when triggered by a core release
-  smoke-test:
-    name: Smoke Test Published Image
-    runs-on: ubuntu-latest
-    needs: build-and-push
-    steps:
-      - name: Pull and test image
+      - name: Smoke test verified image
         env:
-          IMAGE: ${{ needs.build-and-push.outputs.image }}
-          DIGEST: ${{ needs.build-and-push.outputs.digest }}
+          IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          DIGEST: ${{ steps.artifact.outputs.digest }}
         run: |
+          set -euo pipefail
+          trap "docker rm -f ferrite-smoke >/dev/null 2>&1 || true" EXIT
+
           docker pull "${IMAGE}@${DIGEST}"
           docker run -d --name ferrite-smoke -p 6399:6379 "${IMAGE}@${DIGEST}"
           sleep 5
-          # Verify server responds to PING
-          echo "PING" | nc -q 1 localhost 6399 | grep -q "PONG" || \
-            (echo "Smoke test failed: PING did not return PONG" && exit 1)
-          echo "Smoke test passed"
-          docker stop ferrite-smoke
-
-  bump-chart:
-    name: Bump Chart Version
-    runs-on: ubuntu-latest
-    if: github.event_name == 'repository_dispatch'
-    permissions:
-      contents: write
-      pull-requests: write
-    steps:
-      - uses: actions/checkout@v4
-      - name: Update Chart.yaml
-        run: |
-          VERSION="${{ github.event.client_payload.version }}"
-          VERSION="${VERSION#v}"
-          if [ -n "$VERSION" ]; then
-            sed -i "s/^version:.*/version: ${VERSION}/" charts/ferrite/Chart.yaml
-            sed -i "s/^appVersion:.*/appVersion: \"${VERSION}\"/" charts/ferrite/Chart.yaml
-            echo "Updated Chart.yaml to version ${VERSION}"
+          if ! echo "PING" | nc -q 1 localhost 6399 | grep -q "PONG"; then
+            echo "::error::Smoke test failed: PING did not return PONG"
+            exit 1
           fi
-      - name: Create PR for version bump
-        uses: peter-evans/create-pull-request@v6
+          echo "Smoke test passed"
+
+      # Docker Hub exact-tag backfill needs a real cross-registry blob copy.
+      - name: Set up crane
+        if: steps.dockerhub.outputs.enabled == 'true'
+        uses: imjasonh/setup-crane@v0.7
         with:
-          title: "chore: bump chart version to ${{ github.event.client_payload.version }}"
-          body: "Auto-generated by ferrite-release dispatch."
-          branch: "chart-bump-${{ github.event.client_payload.version }}"
-          labels: dependencies
+          version: v0.21.8
+
+      - name: Promote the verified digest to the exact immutable version tag
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          DIGEST: ${{ steps.artifact.outputs.digest }}
+          GHCR_IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          DOCKERHUB_IMAGE: ${{ env.DOCKERHUB_IMAGE }}
+          DOCKERHUB_ENABLED: ${{ steps.dockerhub.outputs.enabled }}
+        run: |
+          set -euo pipefail
+
+          if ! printf '%s\n' "$VERSION" |
+            grep -qE '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?$'; then
+            echo "::error::Refusing to promote an invalid exact version: ${VERSION}"
+            exit 1
+          fi
+          if ! printf '%s\n' "$DIGEST" | grep -qE '^sha256:[0-9a-f]{64}$'; then
+            echo "::error::Refusing to promote an invalid digest: ${DIGEST}"
+            exit 1
+          fi
+
+          # Promotes DIGEST to "${image}:${VERSION}" on the SAME registry as
+          # the verified source (GHCR only) unless that exact tag already
+          # exists and points elsewhere, in which case it refuses outright
+          # rather than overwriting a different, already-published exact
+          # version. An existing tag that already matches DIGEST is left
+          # untouched (idempotent no-op) instead of being re-written. Never
+          # used cross-registry — see promote_exact_tag_cross_registry below
+          # for the Docker Hub backfill, which needs a real blob copy.
+          promote_exact_tag() {
+            local image="$1"
+            local err_log existing_digest
+            err_log="$(mktemp)"
+            if existing_digest="$(docker buildx imagetools inspect "${image}:${VERSION}" --format '{{json .Manifest}}' 2>"$err_log" | jq -r '.digest // empty')" \
+              && [ -n "$existing_digest" ]; then
+              rm -f "$err_log"
+              if [ "$existing_digest" = "$DIGEST" ]; then
+                echo "::notice::${image}:${VERSION} already points at ${DIGEST}; nothing to promote (idempotent)."
+                return 0
+              fi
+              echo "::error::${image}:${VERSION} already exists but points at a DIFFERENT digest (${existing_digest} != ${DIGEST}). Refusing to overwrite an existing exact version tag."
+              return 1
+            fi
+            if grep -qiE 'not found|manifest unknown|no such manifest|MANIFEST_UNKNOWN' "$err_log"; then
+              rm -f "$err_log"
+              echo "::notice::Promoting ${image}:${VERSION} -> ${DIGEST} from verified source ${image}@${DIGEST}"
+              docker buildx imagetools create --tag "${image}:${VERSION}" "${image}@${DIGEST}"
+              return 0
+            fi
+            echo "::error::Could not determine whether ${image}:${VERSION} already exists:"
+            cat "$err_log" >&2
+            rm -f "$err_log"
+            return 1
+          }
+
+          # Cross-registry Docker Hub backfill: performs a REAL all-platform
+          # blob copy with crane (pulling every referenced layer/config from
+          # the verified GHCR source and pushing it to Docker Hub, not just
+          # referencing a manifest that may not resolve there), then
+          # independently re-reads the destination digest and asserts it is
+          # BYTE-IDENTICAL to the verified GHCR source digest before treating
+          # the promotion as successful. Once Docker Hub mirroring is enabled
+          # and eligible, only a positively identified missing tag permits a
+          # copy. Authentication, network, rate-limit, malformed-response, or
+          # any other ambiguous inspection failure aborts the exact release.
+          # Docker Hub must never overwrite a different existing digest, nor
+          # be left in a state this workflow cannot prove matches the signed,
+          # verified source.
+          promote_exact_tag_cross_registry() {
+            local dest_image="$1" source_image="$2"
+            local err_log existing_digest
+            err_log="$(mktemp)"
+            if existing_digest="$(crane digest "${dest_image}:${VERSION}" 2>"$err_log")" \
+              && [ -n "$existing_digest" ]; then
+              rm -f "$err_log"
+              if [ "$existing_digest" = "$DIGEST" ]; then
+                echo "::notice::${dest_image}:${VERSION} already points at ${DIGEST}; nothing to promote (idempotent)."
+                return 0
+              fi
+              echo "::error::${dest_image}:${VERSION} already exists but points at a DIFFERENT digest (${existing_digest} != ${DIGEST}). Refusing to overwrite an existing exact version tag."
+              return 1
+            fi
+            if grep -qiE 'manifest unknown|no such manifest|MANIFEST_UNKNOWN|NAME_UNKNOWN|not found' "$err_log"; then
+              rm -f "$err_log"
+              echo "::notice::Promoting ${dest_image}:${VERSION} -> ${DIGEST} via a real cross-registry blob copy from verified source ${source_image}@${DIGEST}"
+              crane copy "${source_image}@${DIGEST}" "${dest_image}:${VERSION}"
+              local copied_digest
+              copied_digest="$(crane digest "${dest_image}:${VERSION}")"
+              if [ "$copied_digest" != "$DIGEST" ]; then
+                echo "::error::Cross-registry copy to ${dest_image}:${VERSION} produced digest ${copied_digest}, which does not match the verified source digest ${DIGEST}."
+                return 1
+              fi
+              echo "::notice::Verified ${dest_image}:${VERSION} digest matches the verified GHCR source digest exactly."
+              return 0
+            fi
+            echo "::error::Could not determine whether ${dest_image}:${VERSION} already exists:"
+            cat "$err_log" >&2
+            rm -f "$err_log"
+            return 1
+          }
+
+          promote_exact_tag "$GHCR_IMAGE"
+
+          if [ "$DOCKERHUB_ENABLED" = "true" ]; then
+            # GHCR is the signed, metadata-verified source of truth. Copying
+            # from it also lets an idempotent retry safely backfill Docker
+            # Hub when that mirror was disabled during the original release.
+            promote_exact_tag_cross_registry "$DOCKERHUB_IMAGE" "$GHCR_IMAGE"
+          fi
+
+          echo "::notice::Exact version tag ${VERSION} is now published and verified at ${DIGEST}."

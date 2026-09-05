@@ -1,0 +1,275 @@
+# Merge-time guard that stops a stale, already-clean version-sync PR from
+# regressing the canonical release. Automated version-sync PRs are created
+# with GITHUB_TOKEN, which intentionally does not emit pull_request events.
+# This workflow therefore covers every enforcement point:
+#   - normal pull_request checks for human-created PRs,
+#   - merge_group checks at the merge queue's current base,
+#   - workflow_run reconciliation after Version Sync creates/updates a PR, and
+#   - push reconciliation whenever main advances active-release.env.
+# Reconciliation writes the same required check directly onto each automated
+# version-sync PR head, so GITHUB_TOKEN event suppression cannot bypass it.
+#
+# Trust boundary: a PR/merge-queue candidate is untrusted code. This workflow
+# NEVER executes anything from the candidate checkout. The candidate ref is
+# checked out only to read active-release.env as inert data (sed/grep), into
+# its own `candidate/` directory. The trusted base branch (the PR/merge-queue
+# base ref, i.e. main) is checked out separately into `trusted/`, and only
+# `trusted/scripts/release-ordering.sh` is ever invoked. A malicious PR that
+# replaces scripts/release-ordering.sh cannot influence this check, because
+# that file is never read from the candidate checkout at all.
+
+name: Version Supersession Check
+
+on:
+  pull_request:
+    paths:
+      - active-release.env
+  merge_group:
+    types: [checks_requested]
+  push:
+    branches: [main]
+    paths:
+      - active-release.env
+  workflow_run:
+    workflows: [Version Sync]
+    types: [completed]
+
+permissions:
+  contents: read
+
+jobs:
+  supersession:
+    name: Reject superseded release PRs
+    if: github.event_name == 'pull_request' || github.event_name == 'merge_group'
+    runs-on: ubuntu-latest
+    steps:
+      # Untrusted candidate checkout: for pull_request, the proposed PR head;
+      # for merge_group, github.sha is the merge-queue candidate. This copy
+      # is read as inert data only (sed/grep in the step below) and its
+      # scripts are never executed.
+      - name: Checkout candidate (untrusted, data only)
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          path: candidate
+          persist-credentials: false
+
+      # Trusted checkout of the PR/merge-queue base branch (main). Only this
+      # checkout's scripts/release-ordering.sh is ever invoked, so a
+      # candidate that replaces that script cannot affect the outcome.
+      - name: Checkout trusted base branch (scripts + canonical data)
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.ref || github.event.merge_group.base_ref }}
+          path: trusted
+          persist-credentials: false
+
+      - name: Reject a superseded active-release change
+        env:
+          BASE_REF: ${{ github.event.pull_request.base.ref || github.event.merge_group.base_ref }}
+          ORDER_SCRIPT: trusted/scripts/release-ordering.sh
+        run: |
+          set -euo pipefail
+
+          BASE_REF="${BASE_REF#refs/heads/}"
+
+          if [ ! -f trusted/active-release.env ]; then
+            echo "::notice::${BASE_REF} does not yet define active-release.env; allowing its initial introduction."
+            exit 0
+          fi
+
+          if [ ! -x "$ORDER_SCRIPT" ] && [ ! -f "$ORDER_SCRIPT" ]; then
+            echo "::error::Trusted ordering script not found at ${ORDER_SCRIPT}"
+            exit 1
+          fi
+
+          # Proposed values from the untrusted candidate checkout, read as
+          # inert data (sed) — never executed.
+          PR_VERSION="$(sed -n 's/^FERRITE_VERSION=//p' candidate/active-release.env)"
+          PR_SHA256="$(sed -n 's/^FERRITE_SOURCE_SHA256=//p' candidate/active-release.env)"
+
+          # Canonical values from the trusted base-branch checkout.
+          BASE_VERSION="$(sed -n 's/^FERRITE_VERSION=//p' trusted/active-release.env)"
+          BASE_SHA256="$(sed -n 's/^FERRITE_SOURCE_SHA256=//p' trusted/active-release.env)"
+
+          CLASS="$(bash "$ORDER_SCRIPT" classify \
+            "$PR_VERSION" "$PR_SHA256" "$BASE_VERSION" "$BASE_SHA256")"
+          echo "::notice::Supersession check: PR ${PR_VERSION} vs ${BASE_REF} tip ${BASE_VERSION} => ${CLASS}"
+
+          case "$CLASS" in
+            NEWER|EQUAL_SAME)
+              echo "::notice::PR active-release.env does not regress ${BASE_REF}."
+              ;;
+            EQUAL_DIFFERENT)
+              echo "::error::This PR keeps version ${PR_VERSION} but changes its source checksum relative to ${BASE_REF}. A released version's source must not be rewritten."
+              exit 1
+              ;;
+            OLDER)
+              echo "::error::This PR would downgrade active-release.env from ${BASE_VERSION} (current ${BASE_REF}) to ${PR_VERSION}. ${BASE_REF} has been superseded since this PR was opened; rebase or close it."
+              exit 1
+              ;;
+            *)
+              echo "::error::Unexpected release-ordering classification: ${CLASS}"
+              exit 1
+              ;;
+          esac
+
+  # create-pull-request uses GITHUB_TOKEN, so GitHub suppresses the
+  # pull_request event for the generated PR. Reconcile after every Version
+  # Sync run and whenever main's canonical release advances, attaching this
+  # workflow's required check directly to every open version-sync PR head.
+  #
+  # The concurrency group with cancel-in-progress serializes reconciliation:
+  # workflow_run and push reconciliation can both fire in quick succession
+  # (e.g. Version Sync completing right as main advances again), and without
+  # this, an older run finishing after a newer one could overwrite a fresh,
+  # correct check result with a stale one. Cancelling superseded in-flight
+  # runs, combined with re-reading main's tip immediately before
+  # classification/posting below, ensures the last check written always
+  # reflects the current canonical release.
+  reconcile-automated-prs:
+    name: Reconcile automated release checks
+    if: github.event_name == 'workflow_run' || github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      checks: write
+      contents: read
+      pull-requests: read
+    concurrency:
+      group: version-supersession-reconcile
+      cancel-in-progress: true
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # Re-fetch and re-read main's tip immediately before classification and
+      # posting, rather than trusting the initial checkout above. This job can
+      # queue behind the concurrency group or take time paginating PRs, and
+      # main may advance again in the meantime; reading the tip as the last
+      # step before use keeps every posted check aligned with the current
+      # canonical release instead of whatever main looked like when this run
+      # started.
+      - name: Read current main tip immediately before classification
+        id: main_tip
+        run: |
+          set -euo pipefail
+
+          git fetch --no-tags --depth=1 origin main
+          BASE_ENV="$(git show origin/main:active-release.env)"
+          BASE_VERSION="$(printf '%s\n' "$BASE_ENV" | sed -n 's/^FERRITE_VERSION=//p')"
+          BASE_SHA256="$(printf '%s\n' "$BASE_ENV" | sed -n 's/^FERRITE_SOURCE_SHA256=//p')"
+
+          if ! printf '%s\n' "$BASE_VERSION" |
+            grep -qE '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?$'; then
+            echo "::error::origin/main contains an invalid canonical version"
+            exit 1
+          fi
+          if ! printf '%s\n' "$BASE_SHA256" | grep -qE '^[0-9a-f]{64}$'; then
+            echo "::error::origin/main contains an invalid canonical checksum"
+            exit 1
+          fi
+
+          echo "version=${BASE_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "sha256=${BASE_SHA256}" >> "$GITHUB_OUTPUT"
+          echo "::notice::Reconciling against main tip ${BASE_VERSION} (read immediately before classification)."
+
+      - name: Check every open automated version-sync PR
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          ORDER_SCRIPT: scripts/release-ordering.sh
+          BASE_VERSION: ${{ steps.main_tip.outputs.version }}
+          BASE_SHA256: ${{ steps.main_tip.outputs.sha256 }}
+        run: |
+          set -euo pipefail
+
+          ACTIVE_RELEASE="active-release.env"
+          TMP_DIR="$(mktemp -d)"
+          trap 'rm -rf "$TMP_DIR"' EXIT
+
+          PRS="$(gh api --paginate "repos/${REPOSITORY}/pulls?state=open&per_page=100" \
+            --jq '.[] |
+              select(.base.ref == "main") |
+              select(.head.ref | startswith("version-sync/")) |
+              [.number, .head.sha, .head.ref] | @tsv')"
+
+          if [ -z "$PRS" ]; then
+            echo "::notice::No open automated version-sync PRs require reconciliation."
+            exit 0
+          fi
+
+          RECONCILE_ERRORS=0
+          while IFS=$'\t' read -r PR_NUMBER HEAD_SHA HEAD_REF; do
+            PR_ENV="${TMP_DIR}/active-release-${PR_NUMBER}.env"
+            CLASS="ERROR"
+            CONCLUSION="failure"
+            TITLE="Unable to validate release ordering"
+            SUMMARY="PR #${PR_NUMBER} (${HEAD_REF}) could not be validated and must not merge until this check succeeds."
+
+            if ! gh api "repos/${REPOSITORY}/contents/${ACTIVE_RELEASE}?ref=${HEAD_SHA}" \
+              --jq '.content' | tr -d '\n' | base64 --decode > "$PR_ENV"; then
+              echo "::error::Could not read active-release.env from PR #${PR_NUMBER} (${HEAD_SHA})."
+              RECONCILE_ERRORS=1
+            else
+              PR_VERSION="$(sed -n 's/^FERRITE_VERSION=//p' "$PR_ENV")"
+              PR_SHA256="$(sed -n 's/^FERRITE_SOURCE_SHA256=//p' "$PR_ENV")"
+              CLASS_ERROR="${TMP_DIR}/classify-${PR_NUMBER}.err"
+              if CLASS="$(bash "$ORDER_SCRIPT" classify \
+                "$PR_VERSION" "$PR_SHA256" "$BASE_VERSION" "$BASE_SHA256" \
+                2>"$CLASS_ERROR")"; then
+                CONCLUSION="success"
+                TITLE="Release ordering is current"
+                SUMMARY="PR #${PR_NUMBER} (${HEAD_REF}) proposes ${PR_VERSION}; main is ${BASE_VERSION}. Classification: ${CLASS}."
+                case "$CLASS" in
+                  NEWER|EQUAL_SAME)
+                    ;;
+                  OLDER)
+                    CONCLUSION="failure"
+                    TITLE="Release PR is superseded"
+                    SUMMARY="${SUMMARY} This PR would downgrade active-release.env and must not merge."
+                    ;;
+                  EQUAL_DIFFERENT)
+                    CONCLUSION="failure"
+                    TITLE="Released source checksum changed"
+                    SUMMARY="${SUMMARY} A released version's source checksum must not be rewritten."
+                    ;;
+                  *)
+                    CONCLUSION="failure"
+                    TITLE="Invalid release-ordering result"
+                    SUMMARY="PR #${PR_NUMBER} produced an unexpected ordering result and must not merge."
+                    RECONCILE_ERRORS=1
+                    ;;
+                esac
+              else
+                echo "::error::PR #${PR_NUMBER} contains invalid release metadata."
+                RECONCILE_ERRORS=1
+              fi
+            fi
+
+            if ! jq -n \
+              --arg name "Reject superseded release PRs" \
+              --arg head_sha "$HEAD_SHA" \
+              --arg conclusion "$CONCLUSION" \
+              --arg title "$TITLE" \
+              --arg summary "$SUMMARY" \
+              '{
+                name: $name,
+                head_sha: $head_sha,
+                status: "completed",
+                conclusion: $conclusion,
+                output: {title: $title, summary: $summary}
+              }' |
+              gh api --method POST "repos/${REPOSITORY}/check-runs" --input -; then
+              echo "::error::Could not write the supersession check for PR #${PR_NUMBER}."
+              RECONCILE_ERRORS=1
+              continue
+            fi
+
+            echo "::notice::PR #${PR_NUMBER}: ${CLASS} (${CONCLUSION})"
+          done <<< "$PRS"
+
+          if [ "$RECONCILE_ERRORS" -ne 0 ]; then
+            echo "::error::One or more automated release PRs could not be fully reconciled."
+            exit 1
+          fi

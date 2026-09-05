@@ -9,7 +9,7 @@ services:
   ferrite:
     # Pin to a specific version for reproducible deployments
     # Update to latest release: https://github.com/ferritelabs/ferrite/releases
-    image: ghcr.io/ferritelabs/ferrite:0.3.0
+    image: ghcr.io/ferritelabs/ferrite:0.4.0
     ports:
       - "6379:6379"      # RESP protocol (Redis-compatible)
       - "8080:8080"      # Studio web UI
@@ -18,7 +18,7 @@ services:
       - RUST_LOG=ferrite=info
       - FERRITE_STUDIO_ENABLED=true    # Experimental web UI (may be unstable)
     healthcheck:
-      test: ["CMD", "redis-cli", "-p", "6379", "PING"]
+      test: ["CMD", "/usr/local/bin/ferrite-cli", "PING"]
       interval: 5s
       timeout: 3s
       retries: 10
@@ -68,5 +68,5 @@ services:
         echo "  Try FerriteQL:"
         echo "    redis-cli QUERY \"SELECT * FROM user:* LIMIT 10\""
         echo ""
-        echo "  Documentation: https://docs.ferrite.dev"
+        echo "  Documentation: https://github.com/ferritelabs/ferrite-docs"
         echo "══════════════════════════════════════════════════════"

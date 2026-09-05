@@ -1,0 +1,4 @@
+{
+  "linux/amd64": {"config": {"Labels": {"org.opencontainers.image.version": "1.2.3", "dev.ferritelabs.image.source-sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}},
+  "linux/arm64": {"config": {"Labels": {"org.opencontainers.image.version": "1.2.3", "dev.ferritelabs.image.source-sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}}}
+}

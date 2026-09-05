@@ -7,16 +7,48 @@ on:
     branches: [main]
 
 jobs:
-  docker:
-    name: Docker Build
+  tests:
+    name: Bash Test Suite
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: azure/setup-helm@v3
+      # The playground launcher's unit tests run as part of tests/run.sh; the
+      # runner already ships a Rust toolchain, so no extra setup is needed.
+      - name: Run self-contained test suite
+        run: bash tests/run.sh
+
+  launcher:
+    name: Playground Launcher Unit Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run playground-launcher unit tests
+        run: cargo test --manifest-path playground-launcher/Cargo.toml
+      - name: Check playground-launcher formatting
+        run: cargo fmt --manifest-path playground-launcher/Cargo.toml --check
+
+  docker:
+    name: Docker Build
+    runs-on: ubuntu-latest
+    needs: tests
+    steps:
+      - uses: actions/checkout@v4
       - run: docker build -t ferrite:test .
+      # Post-build runtime test: proves the compiled binary actually
+      # executes under the runtime image's C library (glibc/Debian). This
+      # is the cheapest possible check that would have caught a
+      # builder/runtime ABI mismatch (e.g. glibc binaries on an Alpine/musl
+      # runtime failing at startup with a missing dynamic linker error).
+      - name: Verify runtime image executes (ABI compatibility)
+        run: |
+          docker run --rm ferrite:test --version
+          docker run --rm --entrypoint /usr/local/bin/ferrite-cli ferrite:test --version
 
   helm:
     name: Helm Lint
     runs-on: ubuntu-latest
+    needs: tests
     steps:
       - uses: actions/checkout@v4
       - uses: azure/setup-helm@v3
@@ -37,11 +69,16 @@ jobs:
   shellcheck:
     name: ShellCheck
     runs-on: ubuntu-latest
+    needs: tests
     steps:
       - uses: actions/checkout@v4
       - uses: ludeeus/action-shellcheck@2.0.0
         with:
           scandir: scripts
+          severity: warning
+      - uses: ludeeus/action-shellcheck@2.0.0
+        with:
+          scandir: tests
           severity: warning
 
   trivy:
@@ -54,7 +91,7 @@ jobs:
       - name: Build image for scanning
         run: docker build -t ferrite:scan .
       - name: Run Trivy vulnerability scanner
-        uses: aquasecurity/trivy-action@0.28.0
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           image-ref: ferrite:scan
           format: table

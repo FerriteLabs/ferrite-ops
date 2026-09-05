@@ -17,12 +17,12 @@ Deployment, monitoring, and packaging for [Ferrite](https://github.com/ferritela
 - `monitoring/` — Prometheus alerting rules
 - `packaging/` — deb/rpm package definitions
 - `scripts/` — Install and quickstart scripts
-- `ferrite.example.toml` — Example configuration
+- `ferrite.example.toml` — Documentation-only example config (schema reference; generate a real runtime config via the image's own `ferrite init` instead — see `docker/docker-compose.custom-config.yml`)
 
 ## Quick Start
 
 ```bash
-# Docker (single instance)
+# Docker (single instance) — uses the image's own generated, validated config
 docker compose up -d
 
 # Docker with monitoring (Prometheus + Grafana)
@@ -33,6 +33,120 @@ helm install ferrite charts/ferrite
 
 # Quickstart script (builds from source)
 ./scripts/quickstart.sh
+```
+
+### External Tester Quick Start
+
+For a non-production candidate/hardening campaign cohort, follow the
+[canonical Tester Program](https://github.com/ferritelabs/ferrite/blob/main/TESTER_PROGRAM.md).
+Check out the exact campaign commit before running the isolated,
+volume-preserving tester environment — there is no default branch or image;
+both must be supplied by the campaign owner. Docker, Docker Compose v2, and
+Python 3 (standard library only) are required:
+
+> Linux testers must use Docker Engine 28 or newer. Older engines can expose
+> ports published to `127.0.0.1` to peers on the same local network, so
+> `tester.sh start` fails closed on those versions.
+
+```bash
+git clone https://github.com/ferritelabs/ferrite-ops.git
+cd ferrite-ops
+git checkout --detach <CAMPAIGN_OPS_COMMIT>   # full 40-character lowercase commit SHA; never a tag, a branch, or main
+test "$(git rev-parse HEAD)" = "<CAMPAIGN_OPS_COMMIT>" || {
+  echo "HEAD is not <CAMPAIGN_OPS_COMMIT>; stop and re-request the campaign commit" >&2
+  exit 1
+}
+test -x scripts/tester.sh && ./scripts/tester.sh --help >/dev/null || {
+  echo "scripts/tester.sh is missing or not runnable at <CAMPAIGN_OPS_COMMIT>" >&2
+  exit 1
+}
+export FERRITE_TEST_IMAGE='ghcr.io/ferritelabs/ferrite@sha256:<CAMPAIGN_DIGEST>' # complete repository-qualified digest the campaign owner supplied; never latest or a tag
+./scripts/tester.sh start
+./scripts/tester.sh smoke
+./scripts/tester.sh diagnostics
+./scripts/tester.sh stop
+```
+
+`FERRITE_TEST_IMAGE` has no default for commands that start or inspect the
+tester. `tester.sh` fails fast with an actionable error, before any Docker
+call, if it is unset, an implicit/floating `latest` reference, a tag, or not
+the complete repository-qualified sha256 digest form
+(`repository/path@sha256:<64 lowercase hex characters>`). It also verifies,
+before every command that talks to the container, that the running container's
+image still matches `FERRITE_TEST_IMAGE` exactly. `stop` and `reset` do not
+need campaign image or port settings; the wrapper supplies a private,
+parse-only dummy digest to Compose for teardown and never pulls or starts it.
+
+`docker-compose.tester.yml` is an internal implementation detail. Direct
+`docker compose -f docker-compose.tester.yml ...` invocation is unsupported:
+the service requires a wrapper guard and belongs to the dedicated `tester`
+profile. Always use `./scripts/tester.sh`, which sets both controls and keeps
+its authoritative digest validation in front of every start/inspection path.
+
+Docker reporting a container healthy only proves the in-container healthcheck
+passed, so `start` additionally verifies host reachability with
+`scripts/tester-host-probe.py` (Python 3 standard library only, bounded
+timeouts) after health and image verification, and before claiming the
+deployment is available on localhost. The probe sends a RESP `PING` to
+`127.0.0.1:${FERRITE_TEST_PORT}` and requires `+PONG`, then performs an HTTP
+`GET /metrics` against `127.0.0.1:${FERRITE_TEST_METRICS_PORT}` and requires a
+2xx status with a non-empty body. Tune it with `FERRITE_TEST_PROBE_TIMEOUT`
+(one total wall-clock deadline per endpoint attempt, in seconds; default 5)
+and `FERRITE_TEST_PROBE_RETRIES` (default 5); both tester ports stay bound to
+loopback only.
+
+`./scripts/tester.sh diagnostics` first requires a Git worktree at detached
+HEAD, a full 40-character commit SHA, and no tracked staged or unstaged
+modifications (`--untracked-files=no`, so untracked files are ignored). It
+records that exact ops tooling commit in `versions.txt`, `image.txt`, and
+`report.md`. If provenance is not verifiable, diagnostics fails before Docker
+inspection or collection instead of producing a misattributed archive.
+
+Only run `./scripts/tester.sh durability` if the campaign owner has explicitly
+enabled it (`FERRITE_TEST_ENABLE_DURABILITY=1`); it is an optional,
+campaign-specific diagnostic track, not part of the core tester path, and the
+script refuses to run it otherwise. Current candidate images may not persist
+data across restart, so durability is not a core expected pass.
+
+Use `./scripts/tester.sh reset` only when you are ready to delete the tester
+volume. General deployment and operations guidance below remains authoritative
+outside the tester program.
+
+### Custom runtime configuration
+
+By default `docker compose up` mounts nothing over `/etc/ferrite/ferrite.toml`,
+so the container uses the image's own generated, build-time-validated config.
+`ferrite.example.toml` is a documentation-only reference and is **not**
+guaranteed to load in any specific packaged binary (its schema/defaults can
+drift from a given release) — never copy it in directly as a runtime config.
+
+To opt in to a custom `ferrite.toml`, generate one that is actually valid for
+the exact image you're running with that image's own `ferrite init`, then
+layer the custom-config override on top:
+
+```bash
+docker compose build ferrite   # or: docker pull <image>
+
+mkdir -p ./ferrite-config
+docker run --rm --entrypoint ferrite \
+  -v "$(pwd)/ferrite-config:/etc/ferrite" \
+  ferrite:0.4.0 \
+  init --minimal --force -o /etc/ferrite/ferrite.toml -d /var/lib/ferrite/data
+
+# ferrite init defaults to loopback-only binds; rewrite them so the
+# container is reachable through Docker's published ports.
+sed -i.bak 's/^bind = "127\.0\.0\.1"$/bind = "0.0.0.0"/' ./ferrite-config/ferrite.toml
+rm -f ./ferrite-config/ferrite.toml.bak
+
+cp ./ferrite-config/ferrite.toml ferrite.toml
+docker compose -f docker-compose.yml -f docker/docker-compose.custom-config.yml up -d
+```
+
+Point at a different file without editing the override by setting `FERRITE_CONFIG`:
+
+```bash
+FERRITE_CONFIG=./ferrite-config/ferrite.toml \
+  docker compose -f docker-compose.yml -f docker/docker-compose.custom-config.yml up -d
 ```
 
 ## Operational Quick Reference
@@ -181,6 +295,30 @@ The release workflow pushes images to both GHCR and Docker Hub. To enable Docker
    - `DOCKERHUB_USERNAME` — your Docker Hub username
    - `DOCKERHUB_TOKEN` — the access token (not your password)
 3. The release workflow will automatically push to `ferritelabs/ferrite` on Docker Hub when a `v*` tag is pushed
+
+If an eligible Docker Hub mirror or a stable floating tag needs repair, request
+the default-branch reconciliation workflow with the narrowly scoped repository
+dispatch event:
+
+```bash
+gh api --method POST \
+  repos/ferritelabs/ferrite-ops/dispatches \
+  -f event_type=reconcile-release-tags
+```
+
+This workflow intentionally has no `workflow_dispatch` trigger. GitHub resolves
+`repository_dispatch` workflows from the default branch, and the job validates
+the event, ref, and workflow definition before any registry login or write.
+
+### Release recovery
+
+Ferrite release recovery is **roll-forward only** in this repository. Exact container tags and `ferrite-ops-v*` source tags are immutable, and `active-release.env` cannot be synchronized to an equal or older version. If a published release is defective, publish a strictly newer corrective Ferrite release and allow `version-sync.yml` to advance every active deployment and packaging pin.
+
+Flux's configured `rollback` remediation applies only when a Helm upgrade fails; it can restore the last healthy Helm release state, but it does not downgrade canonical Ferrite metadata or rewrite immutable tags. `scripts/rollback-atomic.sh` is a historical developer-workspace reset helper, not a supported release or deployment rollback command.
+
+### Public promotion blocker
+
+Public promotion remains blocked until the hosted documentation endpoint and the required Debian Maintainer mailbox currently declared in package metadata are configured and verified. Chart maintainer email fields are omitted until a verified mailbox exists. GitHub repository links are the supported public fallback until then; do not advertise commercial support, email-based security intake, or hosted chart/package endpoints on unverified domains.
 
 ```bash
 # Verify after release:

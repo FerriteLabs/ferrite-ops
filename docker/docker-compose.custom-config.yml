@@ -1,0 +1,36 @@
+# Ferrite Docker Compose — Custom Runtime Configuration (opt-in override)
+#
+# By default, docker-compose.yml mounts nothing over /etc/ferrite/ferrite.toml,
+# so the container uses the image's own generated, build-time-validated
+# config. Layer this file on top of docker-compose.yml to opt in to a custom
+# ferrite.toml instead.
+#
+# The repository's ferrite.example.toml is NOT guaranteed to load in the
+# packaged binary (its documented values are not schema-checked against any
+# specific release; see AUDIT.md F-17/F-45) and must never be used directly
+# as this override's default. Generate a config that is actually valid for
+# the exact image you are running with that image's own `ferrite init`,
+# then only rewrite its loopback binds so the container is reachable
+# through Docker's published ports:
+#
+#   docker compose build ferrite   # or: docker pull <image>
+#   mkdir -p ./ferrite-config
+#   docker run --rm --entrypoint ferrite \
+#     -v "$(pwd)/ferrite-config:/etc/ferrite" \
+#     ferrite:0.4.0 \
+#     init --minimal --force -o /etc/ferrite/ferrite.toml -d /var/lib/ferrite/data
+#   sed -i.bak 's/^bind = "127\.0\.0\.1"$/bind = "0.0.0.0"/' ./ferrite-config/ferrite.toml
+#   rm -f ./ferrite-config/ferrite.toml.bak
+#   cp ./ferrite-config/ferrite.toml ./ferrite.toml
+#   docker compose -f docker-compose.yml -f docker/docker-compose.custom-config.yml up -d
+#
+# To point at a different file without editing this override, set
+# FERRITE_CONFIG before running compose:
+#
+#   FERRITE_CONFIG=./ferrite-config/ferrite.toml \
+#     docker compose -f docker-compose.yml -f docker/docker-compose.custom-config.yml up -d
+
+services:
+  ferrite:
+    volumes:
+      - ${FERRITE_CONFIG:-./ferrite.toml}:/etc/ferrite/ferrite.toml:ro

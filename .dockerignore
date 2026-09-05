@@ -1,5 +1,6 @@
 # Rust build artifacts
 target/
+**/target/
 **/*.rs.bk
 *.pdb
 
@@ -57,6 +58,9 @@ docker-compose*.yml
 
 # Dependencies cache (will be built in Docker)
 Cargo.lock
+# ... except the repository-owned launcher's lock file, which pins the exact
+# dependency versions the playground image is built from.
+!playground-launcher/Cargo.lock
 
 # Coverage reports
 tarpaulin-report.html

@@ -6,16 +6,9 @@ We take security vulnerabilities seriously and appreciate responsible disclosure
 
 **DO NOT** open a public GitHub issue for security vulnerabilities.
 
-### How to Report
+### Private Reporting
 
-1. **GitHub Security Advisories** (Preferred):
-   - Navigate to the [Security tab](https://github.com/ferritelabs/ferrite-ops/security/advisories/new)
-   - Click "Report a vulnerability"
-   - Fill out the private disclosure form
-
-2. **Email** (Alternative):
-   - Send to **security@ferritelabs.dev**
-   - Include "SECURITY" in the subject line
+Use [GitHub private vulnerability reporting](https://github.com/ferritelabs/ferrite-ops/security/advisories/new), click "Report a vulnerability", and complete the private disclosure form. This is the only published security intake for ferrite-ops.
 
 ### What to Include
 
@@ -45,4 +38,3 @@ For deployment security guidance, see:
 ## Scope
 
 This security policy covers the ferrite-ops repository (Docker, Helm, monitoring, and packaging). For vulnerabilities in the core Ferrite database engine, please report to the [main repository](https://github.com/ferritelabs/ferrite/security/advisories/new).
-

@@ -1,10 +1,27 @@
 # Ferrite Docker Compose Configuration
 #
 # Usage:
-#   docker compose up -d                    # Start Ferrite only
+#   docker compose up -d                    # Start Ferrite only, using the image's own
+#                                            # built-in, generated-and-validated config
 #   docker compose --profile monitoring up  # Start with Prometheus & Grafana
 #   docker compose --profile redis up       # Start with Redis for comparison
 #   docker compose --profile all up         # Start everything
+#
+# Custom runtime config (opt-in):
+#   By default no ferrite.toml is mounted, so the container uses the image's
+#   own generated, validated config. ferrite.example.toml is NOT guaranteed
+#   to load in the packaged binary, so never copy it in directly. Instead,
+#   generate a config that is valid for the exact image you're running with
+#   that image's own `ferrite init`, then layer the custom-config override
+#   on top of this file:
+#     mkdir -p ./ferrite-config
+#     docker run --rm --entrypoint ferrite -v "$(pwd)/ferrite-config:/etc/ferrite" \
+#       ferrite:0.4.0 init --minimal --force -o /etc/ferrite/ferrite.toml -d /var/lib/ferrite/data
+#     sed -i.bak 's/^bind = "127\.0\.0\.1"$/bind = "0.0.0.0"/' ./ferrite-config/ferrite.toml && rm -f ./ferrite-config/ferrite.toml.bak
+#     cp ./ferrite-config/ferrite.toml ./ferrite.toml
+#     docker compose -f docker-compose.yml -f docker/docker-compose.custom-config.yml up -d
+#   Or point at a different file without editing the override:
+#     FERRITE_CONFIG=./ferrite-config/ferrite.toml docker compose -f docker-compose.yml -f docker/docker-compose.custom-config.yml up -d
 
 services:
   # Primary Ferrite service
@@ -12,9 +29,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-      args:
-          RUST_VERSION: "1.94"
-    image: ferrite:${FERRITE_VERSION:-latest}
+    image: ferrite:${FERRITE_VERSION:-0.4.0}
     container_name: ferrite
     hostname: ferrite
     labels:
@@ -25,7 +40,6 @@ services:
       - "9090:9090"   # Prometheus metrics endpoint
     volumes:
       - ferrite-data:/var/lib/ferrite/data
-      - ${FERRITE_CONFIG:-./ferrite.example.toml}:/etc/ferrite/ferrite.toml:ro
     environment:
       - RUST_LOG=${RUST_LOG:-ferrite=info}
       - FERRITE_DATA_DIR=/var/lib/ferrite/data

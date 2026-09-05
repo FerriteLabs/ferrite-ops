@@ -5,7 +5,22 @@ All notable changes to Ferrite Ops will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [Unreleased] - Planned for Ferrite 0.5.0
+
+### Changed
+
+- Updated the audited Docker builder/runtime ABI documentation for Rust 1.98.
+- Standardized Docker Scout on the canonical `DOCKERHUB_USERNAME` secret.
+- Hardened immutable ops tagging to reject canonical versions that do not advance the version shipped before the triggering push.
+- Clarified that release recovery is roll-forward only; Flux rollback remediation is limited to failed Helm upgrades.
+- Removed the obsolete Compose `RUST_VERSION` build argument now that the audited Dockerfiles pin the builder image directly.
+- Replaced unreachable or parked product/documentation URLs with verified GitHub fallbacks, made GitHub private vulnerability reporting the only published security intake, removed unverified support email claims, and omitted optional chart/copyright email fields. Public promotion remains blocked until the hosted documentation endpoint and the required Debian Maintainer mailbox are configured and verified.
+
+## [0.4.1] - 2026-04-22
+
+### Changed
+
+- Hardened deployment security defaults and corrected packaging behavior across the operations repository.
 
 ## [0.4.0] - 2026-04-20
 
@@ -16,7 +31,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Moonshot Docker Compose override (`docker-compose.moonshot.yml`)
 - Grafana dashboard definitions for all 6 moonshot crates: Chronicle, Concord, Forge, Lucidity, Mnemo, Pangea
 - Moonshot health check script (`scripts/moonshot-health.sh`)
-- Rollback automation script (`scripts/rollback-atomic.sh`)
+- Historical developer-workspace reset helper (`scripts/rollback-atomic.sh`); it is not a release or deployment rollback mechanism
 - GitHub Discussion templates for ideas and Q&A
 
 ## [0.3.0] - 2026-03-09
@@ -80,7 +95,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **CI/CD**: Multi-platform release builds (amd64 + arm64) with Cosign keyless signing
 - **CI/CD**: SBOM generation (SPDX + CycloneDX) with SLSA provenance attestation
 
-[Unreleased]: https://github.com/ferritelabs/ferrite-ops/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/ferritelabs/ferrite-ops/compare/v0.4.1...HEAD
+[0.4.1]: https://github.com/ferritelabs/ferrite-ops/compare/v0.4.0...v0.4.1
+[0.4.0]: https://github.com/ferritelabs/ferrite-ops/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/ferritelabs/ferrite-ops/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/ferritelabs/ferrite-ops/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/ferritelabs/ferrite-ops/releases/tag/v0.1.0

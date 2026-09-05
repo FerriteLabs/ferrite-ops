@@ -143,16 +143,11 @@ EOF
 reprepro -b repo includedeb stable ferrite_0.1.0-1_amd64.deb
 ```
 
-Users can then add your repository:
+This repository does not currently advertise a hosted APT endpoint. Distribute the generated package directly or attach it to a verified GitHub release until an owned package domain, TLS, signing, and repository metadata are configured.
 
 ```bash
-# Add repository (replace with your URL)
-echo "deb [trusted=yes] https://packages.ferrite.dev/apt stable main" | \
-    sudo tee /etc/apt/sources.list.d/ferrite.list
-
-# Install
-sudo apt-get update
-sudo apt-get install ferrite
+# Install the generated local package
+sudo apt install ./ferrite_0.1.0-1_amd64.deb
 ```
 
 ## GitHub Actions Integration
