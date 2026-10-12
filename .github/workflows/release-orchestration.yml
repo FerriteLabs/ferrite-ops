@@ -30,7 +30,7 @@ jobs:
       tag: ${{ steps.meta.outputs.tag }}
       sha256: ${{ steps.meta.outputs.sha256 }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Compute release metadata
         id: meta
@@ -96,7 +96,7 @@ jobs:
     needs: prepare
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Trigger Homebrew tap update
         if: ${{ !(inputs.dry_run || false) }}
@@ -150,7 +150,7 @@ jobs:
     needs: prepare
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Trigger docs version update
         if: ${{ !(inputs.dry_run || false) }}
@@ -198,7 +198,7 @@ jobs:
     needs: prepare
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Trigger SDK repository updates
         if: ${{ !(inputs.dry_run || false) }}
@@ -272,7 +272,7 @@ jobs:
     if: always()
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Report orchestration results
         env:
