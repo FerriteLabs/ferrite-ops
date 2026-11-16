@@ -48,7 +48,7 @@ jobs:
       # is read as inert data only (sed/grep in the step below) and its
       # scripts are never executed.
       - name: Checkout candidate (untrusted, data only)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           path: candidate
@@ -58,7 +58,7 @@ jobs:
       # checkout's scripts/release-ordering.sh is ever invoked, so a
       # candidate that replaces that script cannot affect the outcome.
       - name: Checkout trusted base branch (scripts + canonical data)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           ref: ${{ github.event.pull_request.base.ref || github.event.merge_group.base_ref }}
           path: trusted
@@ -139,7 +139,7 @@ jobs:
       group: version-supersession-reconcile
       cancel-in-progress: true
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
